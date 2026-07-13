@@ -72,11 +72,23 @@ dense attention. Audio
 self-attention, text cross-attention, and audio-video cross-attention do not
 pass through this dispatcher.
 
-The first smoke configuration uses `sparge_topk: 0.5`, the upstream default
-`sparge_pvthreshd: 50`, and `sparge_smooth_k: true`. Those settings are an
-integration starting point, not a quality-equivalence claim. Run the dense and
-Sparge smoke tests with the same prompt, seed, dimensions, solver, and step
-count before a formal benchmark.
+The audited experiment has two isolated keep-ratio protocols. Both keep
+`sparge_pvthreshd: 50`, `sparge_smooth_k: true`, CFG cache disabled, block
+cache disabled, and `sp_size: 1`:
+
+| Keep ratio | Diagnostic smoke (20 steps) | Formal benchmark (50 steps) |
+| --- | --- | --- |
+| `topk=0.50` | `bash scripts/run_ovi_sparge_smoke.sh` | `bash scripts/run_ovi_sparge_baseline.sh` |
+| `topk=0.75` | `bash scripts/run_ovi_sparge_topk75_smoke.sh` | `bash scripts/run_ovi_sparge_topk75_baseline.sh` |
+
+The `topk=0.75` runners write below run parents containing
+`sparge_topk75`; they cannot reuse or overwrite either `topk=0.50` run parent.
+The verifier binds each `run_kind` to its exact keep ratio, step count,
+warm-up/measurement count, benchmark eligibility, and debug mode. Changing a
+config after the run therefore invalidates the protocol instead of relabeling
+the result. These settings are integration and comparison points, not a
+quality-equivalence claim. Run the dense and both Sparge smoke tests with the
+same prompt, seed, dimensions, solver, and step count before formal benchmarks.
 
 For this pinned upstream commit, `sparge_smooth_k` must remain `true`: its
 public implementation defines an internal key mean only on that branch but

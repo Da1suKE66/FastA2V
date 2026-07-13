@@ -34,6 +34,66 @@ SPARGE_PROVENANCE = {
     "return_sparsity": False,
 }
 
+SPARGE_COMMON_RUN_PROTOCOL = {
+    "model_name": "720x720_5s",
+    "mode": "t2v",
+    "video_frame_height_width": [720, 720],
+    "solver_name": "unipc",
+    "shift": 5.0,
+    "seed": 103,
+    "video_guidance_scale": 4.0,
+    "audio_guidance_scale": 3.0,
+    "fp8": False,
+    "qint8": False,
+    "cpu_offload": False,
+    "sp_size": 1,
+    "slg_layer": 11,
+    "prompt_count": 1,
+    "each_example_n_times": 1,
+    "sparge_pvthreshd": 50.0,
+    "sparge_smooth_k": True,
+    "use_cfg_cache": False,
+    "use_block_cache": False,
+}
+SPARGE_RUN_KIND_PROTOCOLS = {
+    "sparge_baseline": {
+        **SPARGE_COMMON_RUN_PROTOCOL,
+        "sparge_topk": 0.50,
+        "sample_steps": 50,
+        "warmup_runs": 1,
+        "measurement_runs": 3,
+        "benchmark_eligible": True,
+        "debug_forward": False,
+    },
+    "sparge_diagnostic_smoke": {
+        **SPARGE_COMMON_RUN_PROTOCOL,
+        "sparge_topk": 0.50,
+        "sample_steps": 20,
+        "warmup_runs": 0,
+        "measurement_runs": 1,
+        "benchmark_eligible": False,
+        "debug_forward": True,
+    },
+    "sparge_topk75_baseline": {
+        **SPARGE_COMMON_RUN_PROTOCOL,
+        "sparge_topk": 0.75,
+        "sample_steps": 50,
+        "warmup_runs": 1,
+        "measurement_runs": 3,
+        "benchmark_eligible": True,
+        "debug_forward": False,
+    },
+    "sparge_topk75_diagnostic_smoke": {
+        **SPARGE_COMMON_RUN_PROTOCOL,
+        "sparge_topk": 0.75,
+        "sample_steps": 20,
+        "warmup_runs": 0,
+        "measurement_runs": 1,
+        "benchmark_eligible": False,
+        "debug_forward": True,
+    },
+}
+
 
 def run(command):
     return subprocess.check_output(command, stderr=subprocess.STDOUT)
@@ -354,6 +414,25 @@ def validate_sparge_dispatcher(
                     f"{context}: Sparge setting {field}={details.get(field)!r} "
                     f"!= environment {expected!r}"
                 )
+
+
+def validate_sparge_run_protocol(environment, errors):
+    """Bind each audited Sparge run kind to one immutable parameter set."""
+
+    run_kind = environment.get("run_kind")
+    expected_protocol = SPARGE_RUN_KIND_PROTOCOLS.get(run_kind)
+    if expected_protocol is None:
+        errors.append(
+            f"Sparge run_kind {run_kind!r} is not an audited pure-Sparge "
+            "protocol"
+        )
+        return
+    for field, expected in expected_protocol.items():
+        if environment.get(field) != expected:
+            errors.append(
+                f"Sparge {run_kind} protocol {field}="
+                f"{environment.get(field)!r} != fixed value {expected!r}"
+            )
 
 
 def verify(path, require_metrics=True, expected_video_frames=121):
@@ -802,55 +881,7 @@ def verify_run_protocol(run_dir, reports):
             errors.append(f"preflight contains errors: {preflight['errors']}")
 
     if attention_method == "sparge":
-        run_kind = environment.get("run_kind")
-        run_protocol = {
-            "sparge_baseline": {
-                "sample_steps": 50,
-                "warmup_runs": 1,
-                "measurement_runs": 3,
-                "benchmark_eligible": True,
-                "debug_forward": False,
-            },
-            "sparge_diagnostic_smoke": {
-                "sample_steps": 20,
-                "warmup_runs": 0,
-                "measurement_runs": 1,
-                "benchmark_eligible": False,
-                "debug_forward": True,
-            },
-        }.get(run_kind)
-        if run_protocol is None:
-            errors.append("Sparge run_kind is not an audited pure-Sparge protocol")
-            run_protocol = {}
-        expected_protocol = {
-            "model_name": "720x720_5s",
-            "mode": "t2v",
-            "video_frame_height_width": [720, 720],
-            "solver_name": "unipc",
-            "shift": 5.0,
-            "seed": 103,
-            "video_guidance_scale": 4.0,
-            "audio_guidance_scale": 3.0,
-            "fp8": False,
-            "qint8": False,
-            "cpu_offload": False,
-            "sp_size": 1,
-            "slg_layer": 11,
-            "prompt_count": 1,
-            "each_example_n_times": 1,
-            "sparge_topk": 0.5,
-            "sparge_pvthreshd": 50.0,
-            "sparge_smooth_k": True,
-            "use_cfg_cache": False,
-            "use_block_cache": False,
-            **run_protocol,
-        }
-        for field, expected in expected_protocol.items():
-            if environment.get(field) != expected:
-                errors.append(
-                    f"Sparge protocol {field}={environment.get(field)!r} "
-                    f"!= fixed value {expected!r}"
-                )
+        validate_sparge_run_protocol(environment, errors)
         receipt_path = run_dir / "spargeattn-install.json"
         try:
             copied_receipt = json.loads(receipt_path.read_text())

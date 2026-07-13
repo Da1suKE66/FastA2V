@@ -144,6 +144,8 @@ class RunnerOrderingTests(unittest.TestCase):
         "run_ovi_block_cache_baseline.sh",
         "run_ovi_sparge_smoke.sh",
         "run_ovi_sparge_baseline.sh",
+        "run_ovi_sparge_topk75_smoke.sh",
+        "run_ovi_sparge_topk75_baseline.sh",
     )
 
     def test_idle_check_precedes_all_cuda_preflight_and_inference(self):
@@ -190,7 +192,12 @@ class RunnerOrderingTests(unittest.TestCase):
         self.assertLess(check_offset, microtest_offset)
 
     def test_sparge_runners_copy_hashed_build_and_install_gpu_evidence(self):
-        for filename in ("run_ovi_sparge_smoke.sh", "run_ovi_sparge_baseline.sh"):
+        for filename in (
+            "run_ovi_sparge_smoke.sh",
+            "run_ovi_sparge_baseline.sh",
+            "run_ovi_sparge_topk75_smoke.sh",
+            "run_ovi_sparge_topk75_baseline.sh",
+        ):
             source = (REPO_ROOT / "scripts" / filename).read_text(encoding="utf-8")
             self.assertIn("spargeattn-build.log", source)
             self.assertIn("spargeattn-install-pre_run_gpu.json", source)
