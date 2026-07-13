@@ -50,8 +50,14 @@ def save_video(
     # Convert numpy array to a list of frames
     frames = list(video_numpy)
 
-    # Create video clip
-    clip = ImageSequenceClip(frames, fps=fps)
+    # Create video clip. MoviePy 1.0.3 iterates frames with
+    # np.arange(0, duration, 1 / fps). For 121 frames at 24 fps, the floating
+    # representation of 121 / 24 makes that range include the endpoint and
+    # duplicates the final frame. Moving the duration by one ULP toward zero
+    # preserves the intended 121 encoded frames without changing their timing.
+    clip = ImageSequenceClip(frames, fps=fps).set_duration(
+        np.nextafter(len(frames) / fps, 0.0)
+    )
 
     # Add audio if provided
     if audio_numpy is not None:

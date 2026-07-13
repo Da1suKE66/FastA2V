@@ -39,6 +39,8 @@ cd "${OFFICIAL_WORKTREE}"
 "${FASTA2V_OVI_ENV}/bin/python" inference.py \
   --config-file "${REPO_ROOT}/configs/ovi_720x720_5s_official_smoke.yaml" \
   2>&1 | tee "${RUN_DIR}/stdout.log"
+# The pinned, unmodified upstream saver exposes MoviePy 1.0.3's endpoint
+# rounding quirk: a 121-frame tensor is muxed with one duplicate tail frame.
 "${FASTA2V_OVI_ENV}/bin/python" "${REPO_ROOT}/scripts/verify_ovi_output.py" \
-  "${RUN_DIR}" --media-only
+  "${RUN_DIR}" --media-only --expected-video-frames 122
 echo "Official reference artifacts: ${RUN_DIR}"

@@ -92,7 +92,7 @@ def as_int(value):
         return None
 
 
-def verify(path, require_metrics=True):
+def verify(path, require_metrics=True, expected_video_frames=121):
     info = probe(path)
     artifact_sha256 = sha256(path)
     videos = [stream for stream in info.get("streams", []) if stream.get("codec_type") == "video"]
@@ -112,8 +112,10 @@ def verify(path, require_metrics=True):
         errors.append(f"invalid video dimensions: {width}x{height}")
     elif width % 32 or height % 32:
         errors.append(f"video dimensions are not multiples of 32: {width}x{height}")
-    if frames != 121:
-        errors.append(f"expected 121 video frames, found {frames}")
+    if frames != expected_video_frames:
+        errors.append(
+            f"expected {expected_video_frames} video frames, found {frames}"
+        )
     if not 4.5 <= duration <= 5.5:
         errors.append(f"expected about 5 seconds, found {duration:.6f}")
 
@@ -318,7 +320,16 @@ def main():
         action="store_true",
         help="validate streams/content without FastA2V metrics or run protocol",
     )
+    parser.add_argument(
+        "--expected-video-frames",
+        type=int,
+        default=121,
+        help="exact decoded frame count required (default: 121)",
+    )
     args = parser.parse_args()
+
+    if args.expected_video_frames < 1:
+        parser.error("--expected-video-frames must be positive")
 
     for executable in ("ffmpeg", "ffprobe"):
         if shutil.which(executable) is None:
@@ -327,7 +338,14 @@ def main():
     paths = [args.path] if args.path.is_file() else sorted(args.path.glob("*.mp4"))
     if not paths:
         raise SystemExit(f"no MP4 artifacts found under {args.path}")
-    reports = [verify(path, require_metrics=not args.media_only) for path in paths]
+    reports = [
+        verify(
+            path,
+            require_metrics=not args.media_only,
+            expected_video_frames=args.expected_video_frames,
+        )
+        for path in paths
+    ]
     run_dir = args.path if args.path.is_dir() else args.path.parent
     protocol = (
         verify_run_protocol(run_dir, reports)
