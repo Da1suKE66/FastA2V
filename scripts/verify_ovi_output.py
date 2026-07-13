@@ -18,6 +18,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from ovi.block_cache import fixed_block_cache_metric_errors
+from ovi.sparge_evidence import (
+    sparge_microtest_evidence_errors,
+    sparge_receipt_evidence_errors,
+)
 
 
 SPARGE_PROVENANCE = {
@@ -282,6 +286,7 @@ def validate_sparge_dispatcher(
     *,
     expected_receipt=None,
     expected_settings=None,
+    expected_gpu_uuid=None,
     context="metrics",
 ):
     """Close the formal provenance loop for an official SpargeAttn record."""
@@ -301,14 +306,46 @@ def validate_sparge_dispatcher(
             f"{context}: Sparge backend calls={details.get('calls')} != "
             f"dispatcher calls_total={dispatcher.get('calls_total')}"
         )
+    expected_calls_by_method = {
+        "dense": 0,
+        "sparge": dispatcher.get("calls_total"),
+        "radial": 0,
+        "svg": 0,
+    }
+    if dispatcher.get("calls_by_method") != expected_calls_by_method:
+        errors.append(
+            f"{context}: Sparge calls_by_method="
+            f"{dispatcher.get('calls_by_method')!r} != "
+            f"{expected_calls_by_method!r}"
+        )
+    if details.get("last_nhd_shape") != [1, 15004, 24, 128]:
+        errors.append(
+            f"{context}: Sparge last_nhd_shape="
+            f"{details.get('last_nhd_shape')!r} != [1, 15004, 24, 128]"
+        )
+    if details.get("last_dtype") != "torch.bfloat16":
+        errors.append(
+            f"{context}: Sparge last_dtype={details.get('last_dtype')!r} "
+            "!= 'torch.bfloat16'"
+        )
+    if details.get("last_device") != "cuda:0":
+        errors.append(
+            f"{context}: Sparge last_device={details.get('last_device')!r} "
+            "!= 'cuda:0'"
+        )
 
     receipt = details.get("install_receipt")
     if not isinstance(receipt, dict):
         errors.append(f"{context}: Sparge backend install_receipt is missing")
-    elif expected_receipt is not None and receipt != expected_receipt:
-        errors.append(
-            f"{context}: Sparge backend receipt differs from copied run receipt"
-        )
+    else:
+        for error in sparge_receipt_evidence_errors(
+            receipt, expected_gpu_uuid=expected_gpu_uuid
+        ):
+            errors.append(f"{context}: Sparge backend receipt: {error}")
+        if expected_receipt is not None and receipt != expected_receipt:
+            errors.append(
+                f"{context}: Sparge backend receipt differs from copied run receipt"
+            )
 
     if expected_settings is not None:
         for field, expected in expected_settings.items():
@@ -641,7 +678,13 @@ def verify_run_protocol(run_dir, reports):
         "checkpoint_manifest.json",
     ]
     if attention_method == "sparge":
-        required_files.append("spargeattn-install.json")
+        required_files.extend(
+            (
+                "spargeattn-install.json",
+                "spargeattn-build.log",
+                "spargeattn-install-pre_run_gpu.json",
+            )
+        )
     for filename in required_files:
         if not (run_dir / filename).is_file():
             errors.append(f"missing run evidence file: {filename}")
@@ -759,21 +802,49 @@ def verify_run_protocol(run_dir, reports):
             errors.append(f"preflight contains errors: {preflight['errors']}")
 
     if attention_method == "sparge":
+        run_kind = environment.get("run_kind")
+        run_protocol = {
+            "sparge_baseline": {
+                "sample_steps": 50,
+                "warmup_runs": 1,
+                "measurement_runs": 3,
+                "benchmark_eligible": True,
+                "debug_forward": False,
+            },
+            "sparge_diagnostic_smoke": {
+                "sample_steps": 20,
+                "warmup_runs": 0,
+                "measurement_runs": 1,
+                "benchmark_eligible": False,
+                "debug_forward": True,
+            },
+        }.get(run_kind)
+        if run_protocol is None:
+            errors.append("Sparge run_kind is not an audited pure-Sparge protocol")
+            run_protocol = {}
         expected_protocol = {
+            "model_name": "720x720_5s",
+            "mode": "t2v",
+            "video_frame_height_width": [720, 720],
+            "solver_name": "unipc",
+            "shift": 5.0,
+            "seed": 103,
+            "video_guidance_scale": 4.0,
+            "audio_guidance_scale": 3.0,
+            "fp8": False,
+            "qint8": False,
+            "cpu_offload": False,
+            "sp_size": 1,
+            "slg_layer": 11,
+            "prompt_count": 1,
+            "each_example_n_times": 1,
             "sparge_topk": 0.5,
             "sparge_pvthreshd": 50.0,
             "sparge_smooth_k": True,
             "use_cfg_cache": False,
             "use_block_cache": False,
-            "sp_size": 1,
+            **run_protocol,
         }
-        if environment.get("run_kind") not in {
-            "sparge_baseline",
-            "sparge_diagnostic_smoke",
-        }:
-            errors.append(
-                "Sparge run_kind is not an audited pure-Sparge protocol"
-            )
         for field, expected in expected_protocol.items():
             if environment.get(field) != expected:
                 errors.append(
@@ -786,6 +857,62 @@ def verify_run_protocol(run_dir, reports):
         except (OSError, json.JSONDecodeError) as exc:
             copied_receipt = None
             errors.append(f"invalid copied SpargeAttn receipt: {exc}")
+        expected_gpu_uuid = (
+            expected_gpu_identity[1]
+            if expected_gpu_identity is not None
+            else None
+        )
+        for error in sparge_receipt_evidence_errors(
+            copied_receipt, expected_gpu_uuid=expected_gpu_uuid
+        ):
+            errors.append(f"copied SpargeAttn receipt: {error}")
+
+        if isinstance(copied_receipt, dict):
+            build_metadata = copied_receipt.get("build_log")
+            build_log_path = run_dir / "spargeattn-build.log"
+            if isinstance(build_metadata, dict) and build_log_path.is_file():
+                if (
+                    build_log_path.stat().st_size != build_metadata.get("bytes")
+                    or sha256(build_log_path) != build_metadata.get("sha256")
+                ):
+                    errors.append(
+                        "copied SpargeAttn build log differs from install receipt"
+                    )
+            install_gpu_metadata = copied_receipt.get("install_pre_run_gpu")
+            install_gpu_path = run_dir / "spargeattn-install-pre_run_gpu.json"
+            if isinstance(install_gpu_metadata, dict) and install_gpu_path.is_file():
+                if (
+                    install_gpu_path.stat().st_size
+                    != install_gpu_metadata.get("bytes")
+                    or sha256(install_gpu_path)
+                    != install_gpu_metadata.get("sha256")
+                ):
+                    errors.append(
+                        "copied SpargeAttn install GPU evidence differs from receipt"
+                    )
+                try:
+                    install_gpu_report = json.loads(install_gpu_path.read_text())
+                except (OSError, json.JSONDecodeError) as exc:
+                    install_gpu_report = None
+                    errors.append(
+                        f"invalid SpargeAttn install GPU evidence: {exc}"
+                    )
+                if isinstance(install_gpu_report, dict):
+                    if (
+                        install_gpu_report.get("schema_version") != 1
+                        or install_gpu_report.get("check_type") != "pre_run_idle"
+                        or install_gpu_report.get("valid_for_run") is not True
+                        or install_gpu_report.get("idle") is not True
+                        or install_gpu_report.get("process_count") != 0
+                        or install_gpu_report.get("processes") != []
+                        or install_gpu_report.get("errors") != []
+                        or install_gpu_report.get("device_uuid")
+                        != expected_gpu_uuid
+                    ):
+                        errors.append(
+                            "SpargeAttn install GPU evidence is not an idle "
+                            "record for the benchmark GPU UUID"
+                        )
 
         if not environment.get("spas_sage_attn"):
             errors.append("environment is missing spas_sage_attn package version")
@@ -806,15 +933,15 @@ def verify_run_protocol(run_dir, reports):
             if isinstance(copied_receipt, dict)
             else None
         )
-        if not isinstance(receipt_microtest, dict) or receipt_microtest.get(
-            "status"
-        ) != "ok":
-            errors.append("Sparge install receipt lacks a successful CUDA microtest")
+        for error in sparge_microtest_evidence_errors(
+            receipt_microtest, expected_gpu_uuid=expected_gpu_uuid
+        ):
+            errors.append(f"Sparge install microtest: {error}")
         preflight_microtest = preflight.get("spargeattn_microtest")
-        if not isinstance(preflight_microtest, dict) or preflight_microtest.get(
-            "status"
-        ) != "ok":
-            errors.append("Sparge run preflight lacks a successful CUDA microtest")
+        for error in sparge_microtest_evidence_errors(
+            preflight_microtest, expected_gpu_uuid=expected_gpu_uuid
+        ):
+            errors.append(f"Sparge preflight microtest: {error}")
 
         expected_settings = {
             "topk": environment.get("sparge_topk"),
@@ -834,6 +961,7 @@ def verify_run_protocol(run_dir, reports):
                     errors,
                     expected_receipt=copied_receipt,
                     expected_settings=expected_settings,
+                    expected_gpu_uuid=expected_gpu_uuid,
                     context=f"{record_type}[{index}]",
                 )
 
@@ -848,7 +976,13 @@ def verify_run_protocol(run_dir, reports):
         "checkpoint_manifest.json",
     }
     if attention_method == "sparge":
-        required_hashed_evidence.add("spargeattn-install.json")
+        required_hashed_evidence.update(
+            {
+                "spargeattn-install.json",
+                "spargeattn-build.log",
+                "spargeattn-install-pre_run_gpu.json",
+            }
+        )
     missing_hashes = sorted(required_hashed_evidence - set(evidence_hashes))
     if missing_hashes:
         errors.append(f"environment is missing evidence hashes: {missing_hashes}")
@@ -942,8 +1076,10 @@ def main():
         "benchmark_valid": bool(protocol and protocol["benchmark_valid"]),
     }
     output_path = args.path.with_suffix(".verification.json") if args.path.is_file() else args.path / "verification.json"
-    output_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-    print(json.dumps(summary, indent=2, sort_keys=True))
+    output_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
     return 1 if summary["status"] == "failed" else 0
 
 

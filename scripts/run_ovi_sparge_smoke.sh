@@ -25,6 +25,9 @@ cd "${REPO_ROOT}"
 cp "${FASTA2V_CACHE_ROOT}/ovi-environment.freeze.txt" "${RUN_DIR}/environment.freeze.txt"
 cp "${FASTA2V_CACHE_ROOT}/checkpoint_manifest.json" "${RUN_DIR}/checkpoint_manifest.json"
 cp "${FASTA2V_CACHE_ROOT}/spargeattn-install.json" "${RUN_DIR}/spargeattn-install.json"
+cp "${FASTA2V_CACHE_ROOT}/spargeattn-build.log" "${RUN_DIR}/spargeattn-build.log"
+cp "${FASTA2V_CACHE_ROOT}/spargeattn-pre_run_gpu.json" \
+  "${RUN_DIR}/spargeattn-install-pre_run_gpu.json"
 "${FASTA2V_OVI_ENV}/bin/python" scripts/preflight_ovi.py \
   --attention-method sparge \
   --output "${RUN_DIR}/preflight.json"

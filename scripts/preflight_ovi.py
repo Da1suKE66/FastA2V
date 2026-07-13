@@ -87,6 +87,7 @@ def main(output_path=None, attention_method="dense"):
 
     if attention_method == "sparge":
         try:
+            from ovi.gpu_process_monitor import validate_pre_run_gpu_report
             from ovi.modules.sparge_attention_backend import (
                 SPARGEATTN_API,
                 SPARGEATTN_COMMIT,
@@ -94,6 +95,20 @@ def main(output_path=None, attention_method="dense"):
                 verify_sparge_install_receipt,
             )
             from scripts.sparge_attn_microtest import run_microtest
+
+            run_dir = os.environ.get("FASTA2V_RUN_DIR")
+            pre_run_path = Path(run_dir or "") / "pre_run_gpu.json"
+            if not run_dir or not pre_run_path.is_file():
+                raise RuntimeError(
+                    "Sparge preflight requires runner-created pre_run_gpu.json"
+                )
+            pre_run_gpu = json.loads(pre_run_path.read_text(encoding="utf-8"))
+            pre_run_errors = validate_pre_run_gpu_report(pre_run_gpu)
+            if pre_run_errors:
+                raise RuntimeError(
+                    "invalid Sparge pre-run GPU evidence: "
+                    + "; ".join(pre_run_errors)
+                )
 
             receipt_path, receipt = verify_sparge_install_receipt()
             kernel = load_official_sparge_kernel(
@@ -107,10 +122,16 @@ def main(output_path=None, attention_method="dense"):
                 "install_receipt_contents": receipt,
                 "installed_files_verified": True,
             }
-            report["spargeattn_microtest"] = run_microtest(
+            microtest = run_microtest(
                 kernel=kernel,
                 device_index=0,
             )
+            if microtest.get("device_uuid") != pre_run_gpu.get("device_uuid"):
+                raise RuntimeError(
+                    "Sparge preflight CUDA microtest GPU UUID differs from "
+                    "pre-run idle evidence"
+                )
+            report["spargeattn_microtest"] = microtest
         except Exception as exc:
             report["errors"].append(
                 f"official SpargeAttn dependency check failed: {exc!r}"
@@ -166,9 +187,15 @@ def main(output_path=None, attention_method="dense"):
         except Exception as exc:
             report["errors"].append(f"FlashAttention microtest failed: {exc!r}")
 
-    rendered = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    rendered = json.dumps(
+        report,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+        allow_nan=False,
+    ) + "\n"
     if output_path is not None:
-        Path(output_path).write_text(rendered)
+        Path(output_path).write_text(rendered, encoding="utf-8")
     print(rendered, end="")
     return 1 if report["errors"] else 0
 

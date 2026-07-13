@@ -21,7 +21,13 @@ def main(output_path, device_index=0, sample_fn=query_gpu_compute_processes):
         raise ValueError("FastA2V currently supports physical GPU index 0 only")
     snapshot = sample_fn(0)
     report = build_pre_run_gpu_report(snapshot)
-    rendered = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    rendered = json.dumps(
+        report,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+        allow_nan=False,
+    ) + "\n"
     output_path = Path(output_path)
     output_path.write_text(rendered, encoding="utf-8")
     print(rendered, end="")

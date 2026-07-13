@@ -2,6 +2,7 @@
 """Launch the pinned official SpargeAttn API on real BF16 sm80 tensors."""
 
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from ovi.modules.sparge_attention_backend import (
     SpargeAttentionDependencyError,
     load_official_sparge_kernel,
 )
+from ovi.gpu_process_monitor import query_gpu_compute_processes
 
 
 def run_microtest(kernel=None, device_index=0):
@@ -84,6 +86,10 @@ def run_microtest(kernel=None, device_index=0):
         raise SpargeAttentionDependencyError(
             "SpargeAttn CUDA microtest returned NaN or Inf"
         )
+    if not torch.isfinite(reference).all():
+        raise SpargeAttentionDependencyError(
+            "SpargeAttn CUDA microtest SDPA reference returned NaN or Inf"
+        )
     cosine = float(
         F.cosine_similarity(
             full_output.float().reshape(-1),
@@ -91,14 +97,36 @@ def run_microtest(kernel=None, device_index=0):
             dim=0,
         ).item()
     )
+    max_difference = float(
+        (full_output.float() - reference.float()).abs().max().item()
+    )
+    if not math.isfinite(cosine) or not math.isfinite(max_difference):
+        raise SpargeAttentionDependencyError(
+            "SpargeAttn CUDA microtest produced non-finite comparison evidence"
+        )
     if cosine < SPARGEATTN_MICROTEST_MIN_COSINE:
         raise SpargeAttentionDependencyError(
             "SpargeAttn CUDA microtest differs too far from full SDPA: "
             f"cosine={cosine:.6f} < {SPARGEATTN_MICROTEST_MIN_COSINE}"
         )
+    gpu_identity = query_gpu_compute_processes(0)
+    runtime_device_name = torch.cuda.get_device_name(device)
+    if (
+        gpu_identity.get("available") is not True
+        or gpu_identity.get("device_index") != 0
+        or gpu_identity.get("device_name") != runtime_device_name
+        or not isinstance(gpu_identity.get("device_uuid"), str)
+        or not gpu_identity.get("device_uuid", "").startswith("GPU-")
+        or gpu_identity.get("process_count") not in (0, 1)
+    ):
+        raise SpargeAttentionDependencyError(
+            "SpargeAttn CUDA microtest could not bind logical CUDA 0 to an "
+            f"uncontended physical GPU 0: {gpu_identity}"
+        )
     return {
         "status": "ok",
-        "device": torch.cuda.get_device_name(device),
+        "device": runtime_device_name,
+        "device_uuid": gpu_identity["device_uuid"],
         "compute_capability": list(compute_capability),
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
@@ -108,11 +136,9 @@ def run_microtest(kernel=None, device_index=0):
         "shape": list(SPARGEATTN_MICROTEST_SHAPE),
         "tested_topk": [0.5, 1.0],
         "cosine_vs_sdpa": cosine,
-        "max_abs_difference_vs_sdpa": float(
-            (full_output.float() - reference.float()).abs().max().item()
-        ),
+        "max_abs_difference_vs_sdpa": max_difference,
     }
 
 
 if __name__ == "__main__":
-    print(json.dumps(run_microtest(), indent=2, sort_keys=True))
+    print(json.dumps(run_microtest(), indent=2, sort_keys=True, allow_nan=False))

@@ -50,7 +50,14 @@ def _sha256(path):
 
 def _write_json(path, payload):
     with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        json.dump(
+            payload,
+            handle,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
         handle.write("\n")
 
 
@@ -77,7 +84,13 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
     if config.get("run_kind", "unspecified") != "unspecified":
         evidence_filenames.insert(0, "pre_run_gpu.json")
     if config.get("attention_method", "dense") == "sparge":
-        evidence_filenames.append("spargeattn-install.json")
+        evidence_filenames.extend(
+            (
+                "spargeattn-install.json",
+                "spargeattn-build.log",
+                "spargeattn-install-pre_run_gpu.json",
+            )
+        )
     for filename in evidence_filenames:
         path = os.path.join(output_dir, filename)
         evidence_files[filename] = _sha256(path) if os.path.isfile(path) else None
@@ -108,6 +121,22 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
         "driver_version": driver_version.splitlines()[0] if driver_version else None,
         "engine_load_seconds": engine_load_seconds,
         "model_name": config.get("model_name"),
+        "mode": config.get("mode"),
+        "video_frame_height_width": list(
+            config.get("video_frame_height_width", [])
+        ),
+        "solver_name": config.get("solver_name", "unipc"),
+        "shift": float(config.get("shift", 5.0)),
+        "seed": int(config.get("seed", 100)),
+        "video_guidance_scale": float(
+            config.get("video_guidance_scale", 4.0)
+        ),
+        "audio_guidance_scale": float(
+            config.get("audio_guidance_scale", 3.0)
+        ),
+        "fp8": bool(config.get("fp8", False)),
+        "qint8": bool(config.get("qint8", False)),
+        "cpu_offload": bool(config.get("cpu_offload", False)),
         "sp_size": int(config.get("sp_size", 1)),
         "attention_method": config.get("attention_method", "dense"),
         "sparge_topk": float(config.get("sparge_topk", 0.5)),
@@ -161,7 +190,15 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
 
 def _append_jsonl(path, payload):
     with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.write(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n"
+        )
 
 
 def _prepare_output_dir(config):
@@ -182,7 +219,13 @@ def _prepare_output_dir(config):
             "stdout.log",
         }
         if config.get("attention_method", "dense") == "sparge":
-            allowed_pre_run_files.add("spargeattn-install.json")
+            allowed_pre_run_files.update(
+                {
+                    "spargeattn-install.json",
+                    "spargeattn-build.log",
+                    "spargeattn-install-pre_run_gpu.json",
+                }
+            )
         unexpected = sorted(
             name for name in os.listdir(output_dir)
             if name not in allowed_pre_run_files

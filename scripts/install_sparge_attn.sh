@@ -14,6 +14,7 @@ SOURCE_PARENT="${FASTA2V_CACHE_ROOT}/sources"
 SOURCE_DIR="${SOURCE_PARENT}/SpargeAttn-${PINNED_COMMIT}"
 RECEIPT_PATH="${FASTA2V_CACHE_ROOT}/spargeattn-install.json"
 BUILD_LOG_PATH="${FASTA2V_CACHE_ROOT}/spargeattn-build.log"
+GPU_EVIDENCE_PATH="${FASTA2V_CACHE_ROOT}/spargeattn-pre_run_gpu.json"
 
 if [[ ! "${PINNED_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Invalid SpargeAttn pin in ${PIN_FILE}: ${PINNED_COMMIT}" >&2
@@ -70,6 +71,9 @@ if ! "${FASTA2V_OVI_ENV}/bin/python" -c 'import ninja, packaging'; then
   echo "Run bash scripts/setup_ovi_env.sh before installing SpargeAttn." >&2
   exit 2
 fi
+"${FASTA2V_OVI_ENV}/bin/python" "${REPO_ROOT}/scripts/check_pre_run_gpu.py" \
+  --device-index 0 \
+  --output "${GPU_EVIDENCE_PATH}"
 "${FASTA2V_OVI_ENV}/bin/python" -m pip install \
   --no-build-isolation \
   --no-deps \
@@ -83,6 +87,8 @@ SPARGEATTN_PINNED_COMMIT="${PINNED_COMMIT}" \
 SPARGEATTN_UPSTREAM_URL="${UPSTREAM_URL}" \
 SPARGEATTN_CLONE_URL="${UPSTREAM_CLONE_URL}" \
 SPARGEATTN_BUILD_LOG_PATH="${BUILD_LOG_PATH}" \
+SPARGEATTN_GPU_EVIDENCE_PATH="${GPU_EVIDENCE_PATH}" \
+FASTA2V_OVI_ENV_PATH="${FASTA2V_OVI_ENV}" \
 FASTA2V_REPO_ROOT="${REPO_ROOT}" \
 "${FASTA2V_OVI_ENV}/bin/python" - <<'PY'
 import importlib.metadata
@@ -92,6 +98,7 @@ import json
 import os
 import subprocess
 import sys
+import sysconfig
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -101,6 +108,7 @@ from spas_sage_attn import spas_sage2_attn_meansim_topk_cuda
 
 sys.path.insert(0, os.environ["FASTA2V_REPO_ROOT"])
 from scripts.sparge_attn_microtest import run_microtest
+from ovi.gpu_process_monitor import validate_pre_run_gpu_report
 
 required = {
     "dropout_p",
@@ -117,10 +125,43 @@ if missing:
     raise RuntimeError(f"official SpargeAttn API is missing parameters: {missing}")
 
 package_root = Path(spas_sage_attn.__file__).resolve().parent
+allowed_site_roots = {
+    Path(path).resolve()
+    for path in (sysconfig.get_path("purelib"), sysconfig.get_path("platlib"))
+    if path
+}
+if not any(
+    package_root == site_root or site_root in package_root.parents
+    for site_root in allowed_site_roots
+):
+    raise RuntimeError(
+        "spas_sage_attn was imported outside the fixed Ovi environment: "
+        f"package_root={package_root}, allowed={sorted(map(str, allowed_site_roots))}"
+    )
+expected_prefix = Path(os.environ["FASTA2V_OVI_ENV_PATH"]).resolve()
+if Path(sys.prefix).resolve() != expected_prefix:
+    raise RuntimeError(
+        f"installer Python prefix {sys.prefix!r} != fixed env {str(expected_prefix)!r}"
+    )
+gpu_evidence_path = Path(os.environ["SPARGEATTN_GPU_EVIDENCE_PATH"])
+gpu_evidence = json.loads(gpu_evidence_path.read_text(encoding="utf-8"))
+gpu_evidence_errors = validate_pre_run_gpu_report(
+    gpu_evidence,
+    cuda_visible_devices=gpu_evidence.get("cuda_visible_devices"),
+)
+if gpu_evidence_errors:
+    raise RuntimeError(
+        "invalid install-time pre-run GPU evidence: "
+        + "; ".join(gpu_evidence_errors)
+    )
 microtest = run_microtest(
     kernel=spas_sage2_attn_meansim_topk_cuda,
     device_index=0,
 )
+if microtest.get("device_uuid") != gpu_evidence.get("device_uuid"):
+    raise RuntimeError(
+        "SpargeAttn microtest GPU UUID differs from install-time idle evidence"
+    )
 installed_files = {}
 ldd_env = os.environ.copy()
 torch_lib = Path(torch.__file__).resolve().parent / "lib"
@@ -157,6 +198,31 @@ for path in sorted(package_root.rglob("*")):
 
 build_log_path = Path(os.environ["SPARGEATTN_BUILD_LOG_PATH"])
 build_log_digest = hashlib.sha256(build_log_path.read_bytes()).hexdigest()
+source_core_path = (
+    Path(os.environ["SPARGEATTN_SOURCE_DIR"]) / "spas_sage_attn" / "core.py"
+).resolve()
+source_core_bytes = source_core_path.read_bytes()
+source_core = {
+    "path": str(source_core_path),
+    "bytes": len(source_core_bytes),
+    "sha256": hashlib.sha256(source_core_bytes).hexdigest(),
+}
+installed_core = next(
+    (
+        metadata
+        for name, metadata in installed_files.items()
+        if Path(name).name == "core.py"
+    ),
+    None,
+)
+if installed_core is None or (
+    installed_core.get("bytes") != source_core["bytes"]
+    or installed_core.get("sha256") != source_core["sha256"]
+):
+    raise RuntimeError(
+        "installed spas_sage_attn/core.py differs from the pinned source checkout"
+    )
+gpu_evidence_bytes = gpu_evidence_path.read_bytes()
 
 def command_output(command):
     return subprocess.check_output(
@@ -173,6 +239,7 @@ receipt = {
     "package": "spas_sage_attn",
     "package_version": importlib.metadata.version("spas_sage_attn"),
     "source_dir": os.environ["SPARGEATTN_SOURCE_DIR"],
+    "source_core": source_core,
     "installed_package_root": str(package_root),
     "installed_files": installed_files,
     "python": os.sys.version.split()[0],
@@ -191,15 +258,35 @@ receipt = {
         "bytes": build_log_path.stat().st_size,
         "sha256": build_log_digest,
     },
+    "install_pre_run_gpu": {
+        "path": str(gpu_evidence_path),
+        "bytes": len(gpu_evidence_bytes),
+        "sha256": hashlib.sha256(gpu_evidence_bytes).hexdigest(),
+        "device_uuid": gpu_evidence["device_uuid"],
+    },
     "microtest": microtest,
     "installed_at_utc": datetime.now(timezone.utc).isoformat(),
 }
 path = Path(os.environ["SPARGEATTN_RECEIPT_PATH"])
 path.write_text(
-    json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    json.dumps(
+        receipt,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+        allow_nan=False,
+    ) + "\n",
     encoding="utf-8",
 )
-print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
+print(
+    json.dumps(
+        receipt,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+        allow_nan=False,
+    )
+)
 PY
 
 "${FASTA2V_OVI_ENV}/bin/python" -m pip freeze \

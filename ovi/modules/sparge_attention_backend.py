@@ -17,13 +17,16 @@ import json
 import os
 from pathlib import Path
 
-
-SPARGEATTN_REPOSITORY = "https://github.com/thu-ml/SpargeAttn.git"
-SPARGEATTN_CLONE_URL = "ssh://git@ssh.github.com:443/thu-ml/SpargeAttn.git"
-SPARGEATTN_COMMIT = "ae5b629ebb41e41f86b3ea2ab5a3283f13ac151a"
-SPARGEATTN_API = "spas_sage2_attn_meansim_topk_cuda"
-SPARGEATTN_MICROTEST_SHAPE = (1, 132, 24, 128)
-SPARGEATTN_MICROTEST_MIN_COSINE = 0.90
+from ovi.sparge_evidence import (
+    SPARGEATTN_API,
+    SPARGEATTN_CLONE_URL,
+    SPARGEATTN_COMMIT,
+    SPARGEATTN_MICROTEST_MIN_COSINE,
+    SPARGEATTN_MICROTEST_SHAPE,
+    SPARGEATTN_REPOSITORY,
+    sparge_microtest_evidence_errors,
+    sparge_receipt_evidence_errors,
+)
 
 
 class SpargeAttentionDependencyError(RuntimeError):
@@ -40,6 +43,22 @@ def _sha256_file(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _verify_receipt_file(path, metadata, label):
+    if not isinstance(metadata, dict):
+        raise SpargeAttentionDependencyError(f"SpargeAttn receipt lacks {label}")
+    path = Path(path).resolve()
+    if not path.is_file():
+        raise SpargeAttentionDependencyError(f"SpargeAttn {label} is missing: {path}")
+    actual = {"bytes": path.stat().st_size, "sha256": _sha256_file(path)}
+    if metadata.get("bytes") != actual["bytes"] or metadata.get("sha256") != actual[
+        "sha256"
+    ]:
+        raise SpargeAttentionDependencyError(
+            f"SpargeAttn {label} fingerprint mismatch: {actual}"
+        )
+    return path
 
 
 def _verify_installed_file_fingerprints(receipt):
@@ -130,61 +149,49 @@ def verify_sparge_install_receipt(receipt_path=None):
             f"Invalid SpargeAttn install receipt at {receipt_path}: {exc}"
         ) from exc
 
-    expected = {
-        "repository": SPARGEATTN_REPOSITORY,
-        "clone_url": SPARGEATTN_CLONE_URL,
-        "commit": SPARGEATTN_COMMIT,
-        "api": SPARGEATTN_API,
-    }
-    mismatches = {
-        key: {"expected": value, "actual": receipt.get(key)}
-        for key, value in expected.items()
-        if receipt.get(key) != value
-    }
-    if mismatches:
+    cache_root = os.environ.get(
+        "FASTA2V_CACHE_ROOT", "/cache/liluchen/FastA2V"
+    )
+    receipt_errors = sparge_receipt_evidence_errors(
+        receipt, expected_cache_root=cache_root
+    )
+    if receipt_errors:
         raise SpargeAttentionDependencyError(
-            "SpargeAttn install receipt does not match the pinned official "
-            f"dependency: {mismatches}. Re-run "
+            "SpargeAttn install receipt does not match the audited official "
+            f"dependency: {receipt_errors}. Re-run "
             "'bash scripts/install_sparge_attn.sh'."
         )
-    microtest = receipt.get("microtest")
-    if not isinstance(microtest, dict) or microtest.get("status") != "ok":
-        raise SpargeAttentionDependencyError(
-            "SpargeAttn receipt is missing a successful real CUDA microtest"
-        )
-    if microtest.get("shape") != list(SPARGEATTN_MICROTEST_SHAPE):
-        raise SpargeAttentionDependencyError(
-            "SpargeAttn receipt microtest shape does not match the audited NHD "
-            f"shape {list(SPARGEATTN_MICROTEST_SHAPE)}"
-        )
-    expected_microtest = {
-        "compute_capability": [8, 0],
-        "dtype": "torch.bfloat16",
-        "tensor_layout": "NHD",
-        "tested_topk": [0.5, 1.0],
-    }
-    microtest_mismatches = {
-        key: {"expected": value, "actual": microtest.get(key)}
-        for key, value in expected_microtest.items()
-        if microtest.get(key) != value
-    }
-    if microtest_mismatches:
-        raise SpargeAttentionDependencyError(
-            "SpargeAttn receipt CUDA microtest does not match the audited "
-            f"protocol: {microtest_mismatches}"
-        )
+    package_root = _verify_installed_file_fingerprints(receipt)
+    source_core = receipt["source_core"]
+    source_core_path = _verify_receipt_file(
+        source_core.get("path"), source_core, "pinned source core.py"
+    )
     try:
-        cosine = float(microtest.get("cosine_vs_sdpa"))
-    except (TypeError, ValueError) as exc:
+        source_core_path.relative_to(Path(receipt["source_dir"]).resolve())
+    except (KeyError, TypeError, ValueError) as exc:
         raise SpargeAttentionDependencyError(
-            "SpargeAttn receipt has an invalid CUDA microtest cosine"
+            "SpargeAttn source core.py is outside the pinned source checkout"
         ) from exc
-    if not SPARGEATTN_MICROTEST_MIN_COSINE <= cosine <= 1.0001:
-        raise SpargeAttentionDependencyError(
-            "SpargeAttn receipt CUDA microtest cosine is below the audited "
-            f"minimum: {cosine} < {SPARGEATTN_MICROTEST_MIN_COSINE}"
+    installed_core_path = package_root / "core.py"
+    if not installed_core_path.is_file():
+        installed_core_path = next(
+            (
+                package_root / name
+                for name in receipt["installed_files"]
+                if Path(name).name == "core.py"
+            ),
+            installed_core_path,
         )
-    _verify_installed_file_fingerprints(receipt)
+    if _sha256_file(installed_core_path) != _sha256_file(source_core_path):
+        raise SpargeAttentionDependencyError(
+            "Installed SpargeAttn core.py differs from the pinned source checkout"
+        )
+    build_log = receipt["build_log"]
+    _verify_receipt_file(build_log.get("path"), build_log, "build log")
+    install_gpu = receipt["install_pre_run_gpu"]
+    _verify_receipt_file(
+        install_gpu.get("path"), install_gpu, "install-time pre-run GPU evidence"
+    )
     return receipt_path, receipt
 
 

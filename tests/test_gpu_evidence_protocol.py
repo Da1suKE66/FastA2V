@@ -172,10 +172,28 @@ class RunnerOrderingTests(unittest.TestCase):
         cli_source = (
             REPO_ROOT / "scripts" / "check_pre_run_gpu.py"
         ).read_text(encoding="utf-8")
-        self.assertNotIn("import torch", source)
-        self.assertNotIn("import torch", cli_source)
-        self.assertNotIn("torch.cuda", source)
-        self.assertNotIn("torch.cuda", cli_source)
+        sparge_evidence_source = (
+            REPO_ROOT / "ovi" / "sparge_evidence.py"
+        ).read_text(encoding="utf-8")
+        for evidence_source in (source, cli_source, sparge_evidence_source):
+            self.assertNotIn("import torch", evidence_source)
+            self.assertNotIn("torch.cuda", evidence_source)
+
+    def test_sparge_installer_checks_idle_gpu_before_build_and_microtest(self):
+        source = (REPO_ROOT / "scripts" / "install_sparge_attn.sh").read_text(
+            encoding="utf-8"
+        )
+        check_offset = source.index("scripts/check_pre_run_gpu.py")
+        build_offset = source.index('"${FASTA2V_OVI_ENV}/bin/python" -m pip install')
+        microtest_offset = source.index("from scripts.sparge_attn_microtest")
+        self.assertLess(check_offset, build_offset)
+        self.assertLess(check_offset, microtest_offset)
+
+    def test_sparge_runners_copy_hashed_build_and_install_gpu_evidence(self):
+        for filename in ("run_ovi_sparge_smoke.sh", "run_ovi_sparge_baseline.sh"):
+            source = (REPO_ROOT / "scripts" / filename).read_text(encoding="utf-8")
+            self.assertIn("spargeattn-build.log", source)
+            self.assertIn("spargeattn-install-pre_run_gpu.json", source)
 
 
 if __name__ == "__main__":

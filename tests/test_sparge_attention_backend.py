@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from ovi.sparge_evidence import sparge_microtest_evidence_errors
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_PATH = REPO_ROOT / "ovi" / "modules" / "sparge_attention_backend.py"
@@ -28,6 +30,87 @@ SpargeVideoSelfAttentionBackend = (
 )
 load_official_sparge_kernel = BACKEND_MODULE.load_official_sparge_kernel
 verify_sparge_install_receipt = BACKEND_MODULE.verify_sparge_install_receipt
+
+GPU_UUID = "GPU-11111111-2222-3333-4444-555555555555"
+
+
+def complete_microtest():
+    return {
+        "status": "ok",
+        "device": "NVIDIA A100-SXM4-80GB",
+        "device_uuid": GPU_UUID,
+        "shape": [1, 132, 24, 128],
+        "compute_capability": [8, 0],
+        "torch": "2.6.0+cu124",
+        "torch_cuda": "12.4",
+        "torch_cxx11_abi": False,
+        "dtype": "torch.bfloat16",
+        "tensor_layout": "NHD",
+        "tested_topk": [0.5, 1.0],
+        "cosine_vs_sdpa": 0.99,
+        "max_abs_difference_vs_sdpa": 0.1,
+    }
+
+
+def complete_receipt_metadata():
+    digest = "a" * 64
+    core = {"bytes": 20, "sha256": digest}
+    return {
+        "repository": "https://github.com/thu-ml/SpargeAttn.git",
+        "clone_url": "ssh://git@ssh.github.com:443/thu-ml/SpargeAttn.git",
+        "commit": SPARGEATTN_COMMIT,
+        "api": SPARGEATTN_API,
+        "package": "spas_sage_attn",
+        "package_version": "0.1.0",
+        "python": "3.11.15",
+        "torch": "2.6.0+cu124",
+        "torch_cuda": "12.4",
+        "torch_cxx11_abi": False,
+        "triton": "3.2.0",
+        "cuda_home": "/usr/local/cuda-12.1",
+        "torch_cuda_arch_list": "8.0",
+        "max_jobs": 2,
+        "source_dir": (
+            "/cache/liluchen/FastA2V/sources/SpargeAttn-" + SPARGEATTN_COMMIT
+        ),
+        "source_core": {
+            "path": (
+                "/cache/liluchen/FastA2V/sources/SpargeAttn-"
+                + SPARGEATTN_COMMIT
+                + "/spas_sage_attn/core.py"
+            ),
+            **core,
+        },
+        "installed_package_root": (
+            "/cache/liluchen/FastA2V/envs/ovi/lib/python3.11/site-packages/"
+            "spas_sage_attn"
+        ),
+        "installed_files": {
+            "core.py": dict(core),
+            "_qattn.test.so": {
+                "bytes": 1,
+                "sha256": "b" * 64,
+                "ldd_not_found": [],
+            },
+            "_fused.test.so": {
+                "bytes": 1,
+                "sha256": "c" * 64,
+                "ldd_not_found": [],
+            },
+        },
+        "build_log": {
+            "path": "/cache/liluchen/FastA2V/spargeattn-build.log",
+            "bytes": 1,
+            "sha256": digest,
+        },
+        "install_pre_run_gpu": {
+            "path": "/cache/liluchen/FastA2V/spargeattn-pre_run_gpu.json",
+            "bytes": 1,
+            "sha256": digest,
+            "device_uuid": GPU_UUID,
+        },
+        "microtest": complete_microtest(),
+    }
 
 
 class FakeDevice:
@@ -430,8 +513,16 @@ class SpargeAttentionBackendTests(unittest.TestCase):
 
     def test_install_receipt_fingerprints_detect_package_drift(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "spas_sage_attn"
-            root.mkdir()
+            root = (
+                Path(directory)
+                / "envs"
+                / "ovi"
+                / "lib"
+                / "python3.11"
+                / "site-packages"
+                / "spas_sage_attn"
+            )
+            root.mkdir(parents=True)
             for name, content in {
                 "core.py": b"official python core\n",
                 "_qattn.test.so": b"official qattn extension\n",
@@ -445,36 +536,75 @@ class SpargeAttentionBackendTests(unittest.TestCase):
                     "bytes": path.stat().st_size,
                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                 }
-            receipt = {
-                "repository": "https://github.com/thu-ml/SpargeAttn.git",
-                "clone_url": "ssh://git@ssh.github.com:443/thu-ml/SpargeAttn.git",
-                "commit": SPARGEATTN_COMMIT,
-                "api": SPARGEATTN_API,
-                "microtest": {
-                    "status": "ok",
-                    "shape": [1, 132, 24, 128],
-                    "compute_capability": [8, 0],
-                    "dtype": "torch.bfloat16",
-                    "tensor_layout": "NHD",
-                    "tested_topk": [0.5, 1.0],
-                    "cosine_vs_sdpa": 0.99,
-                },
-                "installed_package_root": str(root),
-                "installed_files": installed_files,
-            }
+                if path.suffix == ".so":
+                    installed_files[path.name]["ldd_not_found"] = []
+            source_dir = (
+                Path(directory)
+                / "sources"
+                / f"SpargeAttn-{SPARGEATTN_COMMIT}"
+                / "spas_sage_attn"
+            )
+            source_dir.mkdir(parents=True)
+            source_core_path = source_dir / "core.py"
+            source_core_path.write_bytes((root / "core.py").read_bytes())
+            build_log_path = Path(directory) / "spargeattn-build.log"
+            build_log_path.write_text("official build log\n", encoding="utf-8")
+            install_gpu_path = Path(directory) / "spargeattn-pre_run_gpu.json"
+            install_gpu_path.write_text("{}\n", encoding="utf-8")
+
+            receipt = complete_receipt_metadata()
+            receipt.update(
+                {
+                    "source_dir": str(source_dir.parent),
+                    "source_core": {
+                        "path": str(source_core_path),
+                        "bytes": source_core_path.stat().st_size,
+                        "sha256": hashlib.sha256(
+                            source_core_path.read_bytes()
+                        ).hexdigest(),
+                    },
+                    "installed_package_root": str(root),
+                    "installed_files": installed_files,
+                    "build_log": {
+                        "path": str(build_log_path),
+                        "bytes": build_log_path.stat().st_size,
+                        "sha256": hashlib.sha256(
+                            build_log_path.read_bytes()
+                        ).hexdigest(),
+                    },
+                    "install_pre_run_gpu": {
+                        "path": str(install_gpu_path),
+                        "bytes": install_gpu_path.stat().st_size,
+                        "sha256": hashlib.sha256(
+                            install_gpu_path.read_bytes()
+                        ).hexdigest(),
+                        "device_uuid": GPU_UUID,
+                    },
+                }
+            )
             receipt_path = Path(directory) / "spargeattn-install.json"
             receipt_path.write_text(
                 json.dumps(receipt, indent=2) + "\n", encoding="utf-8"
             )
-            verified_path, verified = verify_sparge_install_receipt(receipt_path)
+            with mock.patch.dict(
+                BACKEND_MODULE.os.environ,
+                {"FASTA2V_CACHE_ROOT": directory},
+            ):
+                verified_path, verified = verify_sparge_install_receipt(
+                    receipt_path
+                )
             self.assertEqual(verified_path, receipt_path)
             self.assertEqual(verified, receipt)
 
             (root / "core.py").write_text("changed\n", encoding="utf-8")
-            with self.assertRaisesRegex(
-                SpargeAttentionDependencyError, "differ from the pinned"
+            with mock.patch.dict(
+                BACKEND_MODULE.os.environ,
+                {"FASTA2V_CACHE_ROOT": directory},
             ):
-                verify_sparge_install_receipt(receipt_path)
+                with self.assertRaisesRegex(
+                    SpargeAttentionDependencyError, "differ from the pinned"
+                ):
+                    verify_sparge_install_receipt(receipt_path)
 
     def test_install_receipt_requires_real_cuda_microtest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -490,10 +620,17 @@ class SpargeAttentionBackendTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(
-                SpargeAttentionDependencyError, "real CUDA microtest"
-            ):
+            with self.assertRaisesRegex(SpargeAttentionDependencyError, "microtest"):
                 verify_sparge_install_receipt(receipt_path)
+
+    def test_microtest_evidence_rejects_nonfinite_comparison(self):
+        evidence = complete_microtest()
+        evidence["cosine_vs_sdpa"] = float("nan")
+        evidence["max_abs_difference_vs_sdpa"] = float("inf")
+        errors = sparge_microtest_evidence_errors(
+            evidence, expected_gpu_uuid=GPU_UUID
+        )
+        self.assertEqual(sum("must be finite" in error for error in errors), 2)
 
     def test_adapter_uses_public_package_api_not_private_kernel_modules(self):
         source = BACKEND_PATH.read_text(encoding="utf-8")
@@ -525,14 +662,12 @@ class SpargeAttentionBackendTests(unittest.TestCase):
         inference_source = (REPO_ROOT / "inference.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn(
-            'allowed_pre_run_files.add("spargeattn-install.json")',
-            inference_source,
-        )
-        self.assertIn(
-            'evidence_filenames.append("spargeattn-install.json")',
-            inference_source,
-        )
+        for filename in (
+            "spargeattn-install.json",
+            "spargeattn-build.log",
+            "spargeattn-install-pre_run_gpu.json",
+        ):
+            self.assertGreaterEqual(inference_source.count(f'"{filename}"'), 2)
 
     def test_formal_verifier_requires_sparge_backend_provenance_and_calls(self):
         verifier_path = REPO_ROOT / "scripts" / "verify_ovi_output.py"
@@ -543,12 +678,21 @@ class SpargeAttentionBackendTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"numpy": SimpleNamespace()}):
             verifier_spec.loader.exec_module(verifier_module)
 
-        receipt = {"commit": SPARGEATTN_COMMIT, "installed_files": {}}
+        receipt = complete_receipt_metadata()
         dispatcher = {
             "calls_total": 2950,
+            "calls_by_method": {
+                "dense": 0,
+                "sparge": 2950,
+                "radial": 0,
+                "svg": 0,
+            },
             "backend_details": {
                 **verifier_module.SPARGE_PROVENANCE,
                 "calls": 2950,
+                "last_nhd_shape": [1, 15004, 24, 128],
+                "last_dtype": "torch.bfloat16",
+                "last_device": "cuda:0",
                 "topk": 0.5,
                 "pvthreshd": 50.0,
                 "smooth_k": True,
@@ -565,6 +709,7 @@ class SpargeAttentionBackendTests(unittest.TestCase):
                 "pvthreshd": 50.0,
                 "smooth_k": True,
             },
+            expected_gpu_uuid=GPU_UUID,
         )
         self.assertEqual(errors, [])
 

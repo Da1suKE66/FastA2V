@@ -30,16 +30,23 @@ environment, and installation receipt below `/cache/liluchen/FastA2V`. It sets
 `TORCH_CUDA_ARCH_LIST=8.0` by default for the A100 and invokes the upstream
 `setup.py` through `pip`; FastA2V does not copy, modify, or implement any CUDA
 or Triton kernel. A successful build writes
-`/cache/liluchen/FastA2V/spargeattn-install.json`. Sparse inference refuses to
+`/cache/liluchen/FastA2V/spargeattn-install.json` and preserves the complete
+build log. Before the build and its real CUDA microtest, the installer requires
+physical GPU 0 to be idle and records its UUID and process list. Sparse
+inference refuses to
 start if that receipt does not identify the pinned repository, commit, and API,
 or if the installed `core.py`, `_qattn*.so`, and `_fused*.so` fingerprints have
-changed. The formal run verifier cross-checks the copied receipt against
+changed. The installed `core.py` must also be byte-identical to the pinned
+source checkout, the package must resolve from the fixed Ovi environment, and
+the copied build log must match its receipt hash. The formal run verifier
+cross-checks the copied receipt against
 preflight evidence and every warm-up/measurement backend record. Installation
 also launches the pinned public API at `topk=0.5` and `topk=1.0` on a real BF16
 NHD `[1,132,24,128]` tensor. The non-block-aligned sequence length exercises a
 tail path like Ovi's 15004 tokens; the test checks finite outputs and requires
-a broad full-mask cosine agreement with SDPA. Preflight repeats that microtest
-before loading the Ovi model.
+a broad full-mask cosine agreement with SDPA. All comparison numbers must be
+finite. Preflight repeats that microtest before loading the Ovi model and binds
+it to the runner's idle-GPU UUID evidence.
 
 The upstream package requires CUDA 12 or newer and supports head dimensions 64
 and 128. The first GPU validation must therefore check the actual compiler,
