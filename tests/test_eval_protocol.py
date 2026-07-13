@@ -29,6 +29,10 @@ EXPECTED_RUN_KINDS = {
     "sparge_diagnostic_smoke",
     "sparge_topk75_baseline",
     "sparge_topk75_diagnostic_smoke",
+    "radial_conservative_baseline",
+    "radial_conservative_diagnostic_smoke",
+    "radial_aggressive_baseline",
+    "radial_aggressive_diagnostic_smoke",
 }
 
 RUN_KIND_CONFIGS = {
@@ -44,6 +48,16 @@ RUN_KIND_CONFIGS = {
     "sparge_topk75_baseline": "ovi_720x720_5s_sparge_topk75.yaml",
     "sparge_topk75_diagnostic_smoke": (
         "ovi_720x720_5s_sparge_topk75_smoke.yaml"
+    ),
+    "radial_conservative_baseline": (
+        "ovi_720x720_5s_radial_conservative.yaml"
+    ),
+    "radial_conservative_diagnostic_smoke": (
+        "ovi_720x720_5s_radial_conservative_smoke.yaml"
+    ),
+    "radial_aggressive_baseline": "ovi_720x720_5s_radial_aggressive.yaml",
+    "radial_aggressive_diagnostic_smoke": (
+        "ovi_720x720_5s_radial_aggressive_smoke.yaml"
     ),
 }
 
@@ -239,6 +253,7 @@ class ImmutableEvalProtocolTests(unittest.TestCase):
         ]
         self.assertIn("validate_run_protocol", direct_calls)
         self.assertNotIn("validate_sparge_run_protocol", source)
+        self.assertNotIn("validate_radial_run_protocol", source)
 
     def test_official_reference_config_declares_its_protocol_identity(self):
         protocol = RUN_KIND_PROTOCOLS["official_reference"]

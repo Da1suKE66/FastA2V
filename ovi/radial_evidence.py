@@ -33,7 +33,7 @@ RADIAL_MASK_API = "gen_log_mask_shrinked"
 # distribution/version, and the first formal run remains invalid until the
 # strict output verifier sees a successful Radial dispatcher receipt.
 FLASHINFER_DISTRIBUTION = "flashinfer-python"
-FLASHINFER_VERSION = "0.2.5"
+FLASHINFER_VERSION = "0.2.5+cu124torch2.6"
 FLASHINFER_WHEEL_INDEX = "https://flashinfer.ai/whl/cu124/torch2.6/"
 FLASHINFER_REQUIRED_APIS = (
     "BlockSparseAttentionWrapper",
@@ -98,12 +98,12 @@ def radial_profile(profile):
     return profile_copy
 
 
-def _valid_fingerprint(metadata):
+def _valid_fingerprint(metadata, *, allow_empty=False):
     return (
         isinstance(metadata, dict)
         and isinstance(metadata.get("bytes"), int)
         and not isinstance(metadata.get("bytes"), bool)
-        and metadata["bytes"] > 0
+        and (metadata["bytes"] >= 0 if allow_empty else metadata["bytes"] > 0)
         and isinstance(metadata.get("sha256"), str)
         and len(metadata["sha256"]) == 64
     )
@@ -242,7 +242,7 @@ def radial_receipt_evidence_errors(
         if "__init__.py" not in installed_files:
             errors.append("receipt installed FlashInfer files lack __init__.py")
         for name, metadata in installed_files.items():
-            if not _valid_fingerprint(metadata):
+            if not _valid_fingerprint(metadata, allow_empty=True):
                 errors.append(
                     f"receipt installed FlashInfer fingerprint is invalid: {name}"
                 )

@@ -418,6 +418,14 @@ class RadialMaskAuditTests(unittest.TestCase):
         self.assertTrue(any("commit" in error for error in errors))
         self.assertTrue(any("CPU mask audit" in error for error in errors))
 
+    def test_receipt_accepts_legitimate_zero_byte_package_markers(self):
+        receipt = complete_receipt()
+        receipt["installed_flashinfer_files"]["py.typed"] = {
+            "bytes": 0,
+            "sha256": hashlib.sha256(b"").hexdigest(),
+        }
+        self.assertEqual(radial_receipt_evidence_errors(receipt), [])
+
     def test_cuda_microtest_evidence_is_cross_bound_and_finite(self):
         gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
         evidence = {
@@ -537,6 +545,7 @@ class RadialBackendExecutionTests(unittest.TestCase):
         self.assertEqual(wrapper.plan_kwargs["N"], 14976)
         self.assertEqual(wrapper.plan_kwargs["R"], 128)
         self.assertEqual(wrapper.plan_kwargs["C"], 128)
+        self.assertNotIn("o_data_type", wrapper.plan_kwargs)
         self.assertEqual(wrapper.run_calls[0][0].shape, (14976, 24, 128))
         self.assertEqual(wrapper.run_calls[0][1].shape, (14976, 24, 128))
         self.assertTrue(wrapper.run_calls[0][3])

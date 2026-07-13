@@ -73,6 +73,8 @@ def _run_protocol(
     debug_forward=False,
     debug_forward_step=0,
     sparge_topk=None,
+    radial_profile=None,
+    radial_decay_factor=None,
 ):
     protocol = {
         **_base_protocol(),
@@ -95,6 +97,15 @@ def _run_protocol(
                 "sparge_topk": sparge_topk,
                 "sparge_pvthreshd": 50.0,
                 "sparge_smooth_k": True,
+            }
+        )
+    elif attention_method == "radial":
+        protocol.update(
+            {
+                "radial_profile": radial_profile,
+                "radial_decay_factor": radial_decay_factor,
+                "radial_block_size": 128,
+                "radial_model_type": "wan",
             }
         )
     return protocol
@@ -190,6 +201,46 @@ def _build_protocols():
             measurement_runs=1,
             attention_method="sparge",
             sparge_topk=0.75,
+            debug_forward=True,
+        ),
+        _run_protocol(
+            "radial_conservative_baseline",
+            sample_steps=50,
+            warmup_runs=1,
+            measurement_runs=3,
+            attention_method="radial",
+            radial_profile="conservative",
+            radial_decay_factor=4.0,
+            benchmark_eligible=True,
+        ),
+        _run_protocol(
+            "radial_conservative_diagnostic_smoke",
+            sample_steps=20,
+            warmup_runs=0,
+            measurement_runs=1,
+            attention_method="radial",
+            radial_profile="conservative",
+            radial_decay_factor=4.0,
+            debug_forward=True,
+        ),
+        _run_protocol(
+            "radial_aggressive_baseline",
+            sample_steps=50,
+            warmup_runs=1,
+            measurement_runs=3,
+            attention_method="radial",
+            radial_profile="aggressive",
+            radial_decay_factor=1.0,
+            benchmark_eligible=True,
+        ),
+        _run_protocol(
+            "radial_aggressive_diagnostic_smoke",
+            sample_steps=20,
+            warmup_runs=0,
+            measurement_runs=1,
+            attention_method="radial",
+            radial_profile="aggressive",
+            radial_decay_factor=1.0,
             debug_forward=True,
         ),
     )

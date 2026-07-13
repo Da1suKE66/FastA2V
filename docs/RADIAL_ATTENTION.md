@@ -10,8 +10,8 @@ Triton kernel and does not copy the upstream mask algorithm.
 - SSH clone path: `ssh://git@ssh.github.com:443/mit-han-lab/radial-attention.git`
 - Commit: `72788d4f0a6d202f1ec5f1c98a6e4c8b2e34fdbc`
 - Official mask API: `gen_log_mask_shrinked`
-- Fixed FlashInfer candidate: `flashinfer-python==0.2.5` from the CUDA 12.4,
-  PyTorch 2.6 wheel index
+- Fixed FlashInfer candidate: `flashinfer-python==0.2.5+cu124torch2.6` from
+  the CUDA 12.4, PyTorch 2.6 wheel index
 
 The upstream checkout under `/cache/liluchen/FastA2V/sources` must remain
 pristine. The installer creates a separate derived copy and applies

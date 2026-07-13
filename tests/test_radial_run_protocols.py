@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from ovi.eval_protocol import materialize_run_protocol, run_protocol_errors
 from ovi.radial_evidence import (
     RADIAL_COMMIT,
     RADIAL_DERIVED_MODULE_SHA256,
@@ -25,38 +26,8 @@ with mock.patch.dict(sys.modules, {"numpy": SimpleNamespace()}):
 
 
 def fixed_environment(profile, *, smoke):
-    decay = 1.0 if profile == "aggressive" else 4.0
     suffix = "diagnostic_smoke" if smoke else "baseline"
-    return {
-        "run_kind": f"radial_{profile}_{suffix}",
-        "attention_method": "radial",
-        "model_name": "720x720_5s",
-        "mode": "t2v",
-        "video_frame_height_width": [720, 720],
-        "solver_name": "unipc",
-        "shift": 5.0,
-        "seed": 103,
-        "video_guidance_scale": 4.0,
-        "audio_guidance_scale": 3.0,
-        "fp8": False,
-        "qint8": False,
-        "cpu_offload": False,
-        "sp_size": 1,
-        "slg_layer": 11,
-        "prompt_count": 1,
-        "each_example_n_times": 1,
-        "radial_profile": profile,
-        "radial_decay_factor": decay,
-        "radial_block_size": 128,
-        "radial_model_type": "wan",
-        "use_cfg_cache": False,
-        "use_block_cache": False,
-        "sample_steps": 20 if smoke else 50,
-        "warmup_runs": 0 if smoke else 1,
-        "measurement_runs": 1 if smoke else 3,
-        "benchmark_eligible": not smoke,
-        "debug_forward": smoke,
-    }
+    return materialize_run_protocol(f"radial_{profile}_{suffix}")
 
 
 class RadialRunProtocolTests(unittest.TestCase):
@@ -65,23 +36,19 @@ class RadialRunProtocolTests(unittest.TestCase):
             for smoke in (False, True):
                 with self.subTest(profile=profile, smoke=smoke):
                     environment = fixed_environment(profile, smoke=smoke)
-                    errors = []
-                    VERIFIER.validate_radial_run_protocol(environment, errors)
-                    self.assertEqual(errors, [])
+                    self.assertEqual(run_protocol_errors(environment), [])
 
     def test_mixed_cache_or_profile_drift_is_rejected(self):
         environment = fixed_environment("conservative", smoke=False)
         environment["use_cfg_cache"] = True
         environment["radial_decay_factor"] = 1.0
-        errors = []
-        VERIFIER.validate_radial_run_protocol(environment, errors)
+        errors = run_protocol_errors(environment)
         self.assertTrue(any("use_cfg_cache" in error for error in errors))
         self.assertTrue(any("radial_decay_factor" in error for error in errors))
 
         environment["run_kind"] = "radial_unreviewed"
-        errors = []
-        VERIFIER.validate_radial_run_protocol(environment, errors)
-        self.assertTrue(any("not an audited" in error for error in errors))
+        errors = run_protocol_errors(environment)
+        self.assertTrue(any("not an audited immutable" in error for error in errors))
 
     def test_configs_are_pure_radial_and_bind_profile_decay(self):
         cases = {
@@ -270,7 +237,7 @@ class RadialPinAndInstallerTests(unittest.TestCase):
             RADIAL_OPTIONAL_IMPORTS_PATCH_SHA256,
             'UPSTREAM_CLONE_URL="ssh://git@ssh.github.com:443/',
             'GITHUB_SSH_KEY="/home/ma-user/.ssh/id_ed25519_github"',
-            'FLASHINFER_VERSION="0.2.5"',
+            'FLASHINFER_VERSION="0.2.5+cu124torch2.6"',
             'FLASHINFER_MANIFEST_PATH="${FASTA2V_CACHE_ROOT}/',
             'metadata_value["ldd_output"] = ldd_output',
             '"flashinfer_manifest": fingerprint(flashinfer_manifest_path)',

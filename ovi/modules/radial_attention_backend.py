@@ -620,7 +620,6 @@ class RadialVideoSelfAttentionBackend:
             head_dim=RADIAL_HEAD_DIM,
             q_data_type=q.dtype,
             kv_data_type=q.dtype,
-            o_data_type=q.dtype,
         )
         frozen_audit = tuple(
             sorted(
