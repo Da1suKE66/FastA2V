@@ -22,6 +22,10 @@ from ovi.utils.processing_utils import clean_text, preprocess_image_tensor, snap
 import re
 from optimum.quanto import freeze, qint8, quantize
 from ovi.cfg_cache import CfgNegativeCache, validate_cfg_cache_config
+from ovi.modules.video_attention_dispatcher import (
+    VideoSelfAttentionDispatcher,
+    expected_video_self_attention_calls,
+)
 
 DEFAULT_CONFIG = OmegaConf.load('ovi/configs/inference/inference_fusion.yaml')
 
@@ -61,6 +65,9 @@ class OviFusionEngine:
                 f"Unsupported attention_method={self.attention_method!r}; "
                 "expected one of dense, sparge, radial, svg."
             )
+        self.video_self_attention_dispatcher = VideoSelfAttentionDispatcher(
+            self.attention_method
+        )
         self.use_cfg_cache = bool(config.get("use_cfg_cache", False))
         self.use_block_cache = bool(config.get("use_block_cache", False))
         self.cfg_cache_start_step = int(config.get("cfg_cache_start_step", 10))
@@ -73,11 +80,6 @@ class OviFusionEngine:
                 self.cfg_cache_start_step,
                 self.cfg_cache_end_step,
                 self.cfg_cache_refresh_interval,
-            )
-        if self.attention_method != "dense":
-            raise NotImplementedError(
-                f"attention_method={self.attention_method!r} is not wired yet; "
-                "refusing to silently run the dense path."
             )
         if self.use_block_cache:
             raise NotImplementedError(
@@ -95,6 +97,9 @@ class OviFusionEngine:
             logging.info("CPU offloading is enabled. Initializing all models aside from VAEs on CPU")
 
         model, video_config, audio_config = init_fusion_score_model_ovi(rank=device, meta_init=meta_init)
+        model.set_video_self_attention_dispatcher(
+            self.video_self_attention_dispatcher
+        )
 
         fp8 = config.get("fp8", False)
         int8 = config.get("qint8", False)
@@ -193,6 +198,12 @@ class OviFusionEngine:
                 ):
 
         original_text_prompt = text_prompt
+        self.video_self_attention_dispatcher.reset_metrics()
+        expected_attention_calls = expected_video_self_attention_calls(
+            sample_steps=int(sample_steps),
+            num_blocks=int(self.model.num_blocks),
+            slg_layer=int(slg_layer),
+        )
         torch.cuda.reset_peak_memory_stats(self.device)
         torch.cuda.synchronize(self.device)
         generation_started = time.perf_counter()
@@ -235,6 +246,10 @@ class OviFusionEngine:
                 if video_frame_height_width is not None
                 else None
             ),
+            "video_self_attention_dispatcher": {
+                **self.video_self_attention_dispatcher.metrics(),
+                "expected_calls": expected_attention_calls,
+            },
         }
 
         params = {
@@ -555,6 +570,10 @@ class OviFusionEngine:
                 "peak_memory_reserved_bytes": int(torch.cuda.max_memory_reserved(self.device)),
                 "generated_video_shape": list(generated_video.shape),
                 "generated_audio_shape": list(generated_audio.shape),
+                "video_self_attention_dispatcher": {
+                    **self.video_self_attention_dispatcher.metrics(),
+                    "expected_calls": expected_attention_calls,
+                },
             })
             logging.info(
                 "Generation metrics: total=%.3fs denoise=%.3fs peak_allocated=%.3fGiB",
@@ -574,6 +593,10 @@ class OviFusionEngine:
                 "total_generation_seconds": time.perf_counter() - generation_started,
                 "peak_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(self.device)) if torch.cuda.is_available() else 0,
                 "peak_memory_reserved_bytes": int(torch.cuda.max_memory_reserved(self.device)) if torch.cuda.is_available() else 0,
+                "video_self_attention_dispatcher": {
+                    **self.video_self_attention_dispatcher.metrics(),
+                    "expected_calls": expected_attention_calls,
+                },
             })
             logging.error(traceback.format_exc())
             return None

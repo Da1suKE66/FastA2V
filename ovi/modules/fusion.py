@@ -5,12 +5,14 @@ import torch
 import torch.nn as nn
 from ovi.modules.model import WanLayerNorm, WanModel, WanRMSNorm, gradient_checkpointing, rope_apply
 from ovi.modules.attention import flash_attention
+from ovi.modules.video_attention_dispatcher import VideoSelfAttentionDispatcher
 from ovi.distributed_comms.communications import all_gather, all_to_all_4D
 from ovi.distributed_comms.parallel_states import nccl_info, get_sequence_parallel_state
 
 class FusionModel(nn.Module):
     def __init__(self, video_config=None, audio_config=None):
         super().__init__()
+        self.video_self_attention_dispatcher = VideoSelfAttentionDispatcher("dense")
         has_video = True 
         has_audio = True
         if video_config is not None:
@@ -38,6 +40,13 @@ class FusionModel(nn.Module):
             self.inject_cross_attention_kv_projections()
 
         self.init_weights()
+
+    def set_video_self_attention_dispatcher(self, dispatcher):
+        if not isinstance(dispatcher, VideoSelfAttentionDispatcher):
+            raise TypeError(
+                "dispatcher must be a VideoSelfAttentionDispatcher instance"
+            )
+        self.video_self_attention_dispatcher = dispatcher
         
     def inject_cross_attention_kv_projections(self):
         for vid_block in self.video_model.blocks:
@@ -219,11 +228,14 @@ class FusionModel(nn.Module):
                 vid_grid_sizes.detach().cpu().tolist(),
             )
 
-        vid_y = vid_block.self_attn(
+        vid_y = self.video_self_attention_dispatcher(
+            vid_block.self_attn,
             vid_self_attn_input,
             vid_seq_lens,
             vid_grid_sizes,
             vid_freqs,
+            block_index=block_index,
+            debug_context=debug_context,
         )
 
         if debug_enabled:
