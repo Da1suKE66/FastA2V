@@ -179,16 +179,18 @@ def radial_ldd_search_paths(
     cache_root = Path(cache_root)
     return (
         str(
-            cache_root
-            / "envs"
-            / "ovi"
-            / "lib"
-            / "python3.11"
-            / "site-packages"
-            / "torch"
-            / "lib"
+            (
+                cache_root
+                / "envs"
+                / "ovi"
+                / "lib"
+                / "python3.11"
+                / "site-packages"
+                / "torch"
+                / "lib"
+            ).resolve()
         ),
-        str(Path(RADIAL_CUDA_HOME) / "lib64"),
+        str((Path(RADIAL_CUDA_HOME) / "lib64").resolve()),
     )
 
 

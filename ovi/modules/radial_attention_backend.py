@@ -128,8 +128,8 @@ def _verify_installed_flashinfer_files(receipt):
             "Radial receipt points to an unexpected ldd executable"
         )
     expected_search_paths = (
-        str(package_root.parent / "torch" / "lib"),
-        str(Path(RADIAL_CUDA_HOME) / "lib64"),
+        str((package_root.parent / "torch" / "lib").resolve()),
+        str((Path(RADIAL_CUDA_HOME) / "lib64").resolve()),
     )
     search_paths = tuple(receipt.get("ldd_search_paths", ()))
     if receipt.get("cuda_home") != RADIAL_CUDA_HOME:

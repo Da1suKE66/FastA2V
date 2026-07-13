@@ -267,8 +267,9 @@ class RadialPinAndInstallerTests(unittest.TestCase):
         self.assertIn("compgen -e", radial_env)
         self.assertIn('== LD_*', radial_env)
         self.assertIn("unset GLIBC_TUNABLES", radial_env)
+        self.assertIn("readlink -f", radial_env)
         self.assertIn(
-            'export LD_LIBRARY_PATH="${FASTA2V_OVI_ENV}/lib/python3.11/',
+            'export LD_LIBRARY_PATH="${RADIAL_TORCH_LIB}:${RADIAL_CUDA_LIB}"',
             radial_env,
         )
 

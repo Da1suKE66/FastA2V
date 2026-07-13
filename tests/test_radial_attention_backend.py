@@ -28,6 +28,7 @@ from ovi.radial_evidence import (
     ldd_resolved_library_paths,
     normalize_ldd_output,
     radial_profile,
+    radial_ldd_search_paths,
     radial_microtest_evidence_errors,
     radial_receipt_evidence_errors,
 )
@@ -252,6 +253,7 @@ def complete_receipt():
     flashinfer_init = {"bytes": 1, "sha256": "f" * 64}
     native_ldd = "libtorch.so => /fixed/libtorch.so (0x0000)\n"
     native_ldd_normalized = normalize_ldd_output(native_ldd)
+    ldd_search_paths = list(radial_ldd_search_paths(root))
     return {
         "repository": "https://github.com/mit-han-lab/radial-attention.git",
         "clone_url": (
@@ -301,10 +303,7 @@ def complete_receipt():
             "bytes": 1,
             "sha256": "d" * 64,
         },
-        "ldd_search_paths": [
-            f"{root}/envs/ovi/lib/python3.11/site-packages/torch/lib",
-            "/usr/local/cuda-12.1/lib64",
-        ],
+        "ldd_search_paths": ldd_search_paths,
         "ldd_dependencies": {
             "/fixed/libtorch.so": {
                 "path": "/fixed/libtorch.so",
@@ -314,8 +313,7 @@ def complete_receipt():
         },
         "runtime_loader_environment": {
             "LD_LIBRARY_PATH": (
-                f"{root}/envs/ovi/lib/python3.11/site-packages/torch/lib:"
-                "/usr/local/cuda-12.1/lib64"
+                ":".join(ldd_search_paths)
             ),
             "forbidden_prefixes": ["LD_"],
             "unset": list(RADIAL_FORBIDDEN_LOADER_VARIABLES),

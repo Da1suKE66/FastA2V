@@ -15,4 +15,16 @@ while IFS= read -r variable; do
   fi
 done < <(compgen -e)
 unset GLIBC_TUNABLES
-export LD_LIBRARY_PATH="${FASTA2V_OVI_ENV}/lib/python3.11/site-packages/torch/lib:${CUDA_HOME}/lib64"
+
+if ! RADIAL_TORCH_LIB="$(
+  readlink -f -- "${FASTA2V_OVI_ENV}/lib/python3.11/site-packages/torch/lib"
+)" || ! RADIAL_CUDA_LIB="$(readlink -f -- "${CUDA_HOME}/lib64")"; then
+  echo "Radial could not canonicalize fixed loader directories" >&2
+  return 2 2>/dev/null || exit 2
+fi
+if [[ ! -d "${RADIAL_TORCH_LIB}" || ! -d "${RADIAL_CUDA_LIB}" ]]; then
+  echo "Radial fixed loader directories are missing" >&2
+  return 2 2>/dev/null || exit 2
+fi
+export LD_LIBRARY_PATH="${RADIAL_TORCH_LIB}:${RADIAL_CUDA_LIB}"
+unset RADIAL_TORCH_LIB RADIAL_CUDA_LIB
