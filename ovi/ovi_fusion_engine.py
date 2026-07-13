@@ -21,7 +21,11 @@ from omegaconf import OmegaConf
 from ovi.utils.processing_utils import clean_text, preprocess_image_tensor, snap_hw_to_multiple_of_32, scale_hw_to_area_divisible
 import re
 from optimum.quanto import freeze, qint8, quantize
-from ovi.cfg_cache import CfgNegativeCache, validate_cfg_cache_config
+from ovi.cfg_cache import (
+    CfgNegativeCache,
+    expected_cfg_cache_metrics,
+    validate_cfg_cache_config,
+)
 from ovi.modules.video_attention_dispatcher import (
     VideoSelfAttentionDispatcher,
     expected_video_self_attention_calls,
@@ -199,10 +203,27 @@ class OviFusionEngine:
 
         original_text_prompt = text_prompt
         self.video_self_attention_dispatcher.reset_metrics()
+        expected_cfg_metrics = (
+            expected_cfg_cache_metrics(
+                sample_steps,
+                self.cfg_cache_start_step,
+                self.cfg_cache_end_step,
+                self.cfg_cache_refresh_interval,
+            )
+            if self.use_cfg_cache
+            else {
+                "cfg_cache_hits": 0,
+                "cfg_cache_refreshes": 0,
+                "cfg_negative_forwards": int(sample_steps),
+            }
+        )
         expected_attention_calls = expected_video_self_attention_calls(
             sample_steps=int(sample_steps),
             num_blocks=int(self.model.num_blocks),
             slg_layer=int(slg_layer),
+            negative_forward_count=expected_cfg_metrics[
+                "cfg_negative_forwards"
+            ],
         )
         torch.cuda.reset_peak_memory_stats(self.device)
         torch.cuda.synchronize(self.device)
@@ -231,6 +252,7 @@ class OviFusionEngine:
             "cfg_cache_hits": 0,
             "cfg_cache_refreshes": 0,
             "cfg_negative_forwards": 0,
+            "expected_cfg_cache_metrics": expected_cfg_metrics,
             "use_block_cache": self.use_block_cache,
             "debug_forward": self.debug_forward,
             "run_kind": self.run_kind,
@@ -608,6 +630,14 @@ class OviFusionEngine:
             else:
                 self.last_run_metrics.update(cfg_cache_state.metrics())
                 cfg_cache_state.clear()
+            dispatcher_metrics = self.video_self_attention_dispatcher.metrics()
+            self.last_run_metrics["video_self_attention_dispatcher"] = {
+                **dispatcher_metrics,
+                "expected_calls": expected_attention_calls,
+                "calls_match_expected": (
+                    dispatcher_metrics["calls_total"] == expected_attention_calls
+                ),
+            }
             
     def offload_to_cpu(self, model):
         model = model.cpu()

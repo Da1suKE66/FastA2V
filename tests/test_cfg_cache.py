@@ -1,9 +1,35 @@
 import unittest
 
-from ovi.cfg_cache import CfgNegativeCache, validate_cfg_cache_config
+from ovi.cfg_cache import (
+    CfgNegativeCache,
+    expected_cfg_cache_metrics,
+    validate_cfg_cache_config,
+)
 
 
 class CfgNegativeCacheTests(unittest.TestCase):
+    def test_expected_schedule_metrics(self):
+        self.assertEqual(
+            expected_cfg_cache_metrics(50, 10, 39, 5),
+            {
+                "cfg_cache_hits": 24,
+                "cfg_cache_refreshes": 6,
+                "cfg_negative_forwards": 26,
+            },
+        )
+        self.assertEqual(
+            expected_cfg_cache_metrics(50, 10, 39, 1)[
+                "cfg_negative_forwards"
+            ],
+            50,
+        )
+        self.assertEqual(
+            expected_cfg_cache_metrics(8, 10, 39, 5)[
+                "cfg_negative_forwards"
+            ],
+            8,
+        )
+
     def test_steps_10_through_39_interval_5(self):
         cache = CfgNegativeCache(10, 39, 5)
         model_calls = []

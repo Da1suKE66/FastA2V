@@ -161,6 +161,13 @@ def verify(path, require_metrics=True, expected_video_frames=121):
             "output_hash_seconds",
             "measurement_index",
             "benchmark_candidate",
+            "attention_method",
+            "use_cfg_cache",
+            "cfg_cache_hits",
+            "cfg_cache_refreshes",
+            "cfg_negative_forwards",
+            "expected_cfg_cache_metrics",
+            "video_self_attention_dispatcher",
         )
         missing = [field for field in required_fields if field not in metrics]
         if missing:
@@ -186,6 +193,51 @@ def verify(path, require_metrics=True, expected_video_frames=121):
             )
         if Path(metrics.get("output_path", "")).resolve() != path.resolve():
             errors.append(f"metrics output_path does not match artifact: {metrics.get('output_path')}")
+
+        expected_cfg = metrics.get("expected_cfg_cache_metrics")
+        if isinstance(expected_cfg, dict):
+            for field in (
+                "cfg_cache_hits",
+                "cfg_cache_refreshes",
+                "cfg_negative_forwards",
+            ):
+                if metrics.get(field) != expected_cfg.get(field):
+                    errors.append(
+                        f"{field}={metrics.get(field)} != expected "
+                        f"{expected_cfg.get(field)}"
+                    )
+        elif expected_cfg is not None:
+            errors.append("expected_cfg_cache_metrics must be a JSON object")
+
+        dispatcher = metrics.get("video_self_attention_dispatcher")
+        if isinstance(dispatcher, dict):
+            configured_method = metrics.get("attention_method")
+            if dispatcher.get("configured_method") != configured_method:
+                errors.append(
+                    "dispatcher configured_method disagrees with attention_method"
+                )
+            if dispatcher.get("active_method") != configured_method:
+                errors.append("dispatcher active_method disagrees with attention_method")
+            if dispatcher.get("fallback_allowed") is not False:
+                errors.append("dispatcher must not allow fallback")
+            if dispatcher.get("fallback_used") is not False:
+                errors.append("dispatcher unexpectedly used fallback")
+            if dispatcher.get("fallback_count") != 0:
+                errors.append("dispatcher fallback_count must be zero")
+            if dispatcher.get("calls_total") != dispatcher.get("expected_calls"):
+                errors.append(
+                    f"dispatcher calls_total={dispatcher.get('calls_total')} != "
+                    f"expected_calls={dispatcher.get('expected_calls')}"
+                )
+            if dispatcher.get("calls_match_expected") is not True:
+                errors.append("dispatcher calls_match_expected must be true")
+            errors_by_method = dispatcher.get("errors_by_method", {})
+            if any(value for value in errors_by_method.values()):
+                errors.append(
+                    f"dispatcher recorded backend errors: {errors_by_method}"
+                )
+        elif dispatcher is not None:
+            errors.append("video_self_attention_dispatcher must be a JSON object")
 
     return {
         "path": str(path.resolve()),

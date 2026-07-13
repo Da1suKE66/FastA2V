@@ -18,6 +18,31 @@ def validate_cfg_cache_config(start_step, end_step, refresh_interval):
     return start_step, end_step, refresh_interval
 
 
+def expected_cfg_cache_metrics(
+    sample_steps, start_step, end_step, refresh_interval
+):
+    """Return the exact cache schedule expected for one denoising loop."""
+    sample_steps = int(sample_steps)
+    if sample_steps < 0:
+        raise ValueError("sample_steps must be >= 0")
+    start_step, end_step, refresh_interval = validate_cfg_cache_config(
+        start_step, end_step, refresh_interval
+    )
+    last_eligible_step = min(end_step, sample_steps - 1)
+    if start_step > last_eligible_step:
+        refreshes = 0
+        hits = 0
+    else:
+        eligible_steps = last_eligible_step - start_step + 1
+        refreshes = (last_eligible_step - start_step) // refresh_interval + 1
+        hits = eligible_steps - refreshes
+    return {
+        "cfg_cache_hits": hits,
+        "cfg_cache_refreshes": refreshes,
+        "cfg_negative_forwards": sample_steps - hits,
+    }
+
+
 class CfgNegativeCache:
     """Cache one atomic ``(video, audio)`` negative-prediction pair.
 

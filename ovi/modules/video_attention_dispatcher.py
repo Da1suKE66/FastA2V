@@ -23,6 +23,7 @@ def expected_video_self_attention_calls(
     slg_layer,
     conditional_forwards_per_step=1,
     unconditional_forwards_per_step=1,
+    negative_forward_count=None,
 ):
     """Return the expected dispatcher calls for the standard Ovi CFG loop.
 
@@ -40,17 +41,29 @@ def expected_video_self_attention_calls(
     for name, value in values.items():
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    if negative_forward_count is not None and (
+        not isinstance(negative_forward_count, int)
+        or isinstance(negative_forward_count, bool)
+        or negative_forward_count < 0
+    ):
+        raise ValueError(
+            "negative_forward_count must be a non-negative integer or None, "
+            f"got {negative_forward_count!r}"
+        )
 
     unconditional_blocks = num_blocks
     if isinstance(slg_layer, int) and not isinstance(slg_layer, bool):
         if 0 < slg_layer < num_blocks:
             unconditional_blocks -= 1
 
-    calls_per_step = (
-        conditional_forwards_per_step * num_blocks
-        + unconditional_forwards_per_step * unconditional_blocks
+    conditional_calls = (
+        sample_steps * conditional_forwards_per_step * num_blocks
     )
-    return sample_steps * calls_per_step
+    if negative_forward_count is None:
+        negative_forward_count = (
+            sample_steps * unconditional_forwards_per_step
+        )
+    return conditional_calls + negative_forward_count * unconditional_blocks
 
 
 class VideoSelfAttentionDispatcher:

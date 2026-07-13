@@ -178,6 +178,17 @@ class VideoAttentionDispatcherTests(unittest.TestCase):
              for method in SUPPORTED_ATTENTION_METHODS},
         )
 
+    def test_cfg_cache_reduces_expected_negative_dispatches(self):
+        self.assertEqual(
+            expected_video_self_attention_calls(
+                sample_steps=50,
+                num_blocks=30,
+                slg_layer=11,
+                negative_forward_count=26,
+            ),
+            2_254,
+        )
+
     def test_reset_metrics_starts_a_new_generation(self):
         dispatcher = VideoSelfAttentionDispatcher("dense")
         attention = RecordingAttention("video-self")
