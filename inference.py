@@ -87,6 +87,12 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
         "model_name": config.get("model_name"),
         "attention_method": config.get("attention_method", "dense"),
         "use_cfg_cache": bool(config.get("use_cfg_cache", False)),
+        "cfg_cache_start_step": int(config.get("cfg_cache_start_step", 10)),
+        "cfg_cache_end_step": int(config.get("cfg_cache_end_step", 39)),
+        "cfg_cache_window_inclusive": True,
+        "cfg_cache_refresh_interval": int(
+            config.get("cfg_cache_refresh_interval", 5)
+        ),
         "use_block_cache": bool(config.get("use_block_cache", False)),
         "debug_forward": bool(config.get("debug_forward", False)),
         "run_kind": config.get("run_kind", "unspecified"),

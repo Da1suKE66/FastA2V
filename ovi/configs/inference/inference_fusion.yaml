@@ -22,6 +22,10 @@ each_example_n_times: 2
 # FastA2V acceleration switches. Defaults preserve official dense behavior.
 attention_method: "dense" # ["dense", "sparge", "radial", "svg"]
 use_cfg_cache: False
+# Inclusive cache window; refreshes are anchored at cfg_cache_start_step.
+cfg_cache_start_step: 10
+cfg_cache_end_step: 39
+cfg_cache_refresh_interval: 5
 use_block_cache: False
 debug_forward: False
 debug_forward_step: 0

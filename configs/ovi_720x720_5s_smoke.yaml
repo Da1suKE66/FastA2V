@@ -28,6 +28,9 @@ benchmark_eligible: false
 
 attention_method: "dense"
 use_cfg_cache: false
+cfg_cache_start_step: 10
+cfg_cache_end_step: 39
+cfg_cache_refresh_interval: 5
 use_block_cache: false
 debug_forward: true
 debug_forward_step: 0

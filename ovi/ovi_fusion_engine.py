@@ -21,6 +21,7 @@ from omegaconf import OmegaConf
 from ovi.utils.processing_utils import clean_text, preprocess_image_tensor, snap_hw_to_multiple_of_32, scale_hw_to_area_divisible
 import re
 from optimum.quanto import freeze, qint8, quantize
+from ovi.cfg_cache import CfgNegativeCache, validate_cfg_cache_config
 
 DEFAULT_CONFIG = OmegaConf.load('ovi/configs/inference/inference_fusion.yaml')
 
@@ -62,15 +63,26 @@ class OviFusionEngine:
             )
         self.use_cfg_cache = bool(config.get("use_cfg_cache", False))
         self.use_block_cache = bool(config.get("use_block_cache", False))
+        self.cfg_cache_start_step = int(config.get("cfg_cache_start_step", 10))
+        self.cfg_cache_end_step = int(config.get("cfg_cache_end_step", 39))
+        self.cfg_cache_refresh_interval = int(
+            config.get("cfg_cache_refresh_interval", 5)
+        )
+        if self.use_cfg_cache:
+            validate_cfg_cache_config(
+                self.cfg_cache_start_step,
+                self.cfg_cache_end_step,
+                self.cfg_cache_refresh_interval,
+            )
         if self.attention_method != "dense":
             raise NotImplementedError(
                 f"attention_method={self.attention_method!r} is not wired yet; "
                 "refusing to silently run the dense path."
             )
-        if self.use_cfg_cache or self.use_block_cache:
+        if self.use_block_cache:
             raise NotImplementedError(
-                "CFG cache and block cache are not wired yet; refusing to "
-                "silently run without the requested cache."
+                "Block cache is not wired yet; refusing to silently run "
+                "without the requested cache."
             )
         self.debug_forward = bool(config.get("debug_forward", False))
         self.debug_forward_step = int(config.get("debug_forward_step", 0))
@@ -184,11 +196,30 @@ class OviFusionEngine:
         torch.cuda.reset_peak_memory_stats(self.device)
         torch.cuda.synchronize(self.device)
         generation_started = time.perf_counter()
+        # The mutable cache is scoped to this generation.  It is never stored on
+        # the engine/model and is cleared in ``finally`` on success or failure.
+        cfg_cache_state = (
+            CfgNegativeCache(
+                self.cfg_cache_start_step,
+                self.cfg_cache_end_step,
+                self.cfg_cache_refresh_interval,
+            )
+            if self.use_cfg_cache
+            else None
+        )
+        dense_negative_forwards = 0
         self.last_run_metrics = {
             "status": "running",
             "model_name": self.model_name,
             "attention_method": self.attention_method,
             "use_cfg_cache": self.use_cfg_cache,
+            "cfg_cache_start_step": self.cfg_cache_start_step,
+            "cfg_cache_end_step": self.cfg_cache_end_step,
+            "cfg_cache_window_inclusive": True,
+            "cfg_cache_refresh_interval": self.cfg_cache_refresh_interval,
+            "cfg_cache_hits": 0,
+            "cfg_cache_refreshes": 0,
+            "cfg_negative_forwards": 0,
             "use_block_cache": self.use_block_cache,
             "debug_forward": self.debug_forward,
             "run_kind": self.run_kind,
@@ -382,12 +413,21 @@ class OviFusionEngine:
                             tuple(pred_audio_pos[0].shape),
                         )
                     
-                    # Negative (unconditional) forward pass  
-                    if debug_this_step:
+                    # Negative (unconditional) forward pass.  With CFG cache
+                    # enabled, video/audio predictions are reused only as one
+                    # atomic pair inside the inclusive configured window.
+                    cache_action = (
+                        cfg_cache_state.action(i)
+                        if cfg_cache_state is not None
+                        else "disabled"
+                    )
+                    if debug_this_step and cache_action != "hit":
                         logging.info(
-                            "[debug_forward] step=%s timestep=%s unconditional_forward=start",
+                            "[debug_forward] step=%s timestep=%s "
+                            "unconditional_forward=start cfg_cache_action=%s",
                             i,
                             timestep_value,
+                            cache_action,
                         )
                     neg_forward_args = {
                         'audio_context': [text_embeddings_audio_neg],
@@ -397,28 +437,60 @@ class OviFusionEngine:
                         'first_frame_is_clean': is_i2v,
                         'slg_layer': slg_layer
                     }
-                    
-                    pred_vid_neg, pred_audio_neg = self.model(
-                        vid=[video_noise],
-                        audio=[audio_noise],
-                        t=timestep_input,
-                        debug_context={
-                            "enabled": debug_this_step,
-                            "step": i,
-                            "timestep": timestep_value,
-                            "branch": "unconditional",
-                        },
-                        **neg_forward_args
-                    )
-                    if debug_this_step:
-                        logging.info(
-                            "[debug_forward] step=%s timestep=%s unconditional_forward=end "
-                            "video_prediction=%s audio_prediction=%s",
-                            i,
-                            timestep_value,
-                            tuple(pred_vid_neg[0].shape),
-                            tuple(pred_audio_neg[0].shape),
+
+                    negative_debug_context = {
+                        "enabled": debug_this_step,
+                        "step": i,
+                        "timestep": timestep_value,
+                        "branch": "unconditional",
+                    }
+                    if cfg_cache_state is None:
+                        # Preserve the official dense CFG path when caching is
+                        # disabled: one negative model forward on every step.
+                        dense_negative_forwards += 1
+                        pred_vid_neg, pred_audio_neg = self.model(
+                            vid=[video_noise],
+                            audio=[audio_noise],
+                            t=timestep_input,
+                            debug_context=negative_debug_context,
+                            **neg_forward_args
                         )
+                    else:
+                        def negative_forward():
+                            return self.model(
+                                vid=[video_noise],
+                                audio=[audio_noise],
+                                t=timestep_input,
+                                debug_context=negative_debug_context,
+                                **neg_forward_args
+                            )
+
+                        (
+                            (pred_vid_neg, pred_audio_neg),
+                            cache_action,
+                        ) = cfg_cache_state.resolve(i, negative_forward)
+                    if debug_this_step:
+                        if cache_action == "hit":
+                            logging.info(
+                                "[debug_forward] step=%s timestep=%s "
+                                "unconditional_forward=cfg_cache_hit "
+                                "video_prediction=%s audio_prediction=%s",
+                                i,
+                                timestep_value,
+                                tuple(pred_vid_neg[0].shape),
+                                tuple(pred_audio_neg[0].shape),
+                            )
+                        else:
+                            logging.info(
+                                "[debug_forward] step=%s timestep=%s "
+                                "unconditional_forward=end cfg_cache_action=%s "
+                                "video_prediction=%s audio_prediction=%s",
+                                i,
+                                timestep_value,
+                                cache_action,
+                                tuple(pred_vid_neg[0].shape),
+                                tuple(pred_audio_neg[0].shape),
+                            )
 
                     # Apply classifier-free guidance
                     pred_video_guided = pred_vid_neg[0] + video_guidance_scale * (pred_vid_pos[0] - pred_vid_neg[0])
@@ -505,6 +577,14 @@ class OviFusionEngine:
             })
             logging.error(traceback.format_exc())
             return None
+        finally:
+            if cfg_cache_state is None:
+                self.last_run_metrics["cfg_negative_forwards"] = (
+                    dense_negative_forwards
+                )
+            else:
+                self.last_run_metrics.update(cfg_cache_state.metrics())
+                cfg_cache_state.clear()
             
     def offload_to_cpu(self, model):
         model = model.cpu()

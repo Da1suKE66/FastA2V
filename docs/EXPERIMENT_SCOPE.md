@@ -48,6 +48,15 @@ use_cfg_cache = true | false
 use_block_cache = true | false
 ```
 
+The first CFG-cache implementation uses an inclusive step window configured by
+`cfg_cache_start_step`, `cfg_cache_end_step`, and
+`cfg_cache_refresh_interval`. Refreshes are anchored at the start step and cache
+the joint video/audio negative prediction as one pair. Outside the window the
+official negative forward runs every step; an interval of `1` is therefore
+schedule-equivalent to dense CFG. Each generation records `cfg_cache_hits`,
+`cfg_cache_refreshes`, and `cfg_negative_forwards` and clears its local cache in
+a `finally` block.
+
 All acceleration options default to the official dense path. Sparse attention
 will only replace video self-attention; audio self-attention, text
 cross-attention, and bidirectional audio-video cross-attention remain dense.
