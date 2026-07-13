@@ -29,6 +29,11 @@ The formal baseline performs one full warm-up generation in the same process,
 excludes it from measurements, then records three repeated measurements with
 the same prompt, seed, shape, and loaded engine. Every invocation receives a
 unique run directory so failed reruns cannot leave old videos looking current.
+The official unmodified source is also kept as a detached worktree at the same
+base commit. `scripts/run_ovi_official_reference.sh` runs the matching 20-step
+smoke configuration, after which `scripts/compare_media.py` performs decoded
+video PSNR/SSIM and audio waveform comparisons against the instrumented dense
+run.
 
 Acceleration work is restricted to Python/PyTorch integration. Official
 third-party kernels may be installed and called through their public APIs, but

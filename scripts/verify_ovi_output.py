@@ -92,7 +92,7 @@ def as_int(value):
         return None
 
 
-def verify(path):
+def verify(path, require_metrics=True):
     info = probe(path)
     artifact_sha256 = sha256(path)
     videos = [stream for stream in info.get("streams", []) if stream.get("codec_type") == "video"]
@@ -140,9 +140,9 @@ def verify(path):
 
     metrics_path = path.with_suffix(".metrics.json")
     metrics = json.loads(metrics_path.read_text()) if metrics_path.is_file() else None
-    if metrics is None:
+    if metrics is None and require_metrics:
         errors.append(f"missing metrics sidecar: {metrics_path}")
-    else:
+    elif metrics is not None:
         required_fields = (
             "status",
             "record_type",
@@ -313,6 +313,11 @@ def verify_run_protocol(run_dir, reports):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("path", type=Path, help="MP4 file or run directory")
+    parser.add_argument(
+        "--media-only",
+        action="store_true",
+        help="validate streams/content without FastA2V metrics or run protocol",
+    )
     args = parser.parse_args()
 
     for executable in ("ffmpeg", "ffprobe"):
@@ -322,9 +327,13 @@ def main():
     paths = [args.path] if args.path.is_file() else sorted(args.path.glob("*.mp4"))
     if not paths:
         raise SystemExit(f"no MP4 artifacts found under {args.path}")
-    reports = [verify(path) for path in paths]
+    reports = [verify(path, require_metrics=not args.media_only) for path in paths]
     run_dir = args.path if args.path.is_dir() else args.path.parent
-    protocol = verify_run_protocol(run_dir, reports) if args.path.is_dir() else None
+    protocol = (
+        verify_run_protocol(run_dir, reports)
+        if args.path.is_dir() and not args.media_only
+        else None
+    )
     failed = any(item["errors"] for item in reports) or (
         protocol is not None and protocol["errors"]
     )

@@ -1,0 +1,23 @@
+ckpt_dir: /cache/liluchen/FastA2V/ckpts
+output_dir: ${oc.env:FASTA2V_OFFICIAL_RUN_DIR}
+
+model_name: "720x720_5s"
+mode: "t2v"
+video_frame_height_width: [720, 720]
+sample_steps: 20
+solver_name: "unipc"
+shift: 5.0
+sp_size: 1
+
+audio_guidance_scale: 3.0
+video_guidance_scale: 4.0
+slg_layer: 11
+video_negative_prompt: "jitter, bad hands, blur, distortion"
+audio_negative_prompt: "robotic, muffled, echo, distorted"
+
+fp8: false
+qint8: false
+cpu_offload: false
+seed: 103
+text_prompt: ${oc.env:FASTA2V_PROMPT_FILE}
+each_example_n_times: 1
