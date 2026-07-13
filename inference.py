@@ -95,6 +95,22 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
             config.get("cfg_cache_refresh_interval", 5)
         ),
         "use_block_cache": bool(config.get("use_block_cache", False)),
+        "block_cache_start_block": int(
+            config.get("block_cache_start_block", 10)
+        ),
+        "block_cache_end_block": int(
+            config.get("block_cache_end_block", 19)
+        ),
+        "block_cache_window_inclusive": True,
+        "block_cache_policy": str(
+            config.get("block_cache_policy", "fixed")
+        ).lower(),
+        "block_cache_cosine_threshold": float(
+            config.get("block_cache_cosine_threshold", 0.95)
+        ),
+        "block_cache_max_consecutive_reuses": int(
+            config.get("block_cache_max_consecutive_reuses", 1)
+        ),
         "debug_forward": bool(config.get("debug_forward", False)),
         "run_kind": config.get("run_kind", "unspecified"),
         "benchmark_eligible": bool(config.get("benchmark_eligible", False)),

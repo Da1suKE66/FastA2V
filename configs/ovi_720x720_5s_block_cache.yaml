@@ -25,6 +25,7 @@ warmup_runs: 1
 measurement_runs: 3
 run_kind: "block_cache_benchmark"
 benchmark_eligible: true
+gpu_process_monitor_interval_seconds: 5.0
 
 attention_method: "dense"
 use_cfg_cache: false
