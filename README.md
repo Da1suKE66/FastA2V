@@ -1,3 +1,19 @@
+> **FastA2V experiment repository.** This repository starts from the official
+> Character AI Ovi source at commit
+> `5b69b25a4b3115216e9ea53a37a04410be6ad39a`. FastA2V changes are limited to
+> reproducible inference instrumentation and Python/PyTorch-level acceleration
+> adapters. See [`docs/EXPERIMENT_SCOPE.md`](docs/EXPERIMENT_SCOPE.md) for the
+> exact boundary and baseline settings.
+>
+> On `lsh-stable30138`, bootstrap and run the first 5-second dense smoke test:
+>
+> ```bash
+> cd /workspace/liluchen/FastA2V
+> bash scripts/setup_ovi_env.sh
+> bash scripts/download_ovi_720x720_5s.sh
+> bash scripts/run_ovi_smoke.sh
+> ```
+
 <div align="center">
 <h1> Ovi: Twin Backbone Cross-Modal Fusion for Audio-Video Generation </h1>
 

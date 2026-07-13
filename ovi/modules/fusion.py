@@ -1,4 +1,6 @@
 
+import logging
+
 import torch
 import torch.nn as nn
 from ovi.modules.model import WanLayerNorm, WanModel, WanRMSNorm, gradient_checkpointing, rope_apply
@@ -174,7 +176,9 @@ class FusionModel(nn.Module):
                                     audio_grid_sizes,
                                     audio_freqs,
                                     audio_context,
-                                    audio_context_lens
+                                    audio_context_lens,
+                                    block_index=None,
+                                    debug_context=None,
                                     ):
         ## audio modulation
         assert audio_e.dtype == torch.bfloat16
@@ -196,9 +200,41 @@ class FusionModel(nn.Module):
             vid_e = vid_block.modulation(vid_e).chunk(6, dim=2)
 
         # video self-attention
+        vid_self_attn_input = (
+            vid_block.norm1(vid).bfloat16()
+            * (1 + vid_e[1].squeeze(2))
+            + vid_e[0].squeeze(2)
+        )
+        debug_enabled = bool(debug_context and debug_context.get("enabled"))
+        if debug_enabled:
+            logging.info(
+                "[debug_forward] step=%s timestep=%s branch=%s block=%s "
+                "video_self_attn input=%s seq_lens=%s grid_sizes=%s",
+                debug_context.get("step"),
+                debug_context.get("timestep"),
+                debug_context.get("branch"),
+                block_index,
+                tuple(vid_self_attn_input.shape),
+                tuple(vid_seq_lens.shape),
+                vid_grid_sizes.detach().cpu().tolist(),
+            )
+
         vid_y = vid_block.self_attn(
-            vid_block.norm1(vid).bfloat16() * (1 + vid_e[1].squeeze(2)) + vid_e[0].squeeze(2), vid_seq_lens, vid_grid_sizes,
-            vid_freqs)
+            vid_self_attn_input,
+            vid_seq_lens,
+            vid_grid_sizes,
+            vid_freqs,
+        )
+
+        if debug_enabled:
+            logging.info(
+                "[debug_forward] step=%s branch=%s block=%s "
+                "video_self_attn output=%s",
+                debug_context.get("step"),
+                debug_context.get("branch"),
+                block_index,
+                tuple(vid_y.shape),
+            )
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             vid = vid + vid_y * vid_e[2].squeeze(2)
@@ -252,7 +288,8 @@ class FusionModel(nn.Module):
         clip_fea_audio=None,
         y=None,
         first_frame_is_clean=False,
-        slg_layer=False
+        slg_layer=False,
+        debug_context=None,
     ):  
 
         assert clip_fea is None 
@@ -288,6 +325,13 @@ class FusionModel(nn.Module):
             1 fusion block refers to 1 audio block with 1 video block.
             """
             if slg_layer > 0 and i == slg_layer:
+                if debug_context and debug_context.get("enabled"):
+                    logging.info(
+                        "[debug_forward] step=%s branch=%s block=%s skipped_by_slg=true",
+                        debug_context.get("step"),
+                        debug_context.get("branch"),
+                        i,
+                    )
                 continue
             vid_block = self.video_model.blocks[i]
             audio_block = self.audio_model.blocks[i]
@@ -298,6 +342,8 @@ class FusionModel(nn.Module):
                     audio_block=audio_block,
                     vid=vid,
                     audio=audio,
+                    block_index=i,
+                    debug_context=debug_context,
                     **kwargs
                 )
 

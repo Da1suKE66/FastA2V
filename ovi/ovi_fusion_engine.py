@@ -5,6 +5,7 @@ import cv2
 import glob
 import torch
 import logging
+import time
 from textwrap import indent
 import torch.nn as nn
 from diffusers import FluxPipeline
@@ -53,6 +54,17 @@ class OviFusionEngine:
         # Load fusion model
         self.device = device
         self.target_dtype = target_dtype
+        self.attention_method = str(config.get("attention_method", "dense")).lower()
+        if self.attention_method not in {"dense", "sparge", "radial", "svg"}:
+            raise ValueError(
+                f"Unsupported attention_method={self.attention_method!r}; "
+                "expected one of dense, sparge, radial, svg."
+            )
+        self.use_cfg_cache = bool(config.get("use_cfg_cache", False))
+        self.use_block_cache = bool(config.get("use_block_cache", False))
+        self.debug_forward = bool(config.get("debug_forward", False))
+        self.debug_forward_step = int(config.get("debug_forward_step", 0))
+        self.last_run_metrics = {}
         meta_init = True
         self.cpu_offload = config.get("cpu_offload", False) or config.get("mode") == "t2i2v"
         if self.cpu_offload:
@@ -156,6 +168,21 @@ class OviFusionEngine:
                     audio_negative_prompt=""
                 ):
 
+        original_text_prompt = text_prompt
+        torch.cuda.reset_peak_memory_stats(self.device)
+        torch.cuda.synchronize(self.device)
+        generation_started = time.perf_counter()
+        self.last_run_metrics = {
+            "status": "running",
+            "model_name": self.model_name,
+            "attention_method": self.attention_method,
+            "use_cfg_cache": self.use_cfg_cache,
+            "use_block_cache": self.use_block_cache,
+            "sample_steps": int(sample_steps),
+            "seed": int(seed),
+            "original_text_prompt": original_text_prompt,
+        }
+
         params = {
             "Text Prompt": text_prompt,
             "Image Path": image_path if image_path else "None (T2V mode)",
@@ -197,6 +224,7 @@ class OviFusionEngine:
 
             # text and image checks
             formatted_text_prompt = self.text_formatter(text_prompt)
+            self.last_run_metrics["formatted_text_prompt"] = formatted_text_prompt
             if formatted_text_prompt != text_prompt:
                 logging.info(f"Wrong audio description format detected! Please use <AUDCAP>...<ENDAUDCAP> tags for 720x720_5s model and Audio: ... for 960x960 models.\n \
                              Original prompt: {text_prompt}\nFormatted prompt: {formatted_text_prompt}")
@@ -211,7 +239,7 @@ class OviFusionEngine:
                 # input resolution should be at least 0.9x of video area of model spec
                 input_area = video_frame_height_width[0] * video_frame_height_width[1]
                 if input_area < 0.9 * self.target_area or input_area > 1.1 * self.target_area:
-                    logging.warning(f"[Detected model: {self.model_name}] Input video frame area {input_area} is more than 10\% smaller or larger than model's target area {self.target_area}. This may lead to suboptimal results, please refer to readme for best resolutions or use the right model. DEFAULTING TO MODEL'S TARGET AREA while preserving given aspect ratio.")
+                    logging.warning(f"[Detected model: {self.model_name}] Input video frame area {input_area} is more than 10% smaller or larger than model's target area {self.target_area}. This may lead to suboptimal results, please refer to readme for best resolutions or use the right model. DEFAULTING TO MODEL'S TARGET AREA while preserving given aspect ratio.")
 
                 video_h, video_w = video_frame_height_width
                 video_h, video_w = snap_hw_to_multiple_of_32(video_h, video_w, area = self.target_area)
@@ -273,13 +301,23 @@ class OviFusionEngine:
                 self.offload_to_cpu(self.vae_model_audio)
                 self.model = self.model.to(self.device)
             with torch.amp.autocast('cuda', enabled=self.target_dtype != torch.float32, dtype=self.target_dtype):
+                torch.cuda.synchronize(self.device)
+                denoise_started = time.perf_counter()
                 for i, (t_v, t_a) in tqdm(enumerate(zip(timesteps_video, timesteps_audio))):
                     timestep_input = torch.full((1,), t_v, device=self.device)
+                    debug_this_step = self.debug_forward and i == self.debug_forward_step
+                    timestep_value = float(t_v.detach().cpu().item())
 
                     if is_i2v:
                         video_noise[:, :1] = latents_images
 
                     # Positive (conditional) forward pass
+                    if debug_this_step:
+                        logging.info(
+                            "[debug_forward] step=%s timestep=%s conditional_forward=start",
+                            i,
+                            timestep_value,
+                        )
                     pos_forward_args = {
                         'audio_context': [text_embeddings_audio_pos],
                         'vid_context': [text_embeddings_video_pos],
@@ -292,10 +330,31 @@ class OviFusionEngine:
                         vid=[video_noise],
                         audio=[audio_noise],
                         t=timestep_input,
+                        debug_context={
+                            "enabled": debug_this_step,
+                            "step": i,
+                            "timestep": timestep_value,
+                            "branch": "conditional",
+                        },
                         **pos_forward_args
                     )
+                    if debug_this_step:
+                        logging.info(
+                            "[debug_forward] step=%s timestep=%s conditional_forward=end "
+                            "video_prediction=%s audio_prediction=%s",
+                            i,
+                            timestep_value,
+                            tuple(pred_vid_pos[0].shape),
+                            tuple(pred_audio_pos[0].shape),
+                        )
                     
                     # Negative (unconditional) forward pass  
+                    if debug_this_step:
+                        logging.info(
+                            "[debug_forward] step=%s timestep=%s unconditional_forward=start",
+                            i,
+                            timestep_value,
+                        )
                     neg_forward_args = {
                         'audio_context': [text_embeddings_audio_neg],
                         'vid_context': [text_embeddings_video_neg],
@@ -309,8 +368,23 @@ class OviFusionEngine:
                         vid=[video_noise],
                         audio=[audio_noise],
                         t=timestep_input,
+                        debug_context={
+                            "enabled": debug_this_step,
+                            "step": i,
+                            "timestep": timestep_value,
+                            "branch": "unconditional",
+                        },
                         **neg_forward_args
                     )
+                    if debug_this_step:
+                        logging.info(
+                            "[debug_forward] step=%s timestep=%s unconditional_forward=end "
+                            "video_prediction=%s audio_prediction=%s",
+                            i,
+                            timestep_value,
+                            tuple(pred_vid_neg[0].shape),
+                            tuple(pred_audio_neg[0].shape),
+                        )
 
                     # Apply classifier-free guidance
                     pred_video_guided = pred_vid_neg[0] + video_guidance_scale * (pred_vid_pos[0] - pred_vid_neg[0])
@@ -324,6 +398,19 @@ class OviFusionEngine:
                     audio_noise = scheduler_audio.step(
                         pred_audio_guided.unsqueeze(0), t_a, audio_noise.unsqueeze(0), return_dict=False
                     )[0].squeeze(0)
+
+                    if debug_this_step:
+                        logging.info(
+                            "[debug_forward] step=%s timestep=%s scheduler_update=end "
+                            "video_latent=%s audio_latent=%s",
+                            i,
+                            timestep_value,
+                            tuple(video_noise.shape),
+                            tuple(audio_noise.shape),
+                        )
+
+                torch.cuda.synchronize(self.device)
+                denoise_seconds = time.perf_counter() - denoise_started
 
                 if self.cpu_offload:
                     self.offload_to_cpu(self.model)
@@ -347,10 +434,37 @@ class OviFusionEngine:
                 if self.cpu_offload:
                     self.offload_to_cpu(self.vae_model_video.model)
                     self.offload_to_cpu(self.vae_model_audio)
+
+            torch.cuda.synchronize(self.device)
+            total_generation_seconds = time.perf_counter() - generation_started
+            self.last_run_metrics.update({
+                "status": "ok",
+                "denoise_seconds": denoise_seconds,
+                "total_generation_seconds": total_generation_seconds,
+                "peak_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(self.device)),
+                "peak_memory_reserved_bytes": int(torch.cuda.max_memory_reserved(self.device)),
+                "generated_video_shape": list(generated_video.shape),
+                "generated_audio_shape": list(generated_audio.shape),
+            })
+            logging.info(
+                "Generation metrics: total=%.3fs denoise=%.3fs peak_allocated=%.3fGiB",
+                total_generation_seconds,
+                denoise_seconds,
+                self.last_run_metrics["peak_memory_allocated_bytes"] / (1024 ** 3),
+            )
             return generated_video, generated_audio, image
 
 
         except Exception as e:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self.device)
+            self.last_run_metrics.update({
+                "status": "failed",
+                "error": repr(e),
+                "total_generation_seconds": time.perf_counter() - generation_started,
+                "peak_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(self.device)) if torch.cuda.is_available() else 0,
+                "peak_memory_reserved_bytes": int(torch.cuda.max_memory_reserved(self.device)) if torch.cuda.is_available() else 0,
+            })
             logging.error(traceback.format_exc())
             return None
             

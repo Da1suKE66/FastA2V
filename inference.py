@@ -1,6 +1,11 @@
 import os
 import sys
+import hashlib
+import importlib.metadata
+import json
 import logging
+import subprocess
+import time
 import torch
 from tqdm import tqdm
 from omegaconf import OmegaConf
@@ -10,6 +15,67 @@ from ovi.utils.utils import get_arguments
 from ovi.distributed_comms.util import get_world_size, get_local_rank, get_global_rank
 from ovi.distributed_comms.parallel_states import initialize_sequence_parallel_state, get_sequence_parallel_state, nccl_info
 from ovi.ovi_fusion_engine import OviFusionEngine
+
+
+def _command_output(command):
+    try:
+        return subprocess.check_output(
+            command,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _package_version(name):
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_json(path, payload):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def _collect_environment(config, config_file, engine_load_seconds):
+    driver_version = _command_output([
+        "nvidia-smi",
+        "--query-gpu=driver_version",
+        "--format=csv,noheader",
+    ])
+    git_commit = _command_output(["git", "rev-parse", "HEAD"])
+    git_status = _command_output(["git", "status", "--porcelain"])
+    return {
+        "config_file": os.path.abspath(config_file),
+        "git_commit": git_commit,
+        "git_dirty": bool(git_status),
+        "python": sys.version,
+        "torch": torch.__version__,
+        "torch_cuda": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version(),
+        "flash_attn": _package_version("flash-attn"),
+        "transformers": _package_version("transformers"),
+        "gpu": torch.cuda.get_device_name(0),
+        "gpu_count": torch.cuda.device_count(),
+        "driver_version": driver_version.splitlines()[0] if driver_version else None,
+        "engine_load_seconds": engine_load_seconds,
+        "model_name": config.get("model_name"),
+        "attention_method": config.get("attention_method", "dense"),
+        "use_cfg_cache": bool(config.get("use_cfg_cache", False)),
+        "use_block_cache": bool(config.get("use_block_cache", False)),
+    }
 
 
 
@@ -67,11 +133,20 @@ def main(config, args):
         assert all(p is not None and os.path.isfile(p) for p in image_paths), f"In i2v mode, all image paths must be provided.{image_paths}"
 
     logging.info("Loading OVI Fusion Engine...")
+    torch.cuda.synchronize(device)
+    engine_load_started = time.perf_counter()
     ovi_engine = OviFusionEngine(config=config, device=device, target_dtype=target_dtype)
-    logging.info("OVI Fusion Engine loaded!")
+    torch.cuda.synchronize(device)
+    engine_load_seconds = time.perf_counter() - engine_load_started
+    logging.info("OVI Fusion Engine loaded in %.3f seconds!", engine_load_seconds)
     
     output_dir = config.get("output_dir", "./outputs")
     os.makedirs(output_dir, exist_ok=True)
+    OmegaConf.save(config=config, f=os.path.join(output_dir, "run_config.yaml"))
+    _write_json(
+        os.path.join(output_dir, "environment.json"),
+        _collect_environment(config, args.config_file, engine_load_seconds),
+    )
 
     # Load CSV data
     all_eval_data = list(zip(text_prompts, image_paths))
@@ -120,18 +195,23 @@ def main(config, args):
         video_negative_prompt = config.get("video_negative_prompt", "")
         audio_negative_prompt = config.get("audio_negative_prompt", "")
         for idx in range(config.get("each_example_n_times", 1)):
-            generated_video, generated_audio, generated_image = ovi_engine.generate(text_prompt=text_prompt,
-                                                                    image_path=image_path,
-                                                                    video_frame_height_width=video_frame_height_width,
-                                                                    seed=seed+idx,
-                                                                    solver_name=solver_name,
-                                                                    sample_steps=sample_steps,
-                                                                    shift=shift,
-                                                                    video_guidance_scale=video_guidance_scale,
-                                                                    audio_guidance_scale=audio_guidance_scale,
-                                                                    slg_layer=slg_layer,
-                                                                    video_negative_prompt=video_negative_prompt,
-                                                                    audio_negative_prompt=audio_negative_prompt)
+            generation_result = ovi_engine.generate(text_prompt=text_prompt,
+                                                     image_path=image_path,
+                                                     video_frame_height_width=video_frame_height_width,
+                                                     seed=seed+idx,
+                                                     solver_name=solver_name,
+                                                     sample_steps=sample_steps,
+                                                     shift=shift,
+                                                     video_guidance_scale=video_guidance_scale,
+                                                     audio_guidance_scale=audio_guidance_scale,
+                                                     slg_layer=slg_layer,
+                                                     video_negative_prompt=video_negative_prompt,
+                                                     audio_negative_prompt=audio_negative_prompt)
+            if generation_result is None:
+                raise RuntimeError(
+                    f"Ovi generation failed: {ovi_engine.last_run_metrics.get('error', 'unknown error')}"
+                )
+            generated_video, generated_audio, generated_image = generation_result
             
             if sp_rank == 0:
                 formatted_prompt = format_prompt_for_filename(text_prompt)
@@ -139,6 +219,19 @@ def main(config, args):
                 save_video(output_path, generated_video, generated_audio, fps=24, sample_rate=16000)
                 if generated_image is not None:
                     generated_image.save(output_path.replace('.mp4', '.png'))
+
+                metrics = dict(ovi_engine.last_run_metrics)
+                metrics.update({
+                    "output_path": os.path.abspath(output_path),
+                    "output_sha256": _sha256(output_path),
+                    "prompt": text_prompt,
+                    "seed": seed + idx,
+                    "rank": global_rank,
+                })
+                metrics_path = output_path.replace(".mp4", ".metrics.json")
+                _write_json(metrics_path, metrics)
+                with open(os.path.join(output_dir, "timings.jsonl"), "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(metrics, ensure_ascii=False, sort_keys=True) + "\n")
         
 
 

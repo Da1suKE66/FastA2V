@@ -1,2 +1,15 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Runtime artifacts live under /cache/liluchen/FastA2V on the target host.
+ckpts/
+outputs/
+runs/
+*.log
+*.mp4
+*.wav
+*.metrics.json
+environment.json
+timings.jsonl

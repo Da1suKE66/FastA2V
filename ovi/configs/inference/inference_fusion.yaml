@@ -18,3 +18,10 @@ video_frame_height_width: [704, 1280] # only useful if mode = t2v or t2i2v, reco
 text_prompt: example_prompts/gpt_examples_10s_i2v.csv
 slg_layer: 11
 each_example_n_times: 2
+
+# FastA2V acceleration switches. Defaults preserve official dense behavior.
+attention_method: "dense" # ["dense", "sparge", "radial", "svg"]
+use_cfg_cache: False
+use_block_cache: False
+debug_forward: False
+debug_forward_step: 0
