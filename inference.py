@@ -16,6 +16,7 @@ from ovi.utils.utils import get_arguments
 from ovi.distributed_comms.util import get_world_size, get_local_rank, get_global_rank
 from ovi.distributed_comms.parallel_states import initialize_sequence_parallel_state, get_sequence_parallel_state, nccl_info
 from ovi.ovi_fusion_engine import OviFusionEngine
+from ovi.gpu_process_monitor import GpuProcessMonitor
 
 
 def _command_output(command):
@@ -97,6 +98,9 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
         "debug_forward": bool(config.get("debug_forward", False)),
         "run_kind": config.get("run_kind", "unspecified"),
         "benchmark_eligible": bool(config.get("benchmark_eligible", False)),
+        "gpu_process_monitor_interval_seconds": float(
+            config.get("gpu_process_monitor_interval_seconds", 5.0)
+        ),
         "warmup_runs": int(config.get("warmup_runs", 0)),
         "measurement_runs": int(config.get("measurement_runs", 1)),
         "each_example_n_times": each_example_n_times,
@@ -273,14 +277,25 @@ def main(config, args):
         "audio_negative_prompt": config.get("audio_negative_prompt", ""),
     }
     run_id = os.path.basename(os.path.abspath(output_dir))
+    gpu_monitor_interval = float(
+        config.get("gpu_process_monitor_interval_seconds", 5.0)
+    )
 
     def run_one(text_prompt, image_path, sample_seed):
-        return ovi_engine.generate(
-            text_prompt=text_prompt,
-            image_path=image_path,
-            seed=sample_seed,
-            **generation_kwargs,
+        monitor = GpuProcessMonitor(
+            device_index=device,
+            interval_seconds=gpu_monitor_interval,
         )
+        try:
+            with monitor:
+                return ovi_engine.generate(
+                    text_prompt=text_prompt,
+                    image_path=image_path,
+                    seed=sample_seed,
+                    **generation_kwargs,
+                )
+        finally:
+            ovi_engine.last_run_metrics["gpu_process_monitor"] = monitor.summary()
 
     def record_failure(phase, text_prompt, sample_seed, repeat_index):
         failure = dict(ovi_engine.last_run_metrics)

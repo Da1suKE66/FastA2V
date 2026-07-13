@@ -2,6 +2,7 @@
 ckpt_dir: ./ckpts
 output_dir: ./outputs
 sample_steps: 50
+gpu_process_monitor_interval_seconds: 5.0
 solver_name: unipc
 model_name: "960x960_10s" # ["720x720_5s", "960x960_5s", "960x960_10s"]
 shift: 5.0

@@ -168,6 +168,7 @@ def verify(path, require_metrics=True, expected_video_frames=121):
             "cfg_negative_forwards",
             "expected_cfg_cache_metrics",
             "video_self_attention_dispatcher",
+            "gpu_process_monitor",
         )
         missing = [field for field in required_fields if field not in metrics]
         if missing:
@@ -239,6 +240,10 @@ def verify(path, require_metrics=True, expected_video_frames=121):
         elif dispatcher is not None:
             errors.append("video_self_attention_dispatcher must be a JSON object")
 
+        gpu_monitor = metrics.get("gpu_process_monitor")
+        if gpu_monitor is not None and not isinstance(gpu_monitor, dict):
+            errors.append("gpu_process_monitor must be a JSON object")
+
     return {
         "path": str(path.resolve()),
         "sha256": artifact_sha256,
@@ -278,6 +283,7 @@ def verify_run_protocol(run_dir, reports):
 
     environment_path = run_dir / "environment.json"
     environment = json.loads(environment_path.read_text()) if environment_path.is_file() else {}
+    candidate = bool(environment.get("benchmark_eligible"))
     expected_measurements = int(environment.get("expected_measurement_records", -1))
     expected_warmups = int(environment.get("expected_warmup_records", -1))
     measurement_runs = int(environment.get("measurement_runs", -1))
@@ -317,6 +323,18 @@ def verify_run_protocol(run_dir, reports):
             errors.append("warmup_timings.jsonl contains an invalid warm-up record")
             break
 
+    if candidate:
+        for item in [*warmups, *timings]:
+            monitor = item.get("gpu_process_monitor")
+            if not isinstance(monitor, dict) or monitor.get(
+                "valid_for_benchmark"
+            ) is not True:
+                errors.append(
+                    "benchmark run has missing, unavailable, or contaminated "
+                    "GPU process monitoring evidence"
+                )
+                break
+
     artifact_hashes = {report["sha256"] for report in reports}
     timing_hashes = {item.get("output_sha256") for item in timings}
     if artifact_hashes != timing_hashes:
@@ -340,7 +358,6 @@ def verify_run_protocol(run_dir, reports):
     if run_config_path.is_file() and environment.get("run_config_sha256") != sha256(run_config_path):
         errors.append("run_config.yaml SHA256 does not match environment.json")
 
-    candidate = bool(environment.get("benchmark_eligible"))
     if any(item.get("benchmark_candidate") != candidate for item in timings):
         errors.append("per-measurement benchmark_candidate disagrees with environment.json")
     benchmark_valid = bool(
