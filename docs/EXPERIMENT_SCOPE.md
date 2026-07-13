@@ -57,6 +57,18 @@ schedule-equivalent to dense CFG. Each generation records `cfg_cache_hits`,
 `cfg_cache_refreshes`, and `cfg_negative_forwards` and clears its local cache in
 a `finally` block.
 
+The first block-cache implementation covers the inclusive fusion-block window
+`10..19` and caches its complete `(video, audio)` output pair. Conditional and
+unconditional payloads are physically separate and local to one generation.
+The fixed policy is deliberately limited to `compute -> reuse -> compute`
+(`block_cache_max_consecutive_reuses=1`). A denoising-step gap, video/audio
+shape, dtype, or device change, or a changed SLG signature forces a refresh;
+this also prevents an unconditional hit after CFG cache skipped intervening
+negative forwards. The optional cosine policy additionally requires
+`min(video_cosine, audio_cosine)` to meet its threshold. Run
+`scripts/run_ovi_block_cache_smoke.sh` before the formal
+`scripts/run_ovi_block_cache_baseline.sh` protocol.
+
 All acceleration options default to the official dense path. Sparse attention
 will only replace video self-attention; audio self-attention, text
 cross-attention, and bidirectional audio-video cross-attention remain dense.

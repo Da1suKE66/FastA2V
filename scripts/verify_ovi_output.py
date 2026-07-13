@@ -167,6 +167,7 @@ def verify(path, require_metrics=True, expected_video_frames=121):
             "cfg_cache_refreshes",
             "cfg_negative_forwards",
             "expected_cfg_cache_metrics",
+            "use_block_cache",
             "video_self_attention_dispatcher",
             "gpu_process_monitor",
         )
@@ -210,6 +211,118 @@ def verify(path, require_metrics=True, expected_video_frames=121):
         elif expected_cfg is not None:
             errors.append("expected_cfg_cache_metrics must be a JSON object")
 
+        block_cache_enabled = bool(metrics.get("use_block_cache"))
+        block_metric_fields = (
+            "block_cache_start_block",
+            "block_cache_end_block",
+            "block_cache_window_inclusive",
+            "block_cache_policy",
+            "block_cache_cosine_threshold",
+            "block_cache_max_consecutive_reuses",
+            "block_cache_hits",
+            "block_cache_refreshes",
+            "block_cache_saved_video_self_attention_calls",
+            "block_cache_branch_metrics",
+        )
+        block_metrics_present = any(
+            field in metrics for field in block_metric_fields
+        )
+        block_hits = 0
+        block_refreshes = 0
+        block_saved_calls = 0
+        if block_cache_enabled or block_metrics_present:
+            missing_block_fields = [
+                field for field in block_metric_fields if field not in metrics
+            ]
+            if missing_block_fields:
+                errors.append(
+                    "block-cache metrics missing required fields: "
+                    f"{missing_block_fields}"
+                )
+            block_hits = as_int(metrics.get("block_cache_hits"))
+            block_refreshes = as_int(metrics.get("block_cache_refreshes"))
+            block_saved_calls = as_int(
+                metrics.get("block_cache_saved_video_self_attention_calls")
+            )
+            block_branches = metrics.get("block_cache_branch_metrics")
+            if metrics.get("block_cache_policy") not in ("fixed", "cosine"):
+                errors.append("invalid block_cache_policy")
+            try:
+                block_cosine_threshold = float(
+                    metrics.get("block_cache_cosine_threshold")
+                )
+            except (TypeError, ValueError):
+                block_cosine_threshold = float("nan")
+            if (
+                not math.isfinite(block_cosine_threshold)
+                or not 0.0 <= block_cosine_threshold <= 1.0
+            ):
+                errors.append("invalid block_cache_cosine_threshold")
+            if metrics.get("block_cache_max_consecutive_reuses") != 1:
+                errors.append(
+                    "block cache must cap consecutive reuses at exactly 1"
+                )
+            block_start = as_int(metrics.get("block_cache_start_block"))
+            block_end = as_int(metrics.get("block_cache_end_block"))
+            if (
+                block_start is None
+                or block_end is None
+                or not 0 <= block_start <= block_end
+            ):
+                errors.append(
+                    f"invalid block-cache window: {block_start}..{block_end}"
+                )
+            if metrics.get("block_cache_window_inclusive") is not True:
+                errors.append("block-cache window must be recorded as inclusive")
+            if not block_cache_enabled:
+                if (block_hits, block_refreshes, block_saved_calls) != (0, 0, 0):
+                    errors.append(
+                        "disabled block cache recorded non-zero activity"
+                    )
+                if block_branches not in ({}, None):
+                    errors.append(
+                        "disabled block cache recorded branch payload metrics"
+                    )
+            elif isinstance(block_branches, dict):
+                expected_branches = {"conditional", "unconditional"}
+                if set(block_branches) != expected_branches:
+                    errors.append(
+                        f"block-cache branches {sorted(block_branches)} != "
+                        f"{sorted(expected_branches)}"
+                    )
+                branch_hits = sum(
+                    as_int(item.get("hits")) or 0
+                    for item in block_branches.values()
+                    if isinstance(item, dict)
+                )
+                branch_refreshes = sum(
+                    as_int(item.get("refreshes")) or 0
+                    for item in block_branches.values()
+                    if isinstance(item, dict)
+                )
+                branch_saved_calls = sum(
+                    as_int(item.get("saved_video_self_attention_calls")) or 0
+                    for item in block_branches.values()
+                    if isinstance(item, dict)
+                )
+                if branch_hits != block_hits:
+                    errors.append(
+                        f"block_cache_hits={block_hits} != branch sum "
+                        f"{branch_hits}"
+                    )
+                if branch_refreshes != block_refreshes:
+                    errors.append(
+                        "block_cache_refreshes="
+                        f"{block_refreshes} != branch sum {branch_refreshes}"
+                    )
+                if branch_saved_calls != block_saved_calls:
+                    errors.append(
+                        "block_cache_saved_video_self_attention_calls="
+                        f"{block_saved_calls} != branch sum {branch_saved_calls}"
+                    )
+            else:
+                errors.append("enabled block cache requires branch metrics")
+
         dispatcher = metrics.get("video_self_attention_dispatcher")
         if isinstance(dispatcher, dict):
             configured_method = metrics.get("attention_method")
@@ -230,6 +343,18 @@ def verify(path, require_metrics=True, expected_video_frames=121):
                     f"dispatcher calls_total={dispatcher.get('calls_total')} != "
                     f"expected_calls={dispatcher.get('expected_calls')}"
                 )
+            expected_without_block_cache = dispatcher.get(
+                "expected_calls_without_block_cache"
+            )
+            if expected_without_block_cache is not None:
+                adjusted_expected = (
+                    as_int(expected_without_block_cache) or 0
+                ) - (block_saved_calls or 0)
+                if dispatcher.get("expected_calls") != adjusted_expected:
+                    errors.append(
+                        "dispatcher expected_calls does not subtract the "
+                        "recorded block-cache savings"
+                    )
             if dispatcher.get("calls_match_expected") is not True:
                 errors.append("dispatcher calls_match_expected must be true")
             errors_by_method = dispatcher.get("errors_by_method", {})

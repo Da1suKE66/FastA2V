@@ -302,6 +302,8 @@ class FusionModel(nn.Module):
         first_frame_is_clean=False,
         slg_layer=False,
         debug_context=None,
+        block_cache_state=None,
+        block_cache_context=None,
     ):  
 
         assert clip_fea is None 
@@ -332,32 +334,130 @@ class FusionModel(nn.Module):
 
         kwargs = self.merge_kwargs(vid_kwargs, audio_kwargs)
 
-        for i in range(self.num_blocks):
-            """
-            1 fusion block refers to 1 audio block with 1 video block.
-            """
-            if slg_layer > 0 and i == slg_layer:
-                if debug_context and debug_context.get("enabled"):
-                    logging.info(
-                        "[debug_forward] step=%s branch=%s block=%s skipped_by_slg=true",
-                        debug_context.get("step"),
-                        debug_context.get("branch"),
-                        i,
+        if block_cache_state is None:
+            # Keep the official dense loop untouched when block caching is
+            # disabled.  In particular, no branch bookkeeping or cache lookup
+            # is performed on this path.
+            for i in range(self.num_blocks):
+                """
+                1 fusion block refers to 1 audio block with 1 video block.
+                """
+                if slg_layer > 0 and i == slg_layer:
+                    if debug_context and debug_context.get("enabled"):
+                        logging.info(
+                            "[debug_forward] step=%s branch=%s block=%s skipped_by_slg=true",
+                            debug_context.get("step"),
+                            debug_context.get("branch"),
+                            i,
+                        )
+                    continue
+                vid_block = self.video_model.blocks[i]
+                audio_block = self.audio_model.blocks[i]
+                vid, audio = gradient_checkpointing(
+                        enabled=(self.training and self.gradient_checkpointing),
+                        module=self.single_fusion_block_forward,
+                        vid_block=vid_block,
+                        audio_block=audio_block,
+                        vid=vid,
+                        audio=audio,
+                        block_index=i,
+                        debug_context=debug_context,
+                        **kwargs
                     )
-                continue
-            vid_block = self.video_model.blocks[i]
-            audio_block = self.audio_model.blocks[i]
-            vid, audio = gradient_checkpointing(
+        else:
+            if not isinstance(block_cache_context, dict):
+                raise ValueError(
+                    "block_cache_context with step and branch is required "
+                    "when block caching is enabled"
+                )
+            if "step" not in block_cache_context or "branch" not in block_cache_context:
+                raise ValueError(
+                    "block_cache_context must contain step and branch"
+                )
+            cache_start = int(block_cache_state.start_block)
+            cache_end = int(block_cache_state.end_block)
+            if not 0 <= cache_start <= cache_end < self.num_blocks:
+                raise ValueError(
+                    f"invalid fusion block-cache window "
+                    f"{cache_start}..{cache_end} for {self.num_blocks} blocks"
+                )
+            cache_step = int(block_cache_context["step"])
+            cache_branch = str(block_cache_context["branch"])
+            normalized_slg_layer = int(slg_layer) if slg_layer else 0
+            skipped_blocks = (
+                (normalized_slg_layer,)
+                if 0 < normalized_slg_layer < self.num_blocks
+                else ()
+            )
+            slg_signature = (
+                "slg_layer",
+                normalized_slg_layer,
+                "num_blocks",
+                self.num_blocks,
+            )
+
+            def run_block(block_index, block_vid, block_audio):
+                if slg_layer > 0 and block_index == slg_layer:
+                    if debug_context and debug_context.get("enabled"):
+                        logging.info(
+                            "[debug_forward] step=%s branch=%s block=%s skipped_by_slg=true",
+                            debug_context.get("step"),
+                            debug_context.get("branch"),
+                            block_index,
+                        )
+                    return block_vid, block_audio
+                vid_block = self.video_model.blocks[block_index]
+                audio_block = self.audio_model.blocks[block_index]
+                return gradient_checkpointing(
                     enabled=(self.training and self.gradient_checkpointing),
                     module=self.single_fusion_block_forward,
                     vid_block=vid_block,
                     audio_block=audio_block,
-                    vid=vid,
-                    audio=audio,
-                    block_index=i,
+                    vid=block_vid,
+                    audio=block_audio,
+                    block_index=block_index,
                     debug_context=debug_context,
                     **kwargs
                 )
+
+            block_index = 0
+            while block_index < self.num_blocks:
+                if block_index != cache_start:
+                    vid, audio = run_block(block_index, vid, audio)
+                    block_index += 1
+                    continue
+
+                cache_input_pair = (vid, audio)
+
+                def compute_window():
+                    window_vid, window_audio = cache_input_pair
+                    for window_block_index in range(cache_start, cache_end + 1):
+                        window_vid, window_audio = run_block(
+                            window_block_index, window_vid, window_audio
+                        )
+                    return window_vid, window_audio
+
+                (vid, audio), cache_action = block_cache_state.resolve(
+                    step=cache_step,
+                    branch=cache_branch,
+                    input_pair=cache_input_pair,
+                    slg_signature=slg_signature,
+                    skipped_blocks=skipped_blocks,
+                    compute_window=compute_window,
+                )
+                if debug_context and debug_context.get("enabled"):
+                    logging.info(
+                        "[debug_forward] step=%s branch=%s "
+                        "block_cache_window=%s..%s action=%s "
+                        "slg_skipped_blocks=%s",
+                        cache_step,
+                        cache_branch,
+                        cache_start,
+                        cache_end,
+                        cache_action,
+                        skipped_blocks,
+                    )
+                block_index = cache_end + 1
 
         vid = self.video_model.post_transformer_block_out(vid, vid_kwargs['grid_sizes'], vid_e)
         audio = self.audio_model.post_transformer_block_out(audio, audio_kwargs['grid_sizes'], audio_e)

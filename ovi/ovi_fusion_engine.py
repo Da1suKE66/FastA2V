@@ -26,6 +26,7 @@ from ovi.cfg_cache import (
     expected_cfg_cache_metrics,
     validate_cfg_cache_config,
 )
+from ovi.block_cache import FusionBlockCache, validate_block_cache_config
 from ovi.modules.video_attention_dispatcher import (
     VideoSelfAttentionDispatcher,
     expected_video_self_attention_calls,
@@ -79,6 +80,21 @@ class OviFusionEngine:
         self.cfg_cache_refresh_interval = int(
             config.get("cfg_cache_refresh_interval", 5)
         )
+        self.block_cache_start_block = int(
+            config.get("block_cache_start_block", 10)
+        )
+        self.block_cache_end_block = int(
+            config.get("block_cache_end_block", 19)
+        )
+        self.block_cache_policy = str(
+            config.get("block_cache_policy", "fixed")
+        ).lower()
+        self.block_cache_cosine_threshold = float(
+            config.get("block_cache_cosine_threshold", 0.95)
+        )
+        self.block_cache_max_consecutive_reuses = int(
+            config.get("block_cache_max_consecutive_reuses", 1)
+        )
         if self.use_cfg_cache:
             validate_cfg_cache_config(
                 self.cfg_cache_start_step,
@@ -86,10 +102,18 @@ class OviFusionEngine:
                 self.cfg_cache_refresh_interval,
             )
         if self.use_block_cache:
-            raise NotImplementedError(
-                "Block cache is not wired yet; refusing to silently run "
-                "without the requested cache."
+            validate_block_cache_config(
+                self.block_cache_start_block,
+                self.block_cache_end_block,
+                self.block_cache_policy,
+                self.block_cache_cosine_threshold,
+                self.block_cache_max_consecutive_reuses,
             )
+            if int(config.get("sp_size", 1)) != 1:
+                raise NotImplementedError(
+                    "The first block-cache implementation is limited to "
+                    "sp_size=1 so every reuse decision has one owner."
+                )
         self.debug_forward = bool(config.get("debug_forward", False))
         self.debug_forward_step = int(config.get("debug_forward_step", 0))
         self.run_kind = str(config.get("run_kind", "unspecified"))
@@ -101,6 +125,15 @@ class OviFusionEngine:
             logging.info("CPU offloading is enabled. Initializing all models aside from VAEs on CPU")
 
         model, video_config, audio_config = init_fusion_score_model_ovi(rank=device, meta_init=meta_init)
+        if self.use_block_cache:
+            validate_block_cache_config(
+                self.block_cache_start_block,
+                self.block_cache_end_block,
+                self.block_cache_policy,
+                self.block_cache_cosine_threshold,
+                self.block_cache_max_consecutive_reuses,
+                num_blocks=model.num_blocks,
+            )
         model.set_video_self_attention_dispatcher(
             self.video_self_attention_dispatcher
         )
@@ -239,6 +272,10 @@ class OviFusionEngine:
             if self.use_cfg_cache
             else None
         )
+        # Allocate block-cache payload state only after entering the protected
+        # try/finally below.  Configuration lives on the engine; mutable cached
+        # tensors never do.
+        block_cache_state = None
         dense_negative_forwards = 0
         self.last_run_metrics = {
             "status": "running",
@@ -254,6 +291,20 @@ class OviFusionEngine:
             "cfg_negative_forwards": 0,
             "expected_cfg_cache_metrics": expected_cfg_metrics,
             "use_block_cache": self.use_block_cache,
+            "block_cache_start_block": self.block_cache_start_block,
+            "block_cache_end_block": self.block_cache_end_block,
+            "block_cache_window_inclusive": True,
+            "block_cache_policy": self.block_cache_policy,
+            "block_cache_cosine_threshold": (
+                self.block_cache_cosine_threshold
+            ),
+            "block_cache_max_consecutive_reuses": (
+                self.block_cache_max_consecutive_reuses
+            ),
+            "block_cache_hits": 0,
+            "block_cache_refreshes": 0,
+            "block_cache_saved_video_self_attention_calls": 0,
+            "block_cache_branch_metrics": {},
             "debug_forward": self.debug_forward,
             "run_kind": self.run_kind,
             "benchmark_candidate": self.benchmark_eligible and not self.debug_forward,
@@ -294,6 +345,15 @@ class OviFusionEngine:
                     f"{pretty}\n"
                     "==========================================")
         try:
+            if self.use_block_cache:
+                block_cache_state = FusionBlockCache(
+                    self.block_cache_start_block,
+                    self.block_cache_end_block,
+                    self.block_cache_policy,
+                    self.block_cache_cosine_threshold,
+                    self.block_cache_max_consecutive_reuses,
+                    num_blocks=self.model.num_blocks,
+                )
             scheduler_video, timesteps_video = self.get_scheduler_time_steps(
                 sampling_steps=sample_steps,
                 device=self.device,
@@ -427,6 +487,14 @@ class OviFusionEngine:
                         'audio_seq_len': max_seq_len_audio,
                         'first_frame_is_clean': is_i2v
                     }
+                    if block_cache_state is not None:
+                        pos_forward_args.update({
+                            'block_cache_state': block_cache_state,
+                            'block_cache_context': {
+                                'step': i,
+                                'branch': 'conditional',
+                            },
+                        })
 
                     pred_vid_pos, pred_audio_pos = self.model(
                         vid=[video_noise],
@@ -474,6 +542,14 @@ class OviFusionEngine:
                         'first_frame_is_clean': is_i2v,
                         'slg_layer': slg_layer
                     }
+                    if block_cache_state is not None:
+                        neg_forward_args.update({
+                            'block_cache_state': block_cache_state,
+                            'block_cache_context': {
+                                'step': i,
+                                'branch': 'unconditional',
+                            },
+                        })
 
                     negative_debug_context = {
                         "enabled": debug_this_step,
@@ -630,12 +706,31 @@ class OviFusionEngine:
             else:
                 self.last_run_metrics.update(cfg_cache_state.metrics())
                 cfg_cache_state.clear()
+            if block_cache_state is None:
+                block_cache_metrics = {
+                    "block_cache_hits": 0,
+                    "block_cache_refreshes": 0,
+                    "block_cache_saved_video_self_attention_calls": 0,
+                    "block_cache_branch_metrics": {},
+                }
+            else:
+                block_cache_metrics = block_cache_state.metrics()
+                block_cache_state.clear()
+            self.last_run_metrics.update(block_cache_metrics)
+            block_adjusted_expected_attention_calls = (
+                expected_attention_calls
+                - block_cache_metrics[
+                    "block_cache_saved_video_self_attention_calls"
+                ]
+            )
             dispatcher_metrics = self.video_self_attention_dispatcher.metrics()
             self.last_run_metrics["video_self_attention_dispatcher"] = {
                 **dispatcher_metrics,
-                "expected_calls": expected_attention_calls,
+                "expected_calls_without_block_cache": expected_attention_calls,
+                "expected_calls": block_adjusted_expected_attention_calls,
                 "calls_match_expected": (
-                    dispatcher_metrics["calls_total"] == expected_attention_calls
+                    dispatcher_metrics["calls_total"]
+                    == block_adjusted_expected_attention_calls
                 ),
             }
             

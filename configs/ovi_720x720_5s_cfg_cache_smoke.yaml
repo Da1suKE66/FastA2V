@@ -33,5 +33,10 @@ cfg_cache_start_step: 10
 cfg_cache_end_step: 39
 cfg_cache_refresh_interval: 5
 use_block_cache: false
+block_cache_start_block: 10
+block_cache_end_block: 19
+block_cache_policy: "fixed"
+block_cache_cosine_threshold: 0.95
+block_cache_max_consecutive_reuses: 1
 debug_forward: true
 debug_forward_step: 11

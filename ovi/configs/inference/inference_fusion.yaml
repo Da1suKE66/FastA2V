@@ -28,5 +28,13 @@ cfg_cache_start_step: 10
 cfg_cache_end_step: 39
 cfg_cache_refresh_interval: 5
 use_block_cache: False
+# Inclusive fusion-block window.  The fixed policy is deliberately capped at
+# one reuse: compute -> reuse -> compute.  The cosine policy additionally
+# requires min(video cosine, audio cosine) to meet the threshold.
+block_cache_start_block: 10
+block_cache_end_block: 19
+block_cache_policy: "fixed" # ["fixed", "cosine"]
+block_cache_cosine_threshold: 0.95
+block_cache_max_consecutive_reuses: 1
 debug_forward: False
 debug_forward_step: 0

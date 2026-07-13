@@ -1,10 +1,10 @@
 ckpt_dir: /cache/liluchen/FastA2V/ckpts
-output_dir: ${oc.env:FASTA2V_RUN_DIR,/cache/liluchen/FastA2V/runs/ovi_720ckpt_dense_smoke_manual}
+output_dir: ${oc.env:FASTA2V_RUN_DIR,/cache/liluchen/FastA2V/runs/ovi_720ckpt_block_cache_50step_manual}
 
 model_name: "720x720_5s"
 mode: "t2v"
 video_frame_height_width: [720, 720]
-sample_steps: 20
+sample_steps: 50
 solver_name: "unipc"
 shift: 5.0
 sp_size: 1
@@ -21,22 +21,21 @@ cpu_offload: false
 seed: 103
 text_prompt: prompts/ovi_smoke.csv
 each_example_n_times: 1
-warmup_runs: 0
-measurement_runs: 1
-run_kind: "diagnostic_smoke"
-benchmark_eligible: false
-gpu_process_monitor_interval_seconds: 5.0
+warmup_runs: 1
+measurement_runs: 3
+run_kind: "block_cache_benchmark"
+benchmark_eligible: true
 
 attention_method: "dense"
 use_cfg_cache: false
 cfg_cache_start_step: 10
 cfg_cache_end_step: 39
 cfg_cache_refresh_interval: 5
-use_block_cache: false
+use_block_cache: true
 block_cache_start_block: 10
 block_cache_end_block: 19
 block_cache_policy: "fixed"
 block_cache_cosine_threshold: 0.95
 block_cache_max_consecutive_reuses: 1
-debug_forward: true
+debug_forward: false
 debug_forward_step: 0
