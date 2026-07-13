@@ -7,9 +7,17 @@ import json
 import math
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from ovi.block_cache import fixed_block_cache_metric_errors
 
 
 SPARGE_PROVENANCE = {
@@ -374,6 +382,11 @@ def verify(path, require_metrics=True, expected_video_frames=121):
                         "block_cache_saved_video_self_attention_calls="
                         f"{block_saved_calls} != branch sum {branch_saved_calls}"
                     )
+                if metrics.get("block_cache_policy") == "fixed":
+                    errors.extend(
+                        f"fixed block-cache schedule: {error}"
+                        for error in fixed_block_cache_metric_errors(metrics)
+                    )
             else:
                 errors.append("enabled block cache requires branch metrics")
 
@@ -506,6 +519,46 @@ def verify_run_protocol(run_dir, reports):
         if item.get("status") != "ok" or item.get("record_type") != "warmup":
             errors.append("warmup_timings.jsonl contains an invalid warm-up record")
             break
+
+    all_run_records = [*warmups, *timings]
+    if environment.get("use_block_cache") or any(
+        item.get("use_block_cache") for item in all_run_records
+    ):
+        schedule_fields = (
+            "use_block_cache",
+            "sample_steps",
+            "slg_layer",
+            "use_cfg_cache",
+            "cfg_cache_start_step",
+            "cfg_cache_end_step",
+            "cfg_cache_refresh_interval",
+            "block_cache_start_block",
+            "block_cache_end_block",
+            "block_cache_policy",
+            "block_cache_cosine_threshold",
+            "block_cache_max_consecutive_reuses",
+        )
+        for record_type, records in (
+            ("warmup", warmups),
+            ("measurement", timings),
+        ):
+            for index, item in enumerate(records):
+                for field in schedule_fields:
+                    if item.get(field) != environment.get(field):
+                        errors.append(
+                            f"{record_type}[{index}] {field}="
+                            f"{item.get(field)!r} != environment "
+                            f"{environment.get(field)!r}"
+                        )
+                if (
+                    item.get("use_block_cache") is True
+                    and item.get("block_cache_policy") == "fixed"
+                ):
+                    errors.extend(
+                        f"{record_type}[{index}] fixed block-cache schedule: "
+                        f"{error}"
+                        for error in fixed_block_cache_metric_errors(item)
+                    )
 
     if candidate:
         for item in [*warmups, *timings]:

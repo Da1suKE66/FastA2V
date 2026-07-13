@@ -324,6 +324,7 @@ class OviFusionEngine:
             # checking warm-up/measurement cardinality and every artifact.
             "benchmark_valid": False,
             "sample_steps": int(sample_steps),
+            "slg_layer": int(slg_layer),
             "seed": int(seed),
             "original_text_prompt": original_text_prompt,
             "requested_video_frame_height_width": (

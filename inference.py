@@ -95,6 +95,8 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
         "sparge_topk": float(config.get("sparge_topk", 0.5)),
         "sparge_pvthreshd": float(config.get("sparge_pvthreshd", 50)),
         "sparge_smooth_k": bool(config.get("sparge_smooth_k", True)),
+        "sample_steps": int(config.get("sample_steps", 50)),
+        "slg_layer": int(config.get("slg_layer", 11)),
         "use_cfg_cache": bool(config.get("use_cfg_cache", False)),
         "cfg_cache_start_step": int(config.get("cfg_cache_start_step", 10)),
         "cfg_cache_end_step": int(config.get("cfg_cache_end_step", 39)),

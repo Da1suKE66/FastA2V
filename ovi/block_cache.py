@@ -64,6 +64,241 @@ def validate_block_cache_config(
     )
 
 
+def _nonnegative_int(name, value):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _fixed_branch_schedule(forward_steps, max_consecutive_reuses):
+    has_cached_pair = False
+    last_seen_step = None
+    consecutive_reuses = 0
+    hits = 0
+    refreshes = 0
+    refresh_reasons = {}
+
+    for step in forward_steps:
+        if not has_cached_pair:
+            action = "refresh"
+            reason = "empty"
+        elif step != last_seen_step + 1:
+            action = "refresh"
+            reason = "step_gap"
+        elif consecutive_reuses >= max_consecutive_reuses:
+            action = "refresh"
+            reason = "max_consecutive_reuses"
+        else:
+            action = "hit"
+            reason = None
+
+        if action == "hit":
+            hits += 1
+            consecutive_reuses += 1
+        else:
+            has_cached_pair = True
+            refreshes += 1
+            consecutive_reuses = 0
+            refresh_reasons[reason] = refresh_reasons.get(reason, 0) + 1
+        last_seen_step = step
+
+    return {
+        "forward_count": len(forward_steps),
+        "hits": hits,
+        "refreshes": refreshes,
+        "refresh_reasons": refresh_reasons,
+    }
+
+
+def expected_fixed_block_cache_metrics(
+    *,
+    sample_steps,
+    use_cfg_cache,
+    cfg_cache_start_step,
+    cfg_cache_end_step,
+    cfg_cache_refresh_interval,
+    block_cache_start_block,
+    block_cache_end_block,
+    block_cache_max_consecutive_reuses,
+    slg_layer,
+):
+    """Return the exact fixed-policy schedule for one Ovi generation."""
+    sample_steps = _nonnegative_int("sample_steps", sample_steps)
+    cfg_cache_start_step = _nonnegative_int(
+        "cfg_cache_start_step", cfg_cache_start_step
+    )
+    cfg_cache_end_step = _nonnegative_int(
+        "cfg_cache_end_step", cfg_cache_end_step
+    )
+    cfg_cache_refresh_interval = _nonnegative_int(
+        "cfg_cache_refresh_interval", cfg_cache_refresh_interval
+    )
+    if cfg_cache_end_step < cfg_cache_start_step:
+        raise ValueError(
+            "cfg_cache_end_step must be >= cfg_cache_start_step"
+        )
+    if cfg_cache_refresh_interval < 1:
+        raise ValueError("cfg_cache_refresh_interval must be >= 1")
+    block_cache_start_block = _nonnegative_int(
+        "block_cache_start_block", block_cache_start_block
+    )
+    block_cache_end_block = _nonnegative_int(
+        "block_cache_end_block", block_cache_end_block
+    )
+    if block_cache_end_block < block_cache_start_block:
+        raise ValueError(
+            "block_cache_end_block must be >= block_cache_start_block"
+        )
+    block_cache_max_consecutive_reuses = _nonnegative_int(
+        "block_cache_max_consecutive_reuses",
+        block_cache_max_consecutive_reuses,
+    )
+    if block_cache_max_consecutive_reuses != 1:
+        raise ValueError(
+            "fixed block-cache verification requires exactly one consecutive reuse"
+        )
+    if not isinstance(use_cfg_cache, bool):
+        raise ValueError("use_cfg_cache must be a bool")
+    if not isinstance(slg_layer, int) or isinstance(slg_layer, bool):
+        raise ValueError("slg_layer must be an integer")
+
+    conditional_steps = list(range(sample_steps))
+    if use_cfg_cache:
+        unconditional_steps = [
+            step
+            for step in range(sample_steps)
+            if (
+                step < cfg_cache_start_step
+                or step > cfg_cache_end_step
+                or (
+                    (step - cfg_cache_start_step)
+                    % cfg_cache_refresh_interval
+                    == 0
+                )
+            )
+        ]
+    else:
+        unconditional_steps = list(range(sample_steps))
+
+    branch_metrics = {
+        "conditional": _fixed_branch_schedule(
+            conditional_steps, block_cache_max_consecutive_reuses
+        ),
+        "unconditional": _fixed_branch_schedule(
+            unconditional_steps, block_cache_max_consecutive_reuses
+        ),
+    }
+    window_size = block_cache_end_block - block_cache_start_block + 1
+    branch_metrics["conditional"]["saved_video_self_attention_calls"] = (
+        branch_metrics["conditional"]["hits"] * window_size
+    )
+    unconditional_window_calls = window_size - int(
+        slg_layer > 0
+        and block_cache_start_block <= slg_layer <= block_cache_end_block
+    )
+    branch_metrics["unconditional"][
+        "saved_video_self_attention_calls"
+    ] = branch_metrics["unconditional"]["hits"] * unconditional_window_calls
+
+    return {
+        "block_cache_hits": sum(
+            branch["hits"] for branch in branch_metrics.values()
+        ),
+        "block_cache_refreshes": sum(
+            branch["refreshes"] for branch in branch_metrics.values()
+        ),
+        "block_cache_saved_video_self_attention_calls": sum(
+            branch["saved_video_self_attention_calls"]
+            for branch in branch_metrics.values()
+        ),
+        "block_cache_branch_metrics": branch_metrics,
+    }
+
+
+def fixed_block_cache_metric_errors(metrics):
+    """Validate recorded fixed-policy metrics against the exact CFG schedule."""
+    if not isinstance(metrics, dict):
+        return ["fixed block-cache metrics must be a JSON object"]
+    try:
+        expected = expected_fixed_block_cache_metrics(
+            sample_steps=metrics["sample_steps"],
+            use_cfg_cache=metrics["use_cfg_cache"],
+            cfg_cache_start_step=metrics["cfg_cache_start_step"],
+            cfg_cache_end_step=metrics["cfg_cache_end_step"],
+            cfg_cache_refresh_interval=metrics["cfg_cache_refresh_interval"],
+            block_cache_start_block=metrics["block_cache_start_block"],
+            block_cache_end_block=metrics["block_cache_end_block"],
+            block_cache_max_consecutive_reuses=metrics[
+                "block_cache_max_consecutive_reuses"
+            ],
+            slg_layer=metrics["slg_layer"],
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        return [f"cannot derive fixed block-cache schedule: {error}"]
+
+    errors = []
+    for field_name in (
+        "block_cache_hits",
+        "block_cache_refreshes",
+        "block_cache_saved_video_self_attention_calls",
+    ):
+        if metrics.get(field_name) != expected[field_name]:
+            errors.append(
+                f"{field_name}={metrics.get(field_name)} != fixed schedule "
+                f"{expected[field_name]}"
+            )
+
+    expected_negative_forwards = expected["block_cache_branch_metrics"][
+        "unconditional"
+    ]["forward_count"]
+    if metrics.get("cfg_negative_forwards") != expected_negative_forwards:
+        errors.append(
+            "cfg_negative_forwards="
+            f"{metrics.get('cfg_negative_forwards')} != configured CFG "
+            f"schedule {expected_negative_forwards}"
+        )
+
+    actual_branches = metrics.get("block_cache_branch_metrics")
+    if not isinstance(actual_branches, dict):
+        errors.append("fixed block-cache branch metrics must be a JSON object")
+        return errors
+    for branch_name in SUPPORTED_BLOCK_CACHE_BRANCHES:
+        actual = actual_branches.get(branch_name)
+        branch_expected = expected["block_cache_branch_metrics"][branch_name]
+        if not isinstance(actual, dict):
+            errors.append(
+                f"fixed block-cache branch {branch_name} must be a JSON object"
+            )
+            continue
+        for field_name in (
+            "hits",
+            "refreshes",
+            "saved_video_self_attention_calls",
+            "refresh_reasons",
+        ):
+            if actual.get(field_name) != branch_expected[field_name]:
+                errors.append(
+                    f"fixed block-cache {branch_name}.{field_name}="
+                    f"{actual.get(field_name)} != schedule "
+                    f"{branch_expected[field_name]}"
+                )
+        actual_forward_count = (
+            actual.get("hits", 0) + actual.get("refreshes", 0)
+            if isinstance(actual.get("hits"), int)
+            and not isinstance(actual.get("hits"), bool)
+            and isinstance(actual.get("refreshes"), int)
+            and not isinstance(actual.get("refreshes"), bool)
+            else None
+        )
+        if actual_forward_count != branch_expected["forward_count"]:
+            errors.append(
+                f"fixed block-cache {branch_name} forward count="
+                f"{actual_forward_count} != schedule "
+                f"{branch_expected['forward_count']}"
+            )
+    return errors
+
+
 def _atomic_pair(candidate, label):
     if not isinstance(candidate, (tuple, list)) or len(candidate) != 2:
         raise ValueError(f"{label} must be one atomic (video, audio) pair")
@@ -112,17 +347,34 @@ def _detached_pair(pair):
     )
 
 
-def _torch_cosine_similarity(left, right):
+def _pool_hidden_for_cosine(hidden):
+    """Pool ``[batch, sequence, ...]`` hidden state over sequence dim 1."""
+    shape = getattr(hidden, "shape", None)
+    if shape is None or len(shape) < 2:
+        raise ValueError(
+            "cosine block-cache inputs must have at least two dimensions "
+            "so sequence dim=1 can be pooled"
+        )
+    # Cache only this detached pooled representation.  For Ovi [B, S, D]
+    # tensors this avoids retaining another full video hidden state per branch.
+    return hidden.mean(dim=1).detach()
+
+
+def _torch_cosine_similarity(left_pooled, right_pooled):
     import torch
     import torch.nn.functional as F
 
-    if not isinstance(left, torch.Tensor) or not isinstance(right, torch.Tensor):
-        raise TypeError("cosine block-cache policy requires torch.Tensor inputs")
+    if not isinstance(left_pooled, torch.Tensor) or not isinstance(
+        right_pooled, torch.Tensor
+    ):
+        raise TypeError(
+            "cosine block-cache policy requires pooled torch.Tensor inputs"
+        )
     # The optional cosine policy necessarily materializes one scalar decision
     # per stream.  The fixed policy has no such synchronization.
     similarity = F.cosine_similarity(
-        left.detach().reshape(-1).float(),
-        right.detach().reshape(-1).float(),
+        left_pooled.float().reshape(-1),
+        right_pooled.float().reshape(-1),
         dim=0,
         eps=1e-8,
     )
@@ -131,9 +383,10 @@ def _torch_cosine_similarity(left, right):
 
 @dataclass
 class _BranchRecord:
-    cached_input_pair: object = None
+    cached_pooled_input_pair: object = None
     cached_output_pair: object = None
     input_metadata: object = None
+    output_metadata: object = None
     signature: object = None
     source_step: object = None
     last_seen_step: object = None
@@ -149,9 +402,10 @@ class _BranchRecord:
     last_min_cosine: object = None
 
     def clear_payload(self):
-        self.cached_input_pair = None
+        self.cached_pooled_input_pair = None
         self.cached_output_pair = None
         self.input_metadata = None
+        self.output_metadata = None
         self.signature = None
         self.source_step = None
         self.last_seen_step = None
@@ -177,6 +431,7 @@ class FusionBlockCache:
         *,
         num_blocks=None,
         cosine_fn=None,
+        pool_fn=None,
     ):
         (
             self.start_block,
@@ -201,6 +456,7 @@ class FusionBlockCache:
         # Dependency injection keeps the state-machine tests CPU-only and free
         # of the heavyweight Ovi runtime.  Production uses the Torch function.
         self._cosine_fn = cosine_fn or _torch_cosine_similarity
+        self._pool_fn = pool_fn or _pool_hidden_for_cosine
 
     @property
     def window_size(self):
@@ -238,19 +494,38 @@ class FusionBlockCache:
             return "refresh", mismatch
         if signature != record.signature:
             return "refresh", "slg_signature_mismatch"
+        cached_output_metadata = _pair_metadata(record.cached_output_pair)
+        mismatch = _metadata_mismatch_reason(
+            record.output_metadata, cached_output_metadata
+        )
+        if mismatch is not None:
+            return "refresh", f"cached_output_{mismatch}"
+        mismatch = _metadata_mismatch_reason(
+            current_metadata, record.output_metadata
+        )
+        if mismatch is not None:
+            return "refresh", f"output_{mismatch}"
         if record.consecutive_reuses >= self.max_consecutive_reuses:
             return "refresh", "max_consecutive_reuses"
 
         if self.policy == "cosine":
+            current_pooled_pair = tuple(
+                self._pool_fn(value) for value in input_pair
+            )
             video_cosine = self._cosine_fn(
-                input_pair[0], record.cached_input_pair[0]
+                current_pooled_pair[0], record.cached_pooled_input_pair[0]
             )
             audio_cosine = self._cosine_fn(
-                input_pair[1], record.cached_input_pair[1]
+                current_pooled_pair[1], record.cached_pooled_input_pair[1]
             )
-            min_cosine = min(video_cosine, audio_cosine)
             record.last_video_cosine = video_cosine
             record.last_audio_cosine = audio_cosine
+            if not (
+                math.isfinite(video_cosine) and math.isfinite(audio_cosine)
+            ):
+                record.last_min_cosine = None
+                return "refresh", "cosine_nonfinite"
+            min_cosine = min(video_cosine, audio_cosine)
             record.last_min_cosine = min_cosine
             if min_cosine < self.cosine_threshold:
                 return "refresh", "cosine_below_threshold"
@@ -304,14 +579,29 @@ class FusionBlockCache:
         output_pair = _atomic_pair(candidate, "block-cache window output")
         # All fields are replaced together only after the complete pair has
         # validated; a partial/failed refresh leaves the old payload intact.
-        new_cached_input_pair = (
-            _detached_pair(input_pair) if self.policy == "cosine" else None
+        new_cached_pooled_input_pair = (
+            tuple(self._pool_fn(value) for value in input_pair)
+            if self.policy == "cosine"
+            else None
         )
-        new_cached_output_pair = _detached_pair(output_pair)
         new_input_metadata = _pair_metadata(input_pair)
-        record.cached_input_pair = new_cached_input_pair
+        new_cached_output_pair = _detached_pair(output_pair)
+        # Validate the exact detached pair that will be published, rather than
+        # assuming a tensor-like ``detach`` implementation preserves metadata.
+        new_output_metadata = _pair_metadata(new_cached_output_pair)
+        mismatch = _metadata_mismatch_reason(
+            new_input_metadata, new_output_metadata
+        )
+        if mismatch is not None:
+            raise ValueError(
+                "block-cache window output metadata must match its input; "
+                f"mismatch={mismatch} input={new_input_metadata} "
+                f"output={new_output_metadata}"
+            )
+        record.cached_pooled_input_pair = new_cached_pooled_input_pair
         record.cached_output_pair = new_cached_output_pair
         record.input_metadata = new_input_metadata
+        record.output_metadata = new_output_metadata
         record.signature = signature
         record.source_step = step
         record.last_seen_step = step

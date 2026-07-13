@@ -4,7 +4,13 @@ import math
 from pathlib import Path
 import unittest
 
-from ovi.block_cache import FusionBlockCache, validate_block_cache_config
+from ovi.block_cache import (
+    FusionBlockCache,
+    _pool_hidden_for_cosine,
+    expected_fixed_block_cache_metrics,
+    fixed_block_cache_metric_errors,
+    validate_block_cache_config,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +25,27 @@ class CpuMockTensor:
 
     def detach(self):
         return self
+
+
+class RecordingPooledTensor:
+    def __init__(self, events):
+        self.events = events
+
+    def detach(self):
+        self.events.append(("detach",))
+        return self
+
+
+class RecordingHiddenTensor:
+    shape = (2, 3, 4)
+
+    def __init__(self):
+        self.events = []
+        self.pooled = RecordingPooledTensor(self.events)
+
+    def mean(self, *, dim):
+        self.events.append(("mean", dim))
+        return self.pooled
 
 
 def tensor(values, *, shape=None, dtype="bfloat16", device="cpu"):
@@ -281,7 +308,7 @@ class FusionBlockCacheStateMachineTests(unittest.TestCase):
                     1,
                     "conditional",
                     next_input,
-                    lambda: pair("refreshed-output"),
+                    lambda next_input=next_input: next_input,
                 )
                 self.assertEqual(action, "refresh")
                 reasons = cache.metrics()["block_cache_branch_metrics"][
@@ -320,20 +347,25 @@ class FusionBlockCacheStateMachineTests(unittest.TestCase):
             cosine_threshold=0.9,
             num_blocks=30,
             cosine_fn=cosine,
+            pool_fn=lambda value: value,
         )
         base = (
-            tensor((1.0, 0.0)),
-            tensor((1.0, 0.0)),
+            tensor((1.0, 0.0), shape=(1, 2)),
+            tensor((1.0, 0.0), shape=(1, 2)),
         )
         self.resolve(
-            low_audio_cache, 0, "conditional", base, lambda: pair("output")
+            low_audio_cache, 0, "conditional", base, lambda: base
+        )
+        low_audio_input = (
+            tensor((1.0, 0.0), shape=(1, 2)),
+            tensor((0.0, 1.0), shape=(1, 2)),
         )
         _, action = self.resolve(
             low_audio_cache,
             1,
             "conditional",
-            (tensor((1.0, 0.0)), tensor((0.0, 1.0))),
-            lambda: pair("low-audio-refresh"),
+            low_audio_input,
+            lambda: low_audio_input,
         )
         self.assertEqual(action, "refresh")
         branch = low_audio_cache.metrics()["block_cache_branch_metrics"][
@@ -349,18 +381,193 @@ class FusionBlockCacheStateMachineTests(unittest.TestCase):
             cosine_threshold=0.9,
             num_blocks=30,
             cosine_fn=cosine,
+            pool_fn=lambda value: value,
         )
         self.resolve(
-            high_cache, 0, "conditional", base, lambda: pair("output")
+            high_cache, 0, "conditional", base, lambda: base
         )
         _, action = self.resolve(
             high_cache,
             1,
             "conditional",
-            (tensor((0.99, 0.01)), tensor((0.98, 0.02))),
+            (
+                tensor((0.99, 0.01), shape=(1, 2)),
+                tensor((0.98, 0.02), shape=(1, 2)),
+            ),
             lambda: self.fail("high-similarity pair should hit"),
         )
         self.assertEqual(action, "hit")
+
+    def test_production_cosine_pooling_is_mean_dim_one_then_detach(self):
+        hidden = RecordingHiddenTensor()
+
+        pooled = _pool_hidden_for_cosine(hidden)
+
+        self.assertIs(pooled, hidden.pooled)
+        self.assertEqual(hidden.events, [("mean", 1), ("detach",)])
+        with self.assertRaisesRegex(ValueError, "at least two dimensions"):
+            _pool_hidden_for_cosine(tensor((1.0,), shape=(1,)))
+
+    def test_cosine_cache_retains_only_pooled_input_pair(self):
+        pooled_values = []
+
+        def pool_fn(_value):
+            pooled = object()
+            pooled_values.append(pooled)
+            return pooled
+
+        cache = FusionBlockCache(
+            policy="cosine",
+            num_blocks=30,
+            pool_fn=pool_fn,
+            cosine_fn=lambda _left, _right: 1.0,
+        )
+        input_pair = pair("full-input")
+        output_pair = pair("window-output")
+
+        self.resolve(
+            cache,
+            0,
+            "conditional",
+            input_pair,
+            lambda: output_pair,
+        )
+
+        record = cache._branches["conditional"]
+        self.assertEqual(
+            record.cached_pooled_input_pair,
+            tuple(pooled_values),
+        )
+        self.assertFalse(hasattr(record, "cached_input_pair"))
+        for full_input, pooled in zip(
+            input_pair, record.cached_pooled_input_pair
+        ):
+            self.assertIsNot(pooled, full_input)
+        self.assertIs(record.cached_output_pair[0], output_pair[0])
+
+    def test_nonfinite_video_or_audio_cosine_forces_refresh(self):
+        for stream_index, stream_name in enumerate(("video", "audio")):
+            for nonfinite in (float("nan"), float("inf")):
+                with self.subTest(stream=stream_name, value=nonfinite):
+                    similarities = [1.0, 1.0]
+                    similarities[stream_index] = nonfinite
+                    results = iter(similarities)
+                    cache = FusionBlockCache(
+                        policy="cosine",
+                        num_blocks=30,
+                        pool_fn=lambda value: value,
+                        cosine_fn=lambda _left, _right: next(results),
+                    )
+                    base_input = pair("base")
+                    next_input = pair("next")
+                    calls = []
+                    self.resolve(
+                        cache,
+                        0,
+                        "conditional",
+                        base_input,
+                        lambda: pair("base-output"),
+                    )
+                    _, action = self.resolve(
+                        cache,
+                        1,
+                        "conditional",
+                        next_input,
+                        lambda: (
+                            calls.append("refresh") or pair("next-output")
+                        ),
+                    )
+
+                    branch = cache.metrics()["block_cache_branch_metrics"][
+                        "conditional"
+                    ]
+                    self.assertEqual(action, "refresh")
+                    self.assertEqual(calls, ["refresh"])
+                    self.assertEqual(branch["hits"], 0)
+                    self.assertEqual(
+                        branch["refresh_reasons"]["cosine_nonfinite"], 1
+                    )
+                    self.assertIsNone(branch["last_min_cosine"])
+
+    def test_window_output_metadata_must_match_each_input_stream(self):
+        variants = {
+            "video_shape_mismatch": pair(
+                "video-shape",
+                video=tensor((1.0, 2.0), shape=(2, 1)),
+            ),
+            "video_dtype_mismatch": pair(
+                "video-dtype",
+                video=tensor(
+                    (1.0, 2.0), shape=(1, 2), dtype="float32"
+                ),
+            ),
+            "video_device_mismatch": pair(
+                "video-device",
+                video=tensor(
+                    (1.0, 2.0), shape=(1, 2), device="cpu:1"
+                ),
+            ),
+            "audio_shape_mismatch": pair(
+                "audio-shape",
+                audio=tensor((3.0,), shape=(1,)),
+            ),
+            "audio_dtype_mismatch": pair(
+                "audio-dtype",
+                audio=tensor((3.0,), shape=(1, 1), dtype="float32"),
+            ),
+            "audio_device_mismatch": pair(
+                "audio-device",
+                audio=tensor((3.0,), shape=(1, 1), device="cpu:1"),
+            ),
+        }
+        for mismatch, bad_output in variants.items():
+            with self.subTest(mismatch=mismatch):
+                cache = FusionBlockCache(num_blocks=30)
+                with self.assertRaisesRegex(
+                    ValueError, f"mismatch={mismatch}"
+                ):
+                    self.resolve(
+                        cache,
+                        0,
+                        "conditional",
+                        pair("input"),
+                        lambda bad_output=bad_output: bad_output,
+                    )
+                self.assertFalse(cache.has_cached_pair())
+                self.assertEqual(cache.metrics()["block_cache_refreshes"], 0)
+
+    def test_mutated_cached_output_metadata_forces_refresh(self):
+        cache = FusionBlockCache(num_blocks=30)
+        self.resolve(
+            cache,
+            0,
+            "conditional",
+            pair("base"),
+            lambda: pair("base-output"),
+        )
+        record = cache._branches["conditional"]
+        record.cached_output_pair = (
+            tensor((1.0, 2.0), shape=(1, 2), dtype="float32"),
+            record.cached_output_pair[1],
+        )
+        calls = []
+
+        _, action = self.resolve(
+            cache,
+            1,
+            "conditional",
+            pair("next"),
+            lambda: (calls.append("refresh") or pair("new-output")),
+        )
+
+        self.assertEqual(action, "refresh")
+        self.assertEqual(calls, ["refresh"])
+        self.assertEqual(
+            cache.metrics()["block_cache_branch_metrics"]["conditional"][
+                "refresh_reasons"
+            ]["cached_output_video_dtype_mismatch"],
+            1,
+        )
 
     def test_failed_partial_refresh_does_not_publish_half_pair(self):
         cache = FusionBlockCache(num_blocks=30)
@@ -441,6 +648,166 @@ class FusionBlockCacheStateMachineTests(unittest.TestCase):
             validate_block_cache_config(
                 10, 19, max_consecutive_reuses=2
             )
+
+
+class FixedBlockCacheScheduleTests(unittest.TestCase):
+    def expected(self, sample_steps, *, use_cfg_cache):
+        return expected_fixed_block_cache_metrics(
+            sample_steps=sample_steps,
+            use_cfg_cache=use_cfg_cache,
+            cfg_cache_start_step=10,
+            cfg_cache_end_step=39,
+            cfg_cache_refresh_interval=5,
+            block_cache_start_block=10,
+            block_cache_end_block=19,
+            block_cache_max_consecutive_reuses=1,
+            slg_layer=11,
+        )
+
+    def test_no_cfg_smoke_20_step_fixed_schedule_is_exact(self):
+        expected = self.expected(20, use_cfg_cache=False)
+        branches = expected["block_cache_branch_metrics"]
+
+        self.assertEqual(
+            (
+                expected["block_cache_hits"],
+                expected["block_cache_refreshes"],
+                expected["block_cache_saved_video_self_attention_calls"],
+            ),
+            (20, 20, 190),
+        )
+        self.assertEqual(
+            (branches["conditional"]["hits"], branches["conditional"]["refreshes"]),
+            (10, 10),
+        )
+        self.assertEqual(
+            (
+                branches["unconditional"]["hits"],
+                branches["unconditional"]["refreshes"],
+            ),
+            (10, 10),
+        )
+        self.assertEqual(
+            branches["conditional"]["saved_video_self_attention_calls"],
+            100,
+        )
+        self.assertEqual(
+            branches["unconditional"]["saved_video_self_attention_calls"],
+            90,
+        )
+
+    def test_no_cfg_formal_50_step_fixed_schedule_is_exact(self):
+        expected = self.expected(50, use_cfg_cache=False)
+        branches = expected["block_cache_branch_metrics"]
+
+        self.assertEqual(
+            (
+                expected["block_cache_hits"],
+                expected["block_cache_refreshes"],
+                expected["block_cache_saved_video_self_attention_calls"],
+            ),
+            (50, 50, 475),
+        )
+        for branch in ("conditional", "unconditional"):
+            self.assertEqual(
+                (branches[branch]["hits"], branches[branch]["refreshes"]),
+                (25, 25),
+            )
+        self.assertEqual(
+            branches["conditional"]["saved_video_self_attention_calls"],
+            250,
+        )
+        self.assertEqual(
+            branches["unconditional"]["saved_video_self_attention_calls"],
+            225,
+        )
+
+    def test_cfg_50_step_fixed_schedule_tracks_negative_forwards(self):
+        expected = self.expected(50, use_cfg_cache=True)
+        branches = expected["block_cache_branch_metrics"]
+
+        self.assertEqual(
+            (
+                expected["block_cache_hits"],
+                expected["block_cache_refreshes"],
+                expected["block_cache_saved_video_self_attention_calls"],
+            ),
+            (35, 41, 340),
+        )
+        self.assertEqual(
+            (
+                branches["conditional"]["hits"],
+                branches["conditional"]["refreshes"],
+            ),
+            (25, 25),
+        )
+        self.assertEqual(
+            (
+                branches["unconditional"]["forward_count"],
+                branches["unconditional"]["hits"],
+                branches["unconditional"]["refreshes"],
+            ),
+            (26, 10, 16),
+        )
+        self.assertEqual(
+            branches["unconditional"]["refresh_reasons"],
+            {"empty": 1, "max_consecutive_reuses": 9, "step_gap": 6},
+        )
+
+    def test_metric_validator_rejects_self_consistent_wrong_counts(self):
+        config = {
+            "sample_steps": 50,
+            "use_cfg_cache": True,
+            "cfg_cache_start_step": 10,
+            "cfg_cache_end_step": 39,
+            "cfg_cache_refresh_interval": 5,
+            "block_cache_start_block": 10,
+            "block_cache_end_block": 19,
+            "block_cache_max_consecutive_reuses": 1,
+            "slg_layer": 11,
+            "cfg_negative_forwards": 26,
+        }
+        expected = self.expected(50, use_cfg_cache=True)
+        actual_branches = {
+            branch: {
+                field: value
+                for field, value in branch_metrics.items()
+                if field != "forward_count"
+            }
+            for branch, branch_metrics in expected[
+                "block_cache_branch_metrics"
+            ].items()
+        }
+        metrics = {
+            **config,
+            **expected,
+            "block_cache_branch_metrics": actual_branches,
+        }
+        self.assertEqual(fixed_block_cache_metric_errors(metrics), [])
+
+        # Keep aggregate and branch sums internally consistent while making
+        # the conditional schedule one hit short.  The exact verifier must
+        # still reject a record that the old sum-only checks accepted.
+        actual_branches["conditional"]["hits"] -= 1
+        actual_branches["conditional"][
+            "saved_video_self_attention_calls"
+        ] -= 10
+        metrics["block_cache_hits"] -= 1
+        metrics["block_cache_saved_video_self_attention_calls"] -= 10
+        errors = fixed_block_cache_metric_errors(metrics)
+        self.assertTrue(
+            any("conditional.hits" in error for error in errors), errors
+        )
+        self.assertTrue(
+            any("conditional forward count" in error for error in errors),
+            errors,
+        )
+
+        metrics["cfg_negative_forwards"] = 25
+        errors = fixed_block_cache_metric_errors(metrics)
+        self.assertTrue(
+            any("cfg_negative_forwards" in error for error in errors), errors
+        )
 
 
 class FusionBlockCacheMockAndAstTests(unittest.TestCase):
@@ -575,6 +942,79 @@ class FusionBlockCacheMockAndAstTests(unittest.TestCase):
             and node.func.value.id == "block_cache_state"
         ]
         self.assertEqual(len(resolve_calls), 1)
+
+    def test_verifier_binds_fixed_metrics_to_run_schedule_and_environment(self):
+        verifier_source = (
+            ROOT / "scripts" / "verify_ovi_output.py"
+        ).read_text(encoding="utf-8")
+        verifier_tree = ast.parse(verifier_source)
+        fixed_schedule_calls = [
+            node
+            for node in ast.walk(verifier_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "fixed_block_cache_metric_errors"
+        ]
+        # One call validates each artifact sidecar; the other covers every
+        # warm-up/timing record in the run protocol.
+        self.assertEqual(len(fixed_schedule_calls), 2)
+
+        protocol = next(
+            node
+            for node in verifier_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "verify_run_protocol"
+        )
+        schedule_assignment = next(
+            node
+            for node in ast.walk(protocol)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "schedule_fields"
+                for target in node.targets
+            )
+        )
+        schedule_fields = set(ast.literal_eval(schedule_assignment.value))
+        self.assertTrue(
+            {
+                "sample_steps",
+                "slg_layer",
+                "use_block_cache",
+                "use_cfg_cache",
+                "cfg_cache_start_step",
+                "cfg_cache_end_step",
+                "cfg_cache_refresh_interval",
+                "block_cache_start_block",
+                "block_cache_end_block",
+                "block_cache_policy",
+                "block_cache_cosine_threshold",
+                "block_cache_max_consecutive_reuses",
+            }.issubset(schedule_fields)
+        )
+
+        inference_tree = ast.parse(
+            (ROOT / "inference.py").read_text(encoding="utf-8")
+        )
+        collect_environment = next(
+            node
+            for node in inference_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_collect_environment"
+        )
+        environment_return = next(
+            node
+            for node in ast.walk(collect_environment)
+            if isinstance(node, ast.Return)
+            and isinstance(node.value, ast.Dict)
+        )
+        environment_keys = {
+            key.value
+            for key in environment_return.value.keys
+            if isinstance(key, ast.Constant)
+        }
+        self.assertIn("sample_steps", environment_keys)
+        self.assertIn("slg_layer", environment_keys)
 
 
 if __name__ == "__main__":
