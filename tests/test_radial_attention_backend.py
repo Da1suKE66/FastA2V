@@ -625,6 +625,35 @@ class RadialBackendExecutionTests(unittest.TestCase):
         self.assertEqual(mask_calls, [])
         self.assertEqual(flashinfer.wrappers, [])
 
+    def test_same_shape_cannot_hide_later_sequence_or_grid_drift(self):
+        backend, _torch, _flashinfer, mask_calls, _rope = self.make_backend()
+        attention = RecordingAttention()
+        hidden = FakeTensor("hidden", (1, 15004, 3072))
+        backend(
+            attention,
+            hidden,
+            FakeHostTensor([15004]),
+            FakeHostTensor([[31, 22, 22]]),
+            object(),
+        )
+        with self.assertRaisesRegex(RadialAttentionInputError, "seq_lens"):
+            backend(
+                attention,
+                hidden,
+                FakeHostTensor([15003]),
+                FakeHostTensor([[31, 22, 22]]),
+                object(),
+            )
+        with self.assertRaisesRegex(RadialAttentionInputError, "grid"):
+            backend(
+                attention,
+                hidden,
+                FakeHostTensor([15004]),
+                FakeHostTensor([[1, 22, 682]]),
+                object(),
+            )
+        self.assertEqual(len(mask_calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

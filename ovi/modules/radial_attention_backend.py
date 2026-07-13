@@ -472,7 +472,6 @@ class RadialVideoSelfAttentionBackend:
     def reset_metrics(self):
         """Reset generation counters while retaining immutable keyed plans."""
 
-        self._validated_signatures = set()
         self._calls = 0
         self._plan_cache_hits = 0
         self._plan_cache_misses = 0
@@ -547,23 +546,25 @@ class RadialVideoSelfAttentionBackend:
             raise RadialAttentionInputError(
                 f"fixed Radial protocol requires BF16 q/k/v, got {dtype_values}"
             )
-        signature = (expected_shape, next(iter(device_values)))
-        if signature not in self._validated_signatures:
-            lengths = [int(item) for item in _host_values(seq_lens, "seq_lens")]
-            if lengths != [RADIAL_SEQUENCE]:
-                raise RadialAttentionInputError(
-                    "fixed Radial protocol does not support padding or variable "
-                    f"lengths: seq_lens={lengths}"
-                )
-            grid = _host_values(grid_sizes, "grid_sizes")
-            if grid != [list(RADIAL_GRID)]:
-                raise RadialAttentionInputError(
-                    f"fixed Radial protocol requires grid {[list(RADIAL_GRID)]}, "
-                    f"got {grid}"
-                )
-            self._validated_signatures.add(signature)
+        # Ovi constructs these tiny tensors on CPU for every model forward, so
+        # checking their values on every block does not synchronize CUDA.  Do
+        # not cache only by QKV shape/device: a changed grid with the same token
+        # count would otherwise reuse the fixed mask while applying different
+        # RoPE coordinates.
+        lengths = [int(item) for item in _host_values(seq_lens, "seq_lens")]
+        if lengths != [RADIAL_SEQUENCE]:
+            raise RadialAttentionInputError(
+                "fixed Radial protocol does not support padding or variable "
+                f"lengths: seq_lens={lengths}"
+            )
+        grid = _host_values(grid_sizes, "grid_sizes")
+        if grid != [list(RADIAL_GRID)]:
+            raise RadialAttentionInputError(
+                f"fixed Radial protocol requires grid {[list(RADIAL_GRID)]}, "
+                f"got {grid}"
+            )
         self._last_shape = list(expected_shape)
-        self._last_grid = list(RADIAL_GRID)
+        self._last_grid = list(grid[0])
         self._last_device = next(iter(device_values))
         self._last_dtype = next(iter(dtype_values))
         return expected_shape
