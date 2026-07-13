@@ -197,6 +197,25 @@ class VideoAttentionDispatcherTests(unittest.TestCase):
         dispatcher.reset_metrics()
         self.assertEqual(dispatcher.metrics()["calls_total"], 0)
 
+    def test_reset_metrics_notifies_stateful_sparse_backend(self):
+        class ResettableBackend:
+            def __init__(self):
+                self.reset_count = 0
+
+            def __call__(self, *args, **kwargs):
+                return CpuMockTensor((0.0,))
+
+            def reset_metrics(self):
+                self.reset_count += 1
+
+        backend = ResettableBackend()
+        dispatcher = VideoSelfAttentionDispatcher(
+            "sparge", backends={"sparge": backend}
+        )
+        self.assertEqual(backend.reset_count, 1)
+        dispatcher.reset_metrics()
+        self.assertEqual(backend.reset_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

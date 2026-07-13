@@ -24,7 +24,7 @@ def package_version(name):
         return None
 
 
-def main(output_path=None):
+def main(output_path=None, attention_method="dense"):
     report = {
         "python": sys.version.split()[0],
         "python_executable": sys.executable,
@@ -35,6 +35,7 @@ def main(output_path=None):
         "packages": {},
         "checkpoints": {},
         "errors": [],
+        "attention_method": attention_method,
     }
 
     for executable in ("ffmpeg", "ffprobe"):
@@ -83,6 +84,30 @@ def main(output_path=None):
             importlib.import_module(module)
         except Exception as exc:
             report["errors"].append(f"{module} import failed: {exc!r}")
+
+    if attention_method == "sparge":
+        try:
+            from ovi.modules.sparge_attention_backend import (
+                SPARGEATTN_API,
+                SPARGEATTN_COMMIT,
+                load_official_sparge_kernel,
+                verify_sparge_install_receipt,
+            )
+
+            receipt_path, receipt = verify_sparge_install_receipt()
+            load_official_sparge_kernel(receipt["installed_package_root"])
+            report["spargeattn"] = {
+                "package_version": package_version("spas_sage_attn"),
+                "pinned_commit": SPARGEATTN_COMMIT,
+                "api": SPARGEATTN_API,
+                "install_receipt": str(receipt_path),
+                "install_receipt_contents": receipt,
+                "installed_files_verified": True,
+            }
+        except Exception as exc:
+            report["errors"].append(
+                f"official SpargeAttn dependency check failed: {exc!r}"
+            )
 
     try:
         importlib.import_module("inference")
@@ -144,5 +169,10 @@ def main(output_path=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--attention-method",
+        choices=("dense", "sparge", "radial", "svg"),
+        default="dense",
+    )
     cli_args = parser.parse_args()
-    raise SystemExit(main(cli_args.output))
+    raise SystemExit(main(cli_args.output, cli_args.attention_method))

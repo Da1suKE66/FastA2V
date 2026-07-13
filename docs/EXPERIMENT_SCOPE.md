@@ -72,3 +72,10 @@ negative forwards. The optional cosine policy additionally requires
 All acceleration options default to the official dense path. Sparse attention
 will only replace video self-attention; audio self-attention, text
 cross-attention, and bidirectional audio-video cross-attention remain dense.
+
+The first sparse adapter pins official SpargeAttn commit
+`ae5b629ebb41e41f86b3ea2ab5a3283f13ac151a` and calls its public
+`spas_sage2_attn_meansim_topk_cuda` API. See
+[`docs/SPARGEATTN.md`](SPARGEATTN.md) for installation, input constraints, and
+the exact Ovi ownership boundary. This repository contains no copied or custom
+SpargeAttn CUDA/Triton source.

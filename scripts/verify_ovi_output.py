@@ -12,6 +12,16 @@ from pathlib import Path
 import numpy as np
 
 
+SPARGE_PROVENANCE = {
+    "backend": "official_spargeattn",
+    "repository": "https://github.com/thu-ml/SpargeAttn.git",
+    "pinned_commit": "ae5b629ebb41e41f86b3ea2ab5a3283f13ac151a",
+    "api": "spas_sage2_attn_meansim_topk_cuda",
+    "tensor_layout": "NHD",
+    "return_sparsity": False,
+}
+
+
 def run(command):
     return subprocess.check_output(command, stderr=subprocess.STDOUT)
 
@@ -90,6 +100,49 @@ def as_int(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def validate_sparge_dispatcher(
+    dispatcher,
+    errors,
+    *,
+    expected_receipt=None,
+    expected_settings=None,
+    context="metrics",
+):
+    """Close the formal provenance loop for an official SpargeAttn record."""
+
+    details = dispatcher.get("backend_details")
+    if not isinstance(details, dict):
+        errors.append(f"{context}: Sparge dispatcher is missing backend_details")
+        return
+    for field, expected in SPARGE_PROVENANCE.items():
+        if details.get(field) != expected:
+            errors.append(
+                f"{context}: Sparge backend_details {field}="
+                f"{details.get(field)!r} != {expected!r}"
+            )
+    if details.get("calls") != dispatcher.get("calls_total"):
+        errors.append(
+            f"{context}: Sparge backend calls={details.get('calls')} != "
+            f"dispatcher calls_total={dispatcher.get('calls_total')}"
+        )
+
+    receipt = details.get("install_receipt")
+    if not isinstance(receipt, dict):
+        errors.append(f"{context}: Sparge backend install_receipt is missing")
+    elif expected_receipt is not None and receipt != expected_receipt:
+        errors.append(
+            f"{context}: Sparge backend receipt differs from copied run receipt"
+        )
+
+    if expected_settings is not None:
+        for field, expected in expected_settings.items():
+            if details.get(field) != expected:
+                errors.append(
+                    f"{context}: Sparge setting {field}={details.get(field)!r} "
+                    f"!= environment {expected!r}"
+                )
 
 
 def verify(path, require_metrics=True, expected_video_frames=121):
@@ -362,6 +415,8 @@ def verify(path, require_metrics=True, expected_video_frames=121):
                 errors.append(
                     f"dispatcher recorded backend errors: {errors_by_method}"
                 )
+            if configured_method == "sparge":
+                validate_sparge_dispatcher(dispatcher, errors)
         elif dispatcher is not None:
             errors.append("video_self_attention_dispatcher must be a JSON object")
 
@@ -395,19 +450,22 @@ def verify(path, require_metrics=True, expected_video_frames=121):
 
 def verify_run_protocol(run_dir, reports):
     errors = []
-    required_files = (
+    environment_path = run_dir / "environment.json"
+    environment = json.loads(environment_path.read_text()) if environment_path.is_file() else {}
+    attention_method = environment.get("attention_method")
+    required_files = [
         "environment.json",
         "run_config.yaml",
         "preflight.json",
         "environment.freeze.txt",
         "checkpoint_manifest.json",
-    )
+    ]
+    if attention_method == "sparge":
+        required_files.append("spargeattn-install.json")
     for filename in required_files:
         if not (run_dir / filename).is_file():
             errors.append(f"missing run evidence file: {filename}")
 
-    environment_path = run_dir / "environment.json"
-    environment = json.loads(environment_path.read_text()) if environment_path.is_file() else {}
     candidate = bool(environment.get("benchmark_eligible"))
     expected_measurements = int(environment.get("expected_measurement_records", -1))
     expected_warmups = int(environment.get("expected_warmup_records", -1))
@@ -465,11 +523,56 @@ def verify_run_protocol(run_dir, reports):
     if artifact_hashes != timing_hashes:
         errors.append("timings.jsonl output hashes do not match the verified artifacts")
 
+    preflight = {}
     preflight_path = run_dir / "preflight.json"
     if preflight_path.is_file():
         preflight = json.loads(preflight_path.read_text())
         if preflight.get("errors"):
             errors.append(f"preflight contains errors: {preflight['errors']}")
+
+    if attention_method == "sparge":
+        receipt_path = run_dir / "spargeattn-install.json"
+        try:
+            copied_receipt = json.loads(receipt_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            copied_receipt = None
+            errors.append(f"invalid copied SpargeAttn receipt: {exc}")
+
+        if not environment.get("spas_sage_attn"):
+            errors.append("environment is missing spas_sage_attn package version")
+        preflight_sparge = preflight.get("spargeattn")
+        if not isinstance(preflight_sparge, dict):
+            errors.append("Sparge run preflight is missing spargeattn evidence")
+        else:
+            if preflight_sparge.get("pinned_commit") != SPARGE_PROVENANCE["pinned_commit"]:
+                errors.append("preflight SpargeAttn commit differs from formal pin")
+            if preflight_sparge.get("api") != SPARGE_PROVENANCE["api"]:
+                errors.append("preflight SpargeAttn API differs from formal pin")
+            if preflight_sparge.get("installed_files_verified") is not True:
+                errors.append("preflight did not verify installed SpargeAttn files")
+            if preflight_sparge.get("install_receipt_contents") != copied_receipt:
+                errors.append("preflight SpargeAttn receipt differs from copied receipt")
+
+        expected_settings = {
+            "topk": environment.get("sparge_topk"),
+            "pvthreshd": environment.get("sparge_pvthreshd"),
+            "smooth_k": environment.get("sparge_smooth_k"),
+        }
+        for record_type, records in (("measurement", timings), ("warmup", warmups)):
+            for index, item in enumerate(records):
+                dispatcher = item.get("video_self_attention_dispatcher")
+                if not isinstance(dispatcher, dict):
+                    errors.append(
+                        f"{record_type}[{index}] is missing video dispatcher evidence"
+                    )
+                    continue
+                validate_sparge_dispatcher(
+                    dispatcher,
+                    errors,
+                    expected_receipt=copied_receipt,
+                    expected_settings=expected_settings,
+                    context=f"{record_type}[{index}]",
+                )
 
     evidence_hashes = environment.get("evidence_file_sha256", {})
     for filename, expected_hash in evidence_hashes.items():

@@ -121,11 +121,14 @@ class VideoSelfAttentionDispatcher:
         self._errors_by_method = {
             method: 0 for method in SUPPORTED_ATTENTION_METHODS
         }
+        backend_reset_metrics = getattr(self._backend, "reset_metrics", None)
+        if callable(backend_reset_metrics):
+            backend_reset_metrics()
 
     def metrics(self):
         """Return JSON-serializable dispatcher state for run metrics."""
 
-        return {
+        metrics = {
             "configured_method": self.method,
             "active_method": self.method,
             "backend_ready": self.method == "dense" or self._backend is not None,
@@ -137,6 +140,10 @@ class VideoSelfAttentionDispatcher:
             "fallback_count": 0,
             "fallback_reason": None,
         }
+        backend_metrics = getattr(self._backend, "metrics", None)
+        if callable(backend_metrics):
+            metrics["backend_details"] = backend_metrics()
+        return metrics
 
     def __call__(
         self,

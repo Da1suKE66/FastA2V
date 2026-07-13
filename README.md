@@ -21,6 +21,9 @@
 > FASTA2V_HF_ENDPOINT=https://hf-mirror.com \
 >   bash scripts/download_ovi_720x720_5s.sh
 > ```
+>
+> The optional official SpargeAttn adapter has a separate pinned build step and
+> fail-fast receipt check. See [`docs/SPARGEATTN.md`](docs/SPARGEATTN.md).
 
 <div align="center">
 <h1> Ovi: Twin Backbone Cross-Modal Fusion for Audio-Video Generation </h1>

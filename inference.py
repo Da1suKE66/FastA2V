@@ -61,11 +61,14 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
     git_status = _command_output(["git", "status", "--porcelain"])
     evidence_files = {}
     output_dir = os.path.abspath(config.get("output_dir"))
-    for filename in (
+    evidence_filenames = [
         "preflight.json",
         "environment.freeze.txt",
         "checkpoint_manifest.json",
-    ):
+    ]
+    if config.get("attention_method", "dense") == "sparge":
+        evidence_filenames.append("spargeattn-install.json")
+    for filename in evidence_filenames:
         path = os.path.join(output_dir, filename)
         evidence_files[filename] = _sha256(path) if os.path.isfile(path) else None
 
@@ -80,6 +83,7 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
         "torch_cuda": torch.version.cuda,
         "cudnn": torch.backends.cudnn.version(),
         "flash_attn": _package_version("flash-attn"),
+        "spas_sage_attn": _package_version("spas_sage_attn"),
         "transformers": _package_version("transformers"),
         "gpu": torch.cuda.get_device_name(0),
         "gpu_count": torch.cuda.device_count(),
@@ -87,6 +91,9 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
         "engine_load_seconds": engine_load_seconds,
         "model_name": config.get("model_name"),
         "attention_method": config.get("attention_method", "dense"),
+        "sparge_topk": float(config.get("sparge_topk", 0.5)),
+        "sparge_pvthreshd": float(config.get("sparge_pvthreshd", 50)),
+        "sparge_smooth_k": bool(config.get("sparge_smooth_k", True)),
         "use_cfg_cache": bool(config.get("use_cfg_cache", False)),
         "cfg_cache_start_step": int(config.get("cfg_cache_start_step", 10)),
         "cfg_cache_end_step": int(config.get("cfg_cache_end_step", 39)),
@@ -152,6 +159,8 @@ def _prepare_output_dir(config):
             "preflight.json",
             "stdout.log",
         }
+        if config.get("attention_method", "dense") == "sparge":
+            allowed_pre_run_files.add("spargeattn-install.json")
         unexpected = sorted(
             name for name in os.listdir(output_dir)
             if name not in allowed_pre_run_files

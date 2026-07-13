@@ -1,2 +1,5 @@
 # Dependencies imported directly by Ovi but omitted from the upstream file.
 einops==0.8.2
+
+# SpargeAttn is intentionally not resolved from an unpinned package index.
+# Install its fixed official Git commit with scripts/install_sparge_attn.sh.

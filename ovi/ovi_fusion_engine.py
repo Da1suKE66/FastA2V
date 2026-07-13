@@ -70,8 +70,20 @@ class OviFusionEngine:
                 f"Unsupported attention_method={self.attention_method!r}; "
                 "expected one of dense, sparge, radial, svg."
             )
+        video_attention_backends = {}
+        if self.attention_method == "sparge":
+            # Load the official CUDA extension before allocating/loading the
+            # Ovi model so a missing or incompatible dependency fails cheaply.
+            from ovi.modules.sparge_attention_backend import (
+                build_sparge_video_backend,
+            )
+
+            video_attention_backends["sparge"] = build_sparge_video_backend(
+                config
+            )
         self.video_self_attention_dispatcher = VideoSelfAttentionDispatcher(
-            self.attention_method
+            self.attention_method,
+            backends=video_attention_backends,
         )
         self.use_cfg_cache = bool(config.get("use_cfg_cache", False))
         self.use_block_cache = bool(config.get("use_block_cache", False))
