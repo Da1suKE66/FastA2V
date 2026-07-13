@@ -24,6 +24,11 @@
 >
 > The optional official SpargeAttn adapter has a separate pinned build step and
 > fail-fast receipt check. See [`docs/SPARGEATTN.md`](docs/SPARGEATTN.md).
+>
+> The Radial Attention scaffold pins the official MIT Han Lab source, keeps its
+> checkout pristine, handles Ovi's 28-token non-block tail without padding, and
+> fails closed until its fixed FlashInfer candidate passes a guarded smoke run.
+> See [`docs/RADIAL_ATTENTION.md`](docs/RADIAL_ATTENTION.md).
 
 <div align="center">
 <h1> Ovi: Twin Backbone Cross-Modal Fusion for Audio-Video Generation </h1>

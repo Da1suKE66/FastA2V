@@ -137,6 +137,92 @@ def main(output_path=None, attention_method="dense"):
                 f"official SpargeAttn dependency check failed: {exc!r}"
             )
 
+    if attention_method == "radial":
+        try:
+            from ovi.gpu_process_monitor import validate_pre_run_gpu_report
+            from ovi.modules.radial_attention_backend import (
+                load_flashinfer_api,
+                load_official_radial_mask_module,
+                verify_radial_install_receipt,
+            )
+            from ovi.radial_evidence import (
+                RADIAL_COMMIT,
+                RADIAL_MASK_API,
+            )
+            from scripts.radial_flashinfer_microtest import run_microtest
+
+            run_dir = os.environ.get("FASTA2V_RUN_DIR")
+            pre_run_path = Path(run_dir or "") / "pre_run_gpu.json"
+            if not run_dir or not pre_run_path.is_file():
+                raise RuntimeError(
+                    "Radial preflight requires runner-created pre_run_gpu.json"
+                )
+            pre_run_gpu = json.loads(pre_run_path.read_text(encoding="utf-8"))
+            pre_run_errors = validate_pre_run_gpu_report(pre_run_gpu)
+            if pre_run_errors:
+                raise RuntimeError(
+                    "invalid Radial pre-run GPU evidence: "
+                    + "; ".join(pre_run_errors)
+                )
+
+            receipt_path, receipt = verify_radial_install_receipt()
+            cached_flashinfer_manifest = Path(
+                receipt["flashinfer_manifest"]["path"]
+            )
+            copied_flashinfer_manifest = (
+                Path(run_dir) / "radial-flashinfer-manifest.json"
+            )
+            if (
+                not copied_flashinfer_manifest.is_file()
+                or copied_flashinfer_manifest.read_bytes()
+                != cached_flashinfer_manifest.read_bytes()
+            ):
+                raise RuntimeError(
+                    "runner-copied FlashInfer manifest differs from audited "
+                    "cache manifest"
+                )
+            flashinfer = load_flashinfer_api(
+                receipt["installed_flashinfer_package_root"]
+            )
+            source_module = load_official_radial_mask_module(
+                receipt["derived_module"]["path"]
+            )
+            report["radialattn"] = {
+                "pinned_commit": RADIAL_COMMIT,
+                "mask_api": RADIAL_MASK_API,
+                "install_receipt": str(receipt_path),
+                "install_receipt_contents": receipt,
+                "source_files_verified": True,
+                "flashinfer_files_verified": True,
+                "flashinfer_manifest_verified": True,
+                "cpu_mask_audits_verified": True,
+                "flashinfer_version": package_version("flashinfer-python"),
+                "flashinfer_apis": {
+                    name: callable(getattr(flashinfer, name, None))
+                    for name in (
+                        "BlockSparseAttentionWrapper",
+                        "single_prefill_with_kv_cache",
+                        "merge_state",
+                    )
+                },
+                "derived_mask_api_callable": callable(
+                    getattr(source_module, RADIAL_MASK_API, None)
+                ),
+                "install_cuda_kernel_launched": False,
+                "preflight_cuda_microtest_required": True,
+            }
+            microtest = run_microtest(device_index=0)
+            if microtest.get("device_uuid") != pre_run_gpu.get("device_uuid"):
+                raise RuntimeError(
+                    "Radial FlashInfer microtest GPU UUID differs from pre-run "
+                    "idle evidence"
+                )
+            report["radialattn_microtest"] = microtest
+        except Exception as exc:
+            report["errors"].append(
+                f"official Radial Attention dependency check failed: {exc!r}"
+            )
+
     try:
         importlib.import_module("inference")
         importlib.import_module("ovi.ovi_fusion_engine")

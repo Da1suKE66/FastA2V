@@ -1,0 +1,45 @@
+diff --git a/radial_attn/attn_mask.py b/radial_attn/attn_mask.py
+index 2f0caa8..42d4d62 100644
+--- a/radial_attn/attn_mask.py
++++ b/radial_attn/attn_mask.py
+@@ -0,0 +1,2 @@
++import importlib
++
+@@ -3,2 +4,0 @@ import flashinfer
+-import matplotlib.pyplot as plt
+-from sparse_sageattn import sparse_sageattn
+@@ -6,2 +6,19 @@ from einops import rearrange, repeat
+-from sageattention import sageattn
+-from spas_sage_attn import block_sparse_sage2_attn_cuda
++
++
++def _load_sage_backends():
++    """Import optional SageAttention kernels only when that backend is used."""
++
++    sageattn = getattr(importlib.import_module("sageattention"), "sageattn")
++    try:
++        block_sparse = getattr(
++            importlib.import_module("spas_sage_attn"),
++            "block_sparse_sage2_attn_cuda",
++        )
++        print("Using spas_sage_attn as block_sparse_sage2_attn_cuda")
++    except ImportError:
++        print("Using sparse_sageattn as block_sparse_sage2_attn_cuda")
++        block_sparse = getattr(
++            importlib.import_module("sparse_sageattn"),
++            "sparse_sageattn",
++        )
++    return sageattn, block_sparse
+@@ -16,8 +32,0 @@ def get_cuda_arch_versions():
+-# try to import block_sparse_sage2_attn_cuda from spas_sage_attn, if it fails, use the one from sparse_sageattn
+-try:
+-    from spas_sage_attn import block_sparse_sage2_attn_cuda
+-    print("Using spas_sage_attn as block_sparse_sage2_attn_cuda")
+-except ImportError:
+-    print("Using sparse_sageattn as block_sparse_sage2_attn_cuda")
+-    from sparse_sageattn import sparse_sageattn as block_sparse_sage2_attn_cuda
+-
+@@ -192,0 +202 @@ def SpargeSageAttnBackend(query, key, value, mask_map=None, video_mask=None, pre
++    sageattn, block_sparse_sage2_attn_cuda = _load_sage_backends()
+@@ -368,0 +379 @@ if __name__ == "__main__":
++    plt = importlib.import_module("matplotlib.pyplot")

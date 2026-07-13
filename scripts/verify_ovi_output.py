@@ -23,6 +23,23 @@ from ovi.sparge_evidence import (
     sparge_microtest_evidence_errors,
     sparge_receipt_evidence_errors,
 )
+from ovi.radial_evidence import (
+    FLASHINFER_VERSION,
+    RADIAL_BLOCK_SIZE,
+    RADIAL_COMMIT,
+    RADIAL_EMPTY_ROWS,
+    RADIAL_GRID,
+    RADIAL_MASK_API,
+    RADIAL_MODEL_TYPE,
+    RADIAL_PREFIX_SEQUENCE,
+    RADIAL_PROFILE_AUDITS,
+    RADIAL_REPOSITORY,
+    RADIAL_SEQUENCE,
+    RADIAL_TAIL_SEQUENCE,
+    flashinfer_manifest_evidence_errors,
+    radial_microtest_evidence_errors,
+    radial_receipt_evidence_errors,
+)
 
 
 SPARGE_PROVENANCE = {
@@ -356,6 +373,115 @@ def validate_sparge_dispatcher(
                 )
 
 
+def validate_radial_dispatcher(
+    dispatcher,
+    errors,
+    *,
+    expected_receipt=None,
+    expected_settings=None,
+    context="metrics",
+):
+    """Require real Radial calls, exact tail handling, and audited mask data."""
+
+    details = dispatcher.get("backend_details")
+    if not isinstance(details, dict):
+        errors.append(f"{context}: Radial dispatcher is missing backend_details")
+        return
+    expected_provenance = {
+        "backend": "official_radial_attention_flashinfer",
+        "repository": RADIAL_REPOSITORY,
+        "pinned_commit": RADIAL_COMMIT,
+        "mask_api": RADIAL_MASK_API,
+        "model_type": RADIAL_MODEL_TYPE,
+        "block_size": RADIAL_BLOCK_SIZE,
+        "sequence": RADIAL_SEQUENCE,
+        "prefix_sequence": RADIAL_PREFIX_SEQUENCE,
+        "tail_sequence": RADIAL_TAIL_SEQUENCE,
+        "tail_strategy": "dense_lse_merge_no_padding",
+        "empty_row_policy": "dense_row",
+        "empty_rows": list(RADIAL_EMPTY_ROWS),
+        "fallback_allowed": False,
+    }
+    for field, expected in expected_provenance.items():
+        if details.get(field) != expected:
+            errors.append(
+                f"{context}: Radial backend_details {field}="
+                f"{details.get(field)!r} != {expected!r}"
+            )
+    calls = dispatcher.get("calls_total")
+    if details.get("calls") != calls:
+        errors.append(
+            f"{context}: Radial backend calls={details.get('calls')} != "
+            f"dispatcher calls_total={calls}"
+        )
+    expected_calls_by_method = {
+        "dense": 0,
+        "sparge": 0,
+        "radial": calls,
+        "svg": 0,
+    }
+    if dispatcher.get("calls_by_method") != expected_calls_by_method:
+        errors.append(
+            f"{context}: Radial calls_by_method="
+            f"{dispatcher.get('calls_by_method')!r} != "
+            f"{expected_calls_by_method!r}"
+        )
+    if details.get("last_shape") != [1, 15004, 24, 128]:
+        errors.append(f"{context}: Radial last_shape is not fixed Ovi NHD")
+    if details.get("last_grid") != list(RADIAL_GRID):
+        errors.append(f"{context}: Radial last_grid is not [31, 22, 22]")
+    if details.get("last_dtype") != "torch.bfloat16":
+        errors.append(f"{context}: Radial last_dtype is not torch.bfloat16")
+    if details.get("last_device") != "cuda:0":
+        errors.append(f"{context}: Radial last_device is not cuda:0")
+    if details.get("plan_cache_entries") != 1:
+        errors.append(f"{context}: Radial must use exactly one keyed plan")
+    misses = as_int(details.get("plan_cache_misses"))
+    hits = as_int(details.get("plan_cache_hits"))
+    if misses not in (0, 1) or hits is None or hits < 0:
+        errors.append(f"{context}: Radial plan-cache counters are invalid")
+    elif isinstance(calls, int) and hits + misses != calls:
+        errors.append(
+            f"{context}: Radial plan cache hits+misses != backend calls"
+        )
+
+    profile = details.get("profile")
+    expected_audit = RADIAL_PROFILE_AUDITS.get(profile)
+    observed_audit = details.get("last_mask_audit")
+    if expected_audit is None:
+        errors.append(f"{context}: unknown Radial profile {profile!r}")
+    elif observed_audit != expected_audit:
+        errors.append(
+            f"{context}: Radial mask audit differs from fixed {profile} audit"
+        )
+
+    receipt_summary = details.get("install_receipt")
+    if not isinstance(receipt_summary, dict):
+        errors.append(f"{context}: Radial backend receipt summary is missing")
+    elif expected_receipt is not None:
+        expected_summary = {
+            "path": str(Path(expected_receipt["_copied_path"]).resolve()),
+            "commit": expected_receipt.get("commit"),
+            "derived_module_sha256": expected_receipt.get(
+                "derived_module", {}
+            ).get("sha256"),
+            "flashinfer_version": expected_receipt.get("flashinfer_version"),
+        }
+        # The backend reads the cache receipt rather than the copied evidence;
+        # bind immutable contents but allow its original cache path.
+        expected_summary["path"] = expected_receipt.get("_original_path")
+        if receipt_summary != expected_summary:
+            errors.append(
+                f"{context}: Radial backend receipt summary differs from run evidence"
+            )
+
+    if expected_settings is not None:
+        for field, expected in expected_settings.items():
+            if details.get(field) != expected:
+                errors.append(
+                    f"{context}: Radial setting {field}="
+                    f"{details.get(field)!r} != environment {expected!r}"
+                )
 def verify(path, require_metrics=True, expected_video_frames=121):
     info = probe(path)
     artifact_sha256 = sha256(path)
@@ -633,6 +759,8 @@ def verify(path, require_metrics=True, expected_video_frames=121):
                 )
             if configured_method == "sparge":
                 validate_sparge_dispatcher(dispatcher, errors)
+            elif configured_method == "radial":
+                validate_radial_dispatcher(dispatcher, errors)
         elif dispatcher is not None:
             errors.append("video_self_attention_dispatcher must be a JSON object")
 
@@ -684,6 +812,16 @@ def verify_run_protocol(run_dir, reports):
                 "spargeattn-install.json",
                 "spargeattn-build.log",
                 "spargeattn-install-pre_run_gpu.json",
+            )
+        )
+    elif attention_method == "radial":
+        required_files.extend(
+            (
+                "radialattn-install.json",
+                "radial-flashinfer-manifest.json",
+                "radial-attention-source.py",
+                "radial-attention-derived.py",
+                "radial-attention-optional-imports.patch",
             )
         )
     for filename in required_files:
@@ -946,6 +1084,138 @@ def verify_run_protocol(run_dir, reports):
                     context=f"{record_type}[{index}]",
                 )
 
+    elif attention_method == "radial":
+        receipt_path = run_dir / "radialattn-install.json"
+        try:
+            copied_receipt = json.loads(receipt_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            copied_receipt = None
+            errors.append(f"invalid copied Radial receipt: {exc}")
+        for error in radial_receipt_evidence_errors(copied_receipt):
+            errors.append(f"copied Radial receipt: {error}")
+
+        copied_artifacts = {
+            "source_module": run_dir / "radial-attention-source.py",
+            "derived_module": run_dir / "radial-attention-derived.py",
+            "optional_imports_patch": (
+                run_dir / "radial-attention-optional-imports.patch"
+            ),
+        }
+        if isinstance(copied_receipt, dict):
+            for field, path in copied_artifacts.items():
+                metadata = copied_receipt.get(field)
+                if not isinstance(metadata, dict):
+                    errors.append(f"copied Radial receipt lacks {field}")
+                elif path.is_file() and (
+                    path.stat().st_size != metadata.get("bytes")
+                    or sha256(path) != metadata.get("sha256")
+                ):
+                    errors.append(
+                        f"copied Radial {field} differs from install receipt"
+                    )
+
+        flashinfer_manifest_path = (
+            run_dir / "radial-flashinfer-manifest.json"
+        )
+        try:
+            copied_flashinfer_manifest = json.loads(
+                flashinfer_manifest_path.read_text()
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            copied_flashinfer_manifest = None
+            errors.append(f"invalid copied FlashInfer manifest: {exc}")
+        if isinstance(copied_receipt, dict):
+            manifest_fingerprint = copied_receipt.get("flashinfer_manifest")
+            if not isinstance(manifest_fingerprint, dict):
+                errors.append("copied Radial receipt lacks flashinfer_manifest")
+            elif flashinfer_manifest_path.is_file() and (
+                flashinfer_manifest_path.stat().st_size
+                != manifest_fingerprint.get("bytes")
+                or sha256(flashinfer_manifest_path)
+                != manifest_fingerprint.get("sha256")
+            ):
+                errors.append(
+                    "copied FlashInfer manifest differs from install receipt"
+                )
+        for error in flashinfer_manifest_evidence_errors(
+            copied_flashinfer_manifest, copied_receipt
+        ):
+            errors.append(f"copied FlashInfer manifest: {error}")
+
+        if environment.get("flashinfer_python") != FLASHINFER_VERSION:
+            errors.append(
+                "environment FlashInfer version differs from fixed candidate"
+            )
+        preflight_radial = preflight.get("radialattn")
+        if not isinstance(preflight_radial, dict):
+            errors.append("Radial run preflight is missing radialattn evidence")
+        else:
+            expected_preflight = {
+                "pinned_commit": RADIAL_COMMIT,
+                "mask_api": RADIAL_MASK_API,
+                "source_files_verified": True,
+                "flashinfer_files_verified": True,
+                "flashinfer_manifest_verified": True,
+                "cpu_mask_audits_verified": True,
+                "flashinfer_version": FLASHINFER_VERSION,
+                "flashinfer_apis": {
+                    "BlockSparseAttentionWrapper": True,
+                    "single_prefill_with_kv_cache": True,
+                    "merge_state": True,
+                },
+                "derived_mask_api_callable": True,
+                "install_cuda_kernel_launched": False,
+                "preflight_cuda_microtest_required": True,
+            }
+            for field, expected in expected_preflight.items():
+                if preflight_radial.get(field) != expected:
+                    errors.append(
+                        f"preflight Radial {field}="
+                        f"{preflight_radial.get(field)!r} != {expected!r}"
+                    )
+            if preflight_radial.get("install_receipt_contents") != copied_receipt:
+                errors.append("preflight Radial receipt differs from copied receipt")
+        expected_gpu_uuid = (
+            expected_gpu_identity[1]
+            if expected_gpu_identity is not None
+            else None
+        )
+        for error in radial_microtest_evidence_errors(
+            preflight.get("radialattn_microtest"),
+            expected_gpu_uuid=expected_gpu_uuid,
+        ):
+            errors.append(f"Radial preflight microtest: {error}")
+
+        expected_settings = {
+            "profile": environment.get("radial_profile"),
+            "decay_factor": environment.get("radial_decay_factor"),
+            "model_type": environment.get("radial_model_type"),
+            "block_size": environment.get("radial_block_size"),
+        }
+        receipt_for_dispatcher = dict(copied_receipt or {})
+        receipt_for_dispatcher["_original_path"] = (
+            "/cache/liluchen/FastA2V/radialattn-install.json"
+        )
+        receipt_for_dispatcher["_copied_path"] = str(receipt_path)
+        for record_type, records in (
+            ("measurement", timings),
+            ("warmup", warmups),
+        ):
+            for index, item in enumerate(records):
+                dispatcher = item.get("video_self_attention_dispatcher")
+                if not isinstance(dispatcher, dict):
+                    errors.append(
+                        f"{record_type}[{index}] is missing video dispatcher evidence"
+                    )
+                    continue
+                validate_radial_dispatcher(
+                    dispatcher,
+                    errors,
+                    expected_receipt=receipt_for_dispatcher,
+                    expected_settings=expected_settings,
+                    context=f"{record_type}[{index}]",
+                )
+
     evidence_hashes = environment.get("evidence_file_sha256", {})
     if not isinstance(evidence_hashes, dict):
         errors.append("environment evidence_file_sha256 must be a JSON object")
@@ -962,6 +1232,16 @@ def verify_run_protocol(run_dir, reports):
                 "spargeattn-install.json",
                 "spargeattn-build.log",
                 "spargeattn-install-pre_run_gpu.json",
+            }
+        )
+    elif attention_method == "radial":
+        required_hashed_evidence.update(
+            {
+                "radialattn-install.json",
+                "radial-flashinfer-manifest.json",
+                "radial-attention-source.py",
+                "radial-attention-derived.py",
+                "radial-attention-optional-imports.patch",
             }
         )
     missing_hashes = sorted(required_hashed_evidence - set(evidence_hashes))

@@ -92,6 +92,16 @@ def _collect_environment(config, config_file, engine_load_seconds, text_prompts)
                 "spargeattn-install-pre_run_gpu.json",
             )
         )
+    if config.get("attention_method", "dense") == "radial":
+        evidence_filenames.extend(
+            (
+                "radialattn-install.json",
+                "radial-flashinfer-manifest.json",
+                "radial-attention-source.py",
+                "radial-attention-derived.py",
+                "radial-attention-optional-imports.patch",
+            )
+        )
     for filename in evidence_filenames:
         path = os.path.join(output_dir, filename)
         evidence_files[filename] = _sha256(path) if os.path.isfile(path) else None
@@ -109,6 +119,7 @@ def _collect_environment(config, config_file, engine_load_seconds, text_prompts)
         "cudnn": torch.backends.cudnn.version(),
         "flash_attn": _package_version("flash-attn"),
         "spas_sage_attn": _package_version("spas_sage_attn"),
+        "flashinfer_python": _package_version("flashinfer-python"),
         "transformers": _package_version("transformers"),
         "gpu": torch.cuda.get_device_name(0),
         "gpu_count": torch.cuda.device_count(),
@@ -144,6 +155,20 @@ def _collect_environment(config, config_file, engine_load_seconds, text_prompts)
         "sparge_topk": float(config.get("sparge_topk", 0.5)),
         "sparge_pvthreshd": float(config.get("sparge_pvthreshd", 50)),
         "sparge_smooth_k": bool(config.get("sparge_smooth_k", True)),
+        "radial_profile": str(
+            config.get("radial_profile", "conservative")
+        ).lower(),
+        "radial_decay_factor": float(
+            config.get(
+                "radial_decay_factor",
+                1.0
+                if str(config.get("radial_profile", "conservative")).lower()
+                == "aggressive"
+                else 4.0,
+            )
+        ),
+        "radial_block_size": int(config.get("radial_block_size", 128)),
+        "radial_model_type": str(config.get("radial_model_type", "wan")),
         "sample_steps": int(config.get("sample_steps", 50)),
         "slg_layer": int(config.get("slg_layer", 11)),
         "prompts_sha256": prompt_sequence_sha256(text_prompts),
@@ -234,6 +259,16 @@ def _prepare_output_dir(config):
                     "spargeattn-install.json",
                     "spargeattn-build.log",
                     "spargeattn-install-pre_run_gpu.json",
+                }
+            )
+        if config.get("attention_method", "dense") == "radial":
+            allowed_pre_run_files.update(
+                {
+                    "radialattn-install.json",
+                    "radial-flashinfer-manifest.json",
+                    "radial-attention-source.py",
+                    "radial-attention-derived.py",
+                    "radial-attention-optional-imports.patch",
                 }
             )
         unexpected = sorted(

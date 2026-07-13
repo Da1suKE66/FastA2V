@@ -146,6 +146,10 @@ class RunnerOrderingTests(unittest.TestCase):
         "run_ovi_sparge_baseline.sh",
         "run_ovi_sparge_topk75_smoke.sh",
         "run_ovi_sparge_topk75_baseline.sh",
+        "run_ovi_radial_conservative_smoke.sh",
+        "run_ovi_radial_conservative_baseline.sh",
+        "run_ovi_radial_aggressive_smoke.sh",
+        "run_ovi_radial_aggressive_baseline.sh",
     )
 
     def test_idle_check_precedes_all_cuda_preflight_and_inference(self):

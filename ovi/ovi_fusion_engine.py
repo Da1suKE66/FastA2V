@@ -81,6 +81,16 @@ class OviFusionEngine:
             video_attention_backends["sparge"] = build_sparge_video_backend(
                 config
             )
+        elif self.attention_method == "radial":
+            # Bind the pinned upstream mask source and fixed FlashInfer
+            # candidate before allocating/loading the Ovi checkpoint.
+            from ovi.modules.radial_attention_backend import (
+                build_radial_video_backend,
+            )
+
+            video_attention_backends["radial"] = build_radial_video_backend(
+                config
+            )
         self.video_self_attention_dispatcher = VideoSelfAttentionDispatcher(
             self.attention_method,
             backends=video_attention_backends,

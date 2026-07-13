@@ -79,3 +79,12 @@ The first sparse adapter pins official SpargeAttn commit
 [`docs/SPARGEATTN.md`](SPARGEATTN.md) for installation, input constraints, and
 the exact Ovi ownership boundary. This repository contains no copied or custom
 SpargeAttn CUDA/Triton source.
+
+The Radial adapter separately pins official `mit-han-lab/radial-attention`
+commit `72788d4f0a6d202f1ec5f1c98a6e4c8b2e34fdbc`. It calls the upstream
+`gen_log_mask_shrinked` function from an audited mask-only derived Python copy
+whose only patch makes unrelated optional imports lazy, then executes the mask
+through public FlashInfer APIs. Pure Radial runs keep CFG and block cache off.
+See [`docs/RADIAL_ATTENTION.md`](RADIAL_ATTENTION.md) for the 14,976-token
+sparse prefix, 28-token dense/LSE-merged tail, empty-row repair audit, and
+guarded runtime-validation boundary.
