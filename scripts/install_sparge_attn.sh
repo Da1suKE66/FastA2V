@@ -51,7 +51,11 @@ fi
 # makes setup.py reproducible without asking it to enumerate/initialize GPUs.
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
 export MAX_JOBS="${MAX_JOBS:-8}"
-"${FASTA2V_OVI_ENV}/bin/python" -m pip install --upgrade ninja packaging
+if ! "${FASTA2V_OVI_ENV}/bin/python" -c 'import ninja, packaging'; then
+  echo "Missing build prerequisites in the fixed Ovi environment." >&2
+  echo "Run bash scripts/setup_ovi_env.sh before installing SpargeAttn." >&2
+  exit 2
+fi
 "${FASTA2V_OVI_ENV}/bin/python" -m pip install \
   --no-build-isolation \
   --no-deps \
