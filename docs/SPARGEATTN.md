@@ -23,8 +23,10 @@ bash scripts/setup_ovi_env.sh
 bash scripts/install_sparge_attn.sh
 ```
 
-The installer keeps the checkout, build cache, environment, and installation
-receipt below `/cache/liluchen/FastA2V`. It sets
+The installer clones the official source through `ssh.github.com:443` with
+`/home/ma-user/.ssh/id_ed25519_github`; the canonical HTTPS repository identity
+is still recorded in the receipt. It keeps the checkout, build cache,
+environment, and installation receipt below `/cache/liluchen/FastA2V`. It sets
 `TORCH_CUDA_ARCH_LIST=8.0` by default for the A100 and invokes the upstream
 `setup.py` through `pip`; FastA2V does not copy, modify, or implement any CUDA
 or Triton kernel. A successful build writes
@@ -32,7 +34,12 @@ or Triton kernel. A successful build writes
 start if that receipt does not identify the pinned repository, commit, and API,
 or if the installed `core.py`, `_qattn*.so`, and `_fused*.so` fingerprints have
 changed. The formal run verifier cross-checks the copied receipt against
-preflight evidence and every warm-up/measurement backend record.
+preflight evidence and every warm-up/measurement backend record. Installation
+also launches the pinned public API at `topk=0.5` and `topk=1.0` on a real BF16
+NHD `[1,132,24,128]` tensor. The non-block-aligned sequence length exercises a
+tail path like Ovi's 15004 tokens; the test checks finite outputs and requires
+a broad full-mask cosine agreement with SDPA. Preflight repeats that microtest
+before loading the Ovi model.
 
 The upstream package requires CUDA 12 or newer and supports head dimensions 64
 and 128. The first GPU validation must therefore check the actual compiler,

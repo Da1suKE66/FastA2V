@@ -40,10 +40,11 @@ class FakeDevice:
 
 
 class FakeTensor:
-    def __init__(self, label, shape, *, device=None):
+    def __init__(self, label, shape, *, device=None, dtype="torch.bfloat16"):
         self.label = label
         self.shape = tuple(shape)
         self.device = device or FakeDevice()
+        self.dtype = dtype
 
     def flatten(self, start_dim):
         if start_dim != 2 or len(self.shape) != 4:
@@ -52,6 +53,7 @@ class FakeTensor:
             f"flatten({self.label})",
             (self.shape[0], self.shape[1], self.shape[2] * self.shape[3]),
             device=self.device,
+            dtype=self.dtype,
         )
 
 
@@ -307,6 +309,28 @@ class SpargeAttentionBackendTests(unittest.TestCase):
             )
         self.assertEqual(kernel.calls, [])
 
+    def test_non_bf16_qkv_fails_before_official_kernel(self):
+        backend, kernel, _, _ = self.make_backend()
+        attention = RecordingOviAttention()
+        original_qkv_fn = attention.qkv_fn
+
+        def float16_qkv(x):
+            q, k, v = original_qkv_fn(x)
+            for tensor in (q, k, v):
+                tensor.dtype = "torch.float16"
+            return q, k, v
+
+        attention.qkv_fn = float16_qkv
+        with self.assertRaisesRegex(SpargeAttentionInputError, "torch.bfloat16"):
+            backend(
+                attention,
+                FakeTensor("video_hidden", (1, 15004, 3072)),
+                FakeSequenceLengths([15004]),
+                object(),
+                object(),
+            )
+        self.assertEqual(kernel.calls, [])
+
     def test_pinned_upstream_rejects_smooth_k_false_before_inference(self):
         with self.assertRaisesRegex(ValueError, "sparge_smooth_k must be true"):
             SpargeVideoSelfAttentionBackend(
@@ -423,8 +447,18 @@ class SpargeAttentionBackendTests(unittest.TestCase):
                 }
             receipt = {
                 "repository": "https://github.com/thu-ml/SpargeAttn.git",
+                "clone_url": "ssh://git@ssh.github.com:443/thu-ml/SpargeAttn.git",
                 "commit": SPARGEATTN_COMMIT,
                 "api": SPARGEATTN_API,
+                "microtest": {
+                    "status": "ok",
+                    "shape": [1, 132, 24, 128],
+                    "compute_capability": [8, 0],
+                    "dtype": "torch.bfloat16",
+                    "tensor_layout": "NHD",
+                    "tested_topk": [0.5, 1.0],
+                    "cosine_vs_sdpa": 0.99,
+                },
                 "installed_package_root": str(root),
                 "installed_files": installed_files,
             }
@@ -439,6 +473,25 @@ class SpargeAttentionBackendTests(unittest.TestCase):
             (root / "core.py").write_text("changed\n", encoding="utf-8")
             with self.assertRaisesRegex(
                 SpargeAttentionDependencyError, "differ from the pinned"
+            ):
+                verify_sparge_install_receipt(receipt_path)
+
+    def test_install_receipt_requires_real_cuda_microtest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt_path = Path(directory) / "spargeattn-install.json"
+            receipt_path.write_text(
+                json.dumps(
+                    {
+                        "repository": "https://github.com/thu-ml/SpargeAttn.git",
+                        "clone_url": "ssh://git@ssh.github.com:443/thu-ml/SpargeAttn.git",
+                        "commit": SPARGEATTN_COMMIT,
+                        "api": SPARGEATTN_API,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                SpargeAttentionDependencyError, "real CUDA microtest"
             ):
                 verify_sparge_install_receipt(receipt_path)
 

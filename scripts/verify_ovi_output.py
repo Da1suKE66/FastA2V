@@ -15,6 +15,7 @@ import numpy as np
 SPARGE_PROVENANCE = {
     "backend": "official_spargeattn",
     "repository": "https://github.com/thu-ml/SpargeAttn.git",
+    "clone_url": "ssh://git@ssh.github.com:443/thu-ml/SpargeAttn.git",
     "pinned_commit": "ae5b629ebb41e41f86b3ea2ab5a3283f13ac151a",
     "api": "spas_sage2_attn_meansim_topk_cuda",
     "tensor_layout": "NHD",
@@ -531,6 +532,27 @@ def verify_run_protocol(run_dir, reports):
             errors.append(f"preflight contains errors: {preflight['errors']}")
 
     if attention_method == "sparge":
+        expected_protocol = {
+            "sparge_topk": 0.5,
+            "sparge_pvthreshd": 50.0,
+            "sparge_smooth_k": True,
+            "use_cfg_cache": False,
+            "use_block_cache": False,
+            "sp_size": 1,
+        }
+        if environment.get("run_kind") not in {
+            "sparge_baseline",
+            "sparge_diagnostic_smoke",
+        }:
+            errors.append(
+                "Sparge run_kind is not an audited pure-Sparge protocol"
+            )
+        for field, expected in expected_protocol.items():
+            if environment.get(field) != expected:
+                errors.append(
+                    f"Sparge protocol {field}={environment.get(field)!r} "
+                    f"!= fixed value {expected!r}"
+                )
         receipt_path = run_dir / "spargeattn-install.json"
         try:
             copied_receipt = json.loads(receipt_path.read_text())
@@ -552,6 +574,20 @@ def verify_run_protocol(run_dir, reports):
                 errors.append("preflight did not verify installed SpargeAttn files")
             if preflight_sparge.get("install_receipt_contents") != copied_receipt:
                 errors.append("preflight SpargeAttn receipt differs from copied receipt")
+        receipt_microtest = (
+            copied_receipt.get("microtest")
+            if isinstance(copied_receipt, dict)
+            else None
+        )
+        if not isinstance(receipt_microtest, dict) or receipt_microtest.get(
+            "status"
+        ) != "ok":
+            errors.append("Sparge install receipt lacks a successful CUDA microtest")
+        preflight_microtest = preflight.get("spargeattn_microtest")
+        if not isinstance(preflight_microtest, dict) or preflight_microtest.get(
+            "status"
+        ) != "ok":
+            errors.append("Sparge run preflight lacks a successful CUDA microtest")
 
         expected_settings = {
             "topk": environment.get("sparge_topk"),

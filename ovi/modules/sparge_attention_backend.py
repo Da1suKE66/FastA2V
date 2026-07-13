@@ -19,8 +19,11 @@ from pathlib import Path
 
 
 SPARGEATTN_REPOSITORY = "https://github.com/thu-ml/SpargeAttn.git"
+SPARGEATTN_CLONE_URL = "ssh://git@ssh.github.com:443/thu-ml/SpargeAttn.git"
 SPARGEATTN_COMMIT = "ae5b629ebb41e41f86b3ea2ab5a3283f13ac151a"
 SPARGEATTN_API = "spas_sage2_attn_meansim_topk_cuda"
+SPARGEATTN_MICROTEST_SHAPE = (1, 132, 24, 128)
+SPARGEATTN_MICROTEST_MIN_COSINE = 0.90
 
 
 class SpargeAttentionDependencyError(RuntimeError):
@@ -129,6 +132,7 @@ def verify_sparge_install_receipt(receipt_path=None):
 
     expected = {
         "repository": SPARGEATTN_REPOSITORY,
+        "clone_url": SPARGEATTN_CLONE_URL,
         "commit": SPARGEATTN_COMMIT,
         "api": SPARGEATTN_API,
     }
@@ -142,6 +146,43 @@ def verify_sparge_install_receipt(receipt_path=None):
             "SpargeAttn install receipt does not match the pinned official "
             f"dependency: {mismatches}. Re-run "
             "'bash scripts/install_sparge_attn.sh'."
+        )
+    microtest = receipt.get("microtest")
+    if not isinstance(microtest, dict) or microtest.get("status") != "ok":
+        raise SpargeAttentionDependencyError(
+            "SpargeAttn receipt is missing a successful real CUDA microtest"
+        )
+    if microtest.get("shape") != list(SPARGEATTN_MICROTEST_SHAPE):
+        raise SpargeAttentionDependencyError(
+            "SpargeAttn receipt microtest shape does not match the audited NHD "
+            f"shape {list(SPARGEATTN_MICROTEST_SHAPE)}"
+        )
+    expected_microtest = {
+        "compute_capability": [8, 0],
+        "dtype": "torch.bfloat16",
+        "tensor_layout": "NHD",
+        "tested_topk": [0.5, 1.0],
+    }
+    microtest_mismatches = {
+        key: {"expected": value, "actual": microtest.get(key)}
+        for key, value in expected_microtest.items()
+        if microtest.get(key) != value
+    }
+    if microtest_mismatches:
+        raise SpargeAttentionDependencyError(
+            "SpargeAttn receipt CUDA microtest does not match the audited "
+            f"protocol: {microtest_mismatches}"
+        )
+    try:
+        cosine = float(microtest.get("cosine_vs_sdpa"))
+    except (TypeError, ValueError) as exc:
+        raise SpargeAttentionDependencyError(
+            "SpargeAttn receipt has an invalid CUDA microtest cosine"
+        ) from exc
+    if not SPARGEATTN_MICROTEST_MIN_COSINE <= cosine <= 1.0001:
+        raise SpargeAttentionDependencyError(
+            "SpargeAttn receipt CUDA microtest cosine is below the audited "
+            f"minimum: {cosine} < {SPARGEATTN_MICROTEST_MIN_COSINE}"
         )
     _verify_installed_file_fingerprints(receipt)
     return receipt_path, receipt
@@ -295,11 +336,14 @@ class SpargeVideoSelfAttentionBackend:
         self._validated_full_length_signatures = set()
         self._calls = 0
         self._last_nhd_shape = None
+        self._last_dtype = None
+        self._last_device = None
 
     def metrics(self):
         return {
             "backend": "official_spargeattn",
             "repository": SPARGEATTN_REPOSITORY,
+            "clone_url": SPARGEATTN_CLONE_URL,
             "pinned_commit": SPARGEATTN_COMMIT,
             "api": SPARGEATTN_API,
             "tensor_layout": "NHD",
@@ -310,6 +354,8 @@ class SpargeVideoSelfAttentionBackend:
             "install_receipt": dict(self.install_receipt),
             "calls": self._calls,
             "last_nhd_shape": self._last_nhd_shape,
+            "last_dtype": self._last_dtype,
+            "last_device": self._last_device,
         }
 
     def _validate_qkv(self, q, k, v, seq_lens):
@@ -352,6 +398,12 @@ class SpargeVideoSelfAttentionBackend:
             raise SpargeAttentionInputError(
                 "official SpargeAttn is a CUDA backend; q/k/v must be CUDA tensors"
             )
+        dtypes = {str(getattr(tensor, "dtype", None)) for tensor in (q, k, v)}
+        if dtypes != {"torch.bfloat16"}:
+            raise SpargeAttentionInputError(
+                "the fixed Ovi Sparge path requires q/k/v all torch.bfloat16; "
+                f"got {sorted(dtypes)}"
+            )
 
         # The public top-k API does not accept per-sample lengths or a padding
         # mask.  Validate once per shape/device signature rather than forcing a
@@ -367,6 +419,8 @@ class SpargeVideoSelfAttentionBackend:
             self._validated_full_length_signatures.add(signature)
 
         self._last_nhd_shape = list(shape)
+        self._last_dtype = next(iter(dtypes))
+        self._last_device = next(iter(devices))
         return shape
 
     def __call__(
@@ -418,6 +472,15 @@ class SpargeVideoSelfAttentionBackend:
         nhd_shape = self._validate_qkv(q, k, v, seq_lens)
         q = self._rope_apply(q, grid_sizes, freqs)
         k = self._rope_apply(k, grid_sizes, freqs)
+        if (
+            str(getattr(q, "dtype", None)) != "torch.bfloat16"
+            or str(getattr(k, "dtype", None)) != "torch.bfloat16"
+            or str(getattr(q, "device", None)) != self._last_device
+            or str(getattr(k, "device", None)) != self._last_device
+        ):
+            raise SpargeAttentionInputError(
+                "Ovi RoPE must preserve BF16 dtype and the q/k CUDA device"
+            )
 
         # return_sparsity=True calls .item() in the official implementation and
         # introduces a device synchronization.  Formal timed inference always
@@ -444,6 +507,13 @@ class SpargeVideoSelfAttentionBackend:
                 "official SpargeAttn output shape differs from its NHD input: "
                 f"output={_tensor_shape(attn_output, 'SpargeAttn output')} "
                 f"input={nhd_shape}"
+            )
+        if (
+            str(getattr(attn_output, "dtype", None)) != "torch.bfloat16"
+            or str(getattr(attn_output, "device", None)) != self._last_device
+        ):
+            raise RuntimeError(
+                "official SpargeAttn output changed BF16 dtype or CUDA device"
             )
 
         if use_sp:

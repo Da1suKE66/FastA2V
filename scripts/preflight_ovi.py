@@ -93,9 +93,12 @@ def main(output_path=None, attention_method="dense"):
                 load_official_sparge_kernel,
                 verify_sparge_install_receipt,
             )
+            from scripts.sparge_attn_microtest import run_microtest
 
             receipt_path, receipt = verify_sparge_install_receipt()
-            load_official_sparge_kernel(receipt["installed_package_root"])
+            kernel = load_official_sparge_kernel(
+                receipt["installed_package_root"]
+            )
             report["spargeattn"] = {
                 "package_version": package_version("spas_sage_attn"),
                 "pinned_commit": SPARGEATTN_COMMIT,
@@ -104,6 +107,10 @@ def main(output_path=None, attention_method="dense"):
                 "install_receipt_contents": receipt,
                 "installed_files_verified": True,
             }
+            report["spargeattn_microtest"] = run_microtest(
+                kernel=kernel,
+                device_index=0,
+            )
         except Exception as exc:
             report["errors"].append(
                 f"official SpargeAttn dependency check failed: {exc!r}"

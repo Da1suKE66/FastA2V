@@ -90,6 +90,7 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
         "driver_version": driver_version.splitlines()[0] if driver_version else None,
         "engine_load_seconds": engine_load_seconds,
         "model_name": config.get("model_name"),
+        "sp_size": int(config.get("sp_size", 1)),
         "attention_method": config.get("attention_method", "dense"),
         "sparge_topk": float(config.get("sparge_topk", 0.5)),
         "sparge_pvthreshd": float(config.get("sparge_pvthreshd", 50)),
