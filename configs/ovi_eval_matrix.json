@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "matrix_id": "ovi_720x720_5s_a100_bf16_v1",
+  "description": "Audited FastA2V Ovi performance and quality comparison matrix.",
+  "comparison_contract": {
+    "allow_latest_run_discovery": false,
+    "explicit_method_run_mapping_required": true,
+    "measurement_count": 3,
+    "require_artifact_hash_match": true,
+    "require_benchmark_valid": true,
+    "require_clean_git_commit": true,
+    "require_no_gpu_contention": true,
+    "same_across_methods": [
+      "git_commit",
+      "checkpoint_fingerprint_sha256",
+      "gpu_identity",
+      "prompt",
+      "seed",
+      "requested_shape",
+      "actual_shape",
+      "sample_steps"
+    ],
+    "quality_and_manual_fields_default": null
+  },
+  "fixed_protocol": {
+    "model_name": "720x720_5s",
+    "mode": "t2v",
+    "video_frame_height_width": [
+      720,
+      720
+    ],
+    "sample_steps": 50,
+    "solver_name": "unipc",
+    "shift": 5.0,
+    "sp_size": 1,
+    "audio_guidance_scale": 3.0,
+    "video_guidance_scale": 4.0,
+    "slg_layer": 11,
+    "fp8": false,
+    "qint8": false,
+    "cpu_offload": false,
+    "seed": 103,
+    "warmup_runs": 1,
+    "measurement_runs": 3,
+    "each_example_n_times": 1,
+    "prompt_count": 1,
+    "benchmark_eligible": true,
+    "debug_forward": false
+  },
+  "methods": [
+    {
+      "method_id": "dense",
+      "label": "Dense",
+      "required": true,
+      "implementation_status": "ready",
+      "expected_environment": {
+        "run_kind": "dense_baseline",
+        "attention_method": "dense",
+        "use_cfg_cache": false,
+        "use_block_cache": false
+      }
+    },
+    {
+      "method_id": "dense_cfg_cache",
+      "label": "Dense + CFG cache",
+      "required": true,
+      "implementation_status": "ready",
+      "expected_environment": {
+        "run_kind": "cfg_cache_benchmark",
+        "attention_method": "dense",
+        "use_cfg_cache": true,
+        "use_block_cache": false
+      }
+    },
+    {
+      "method_id": "sparge_topk50",
+      "label": "SpargeAttn topk=0.50",
+      "required": true,
+      "implementation_status": "ready",
+      "expected_environment": {
+        "run_kind": "sparge_baseline",
+        "attention_method": "sparge",
+        "sparge_topk": 0.5,
+        "sparge_pvthreshd": 50.0,
+        "sparge_smooth_k": true,
+        "use_cfg_cache": false,
+        "use_block_cache": false
+      }
+    },
+    {
+      "method_id": "sparge_topk75",
+      "label": "SpargeAttn topk=0.75",
+      "required": true,
+      "implementation_status": "ready",
+      "expected_environment": {
+        "run_kind": "sparge_topk75_baseline",
+        "attention_method": "sparge",
+        "sparge_topk": 0.75,
+        "sparge_pvthreshd": 50.0,
+        "sparge_smooth_k": true,
+        "use_cfg_cache": false,
+        "use_block_cache": false
+      }
+    },
+    {
+      "method_id": "radial_conservative",
+      "label": "Radial conservative",
+      "required": true,
+      "implementation_status": "pending",
+      "pending_reason": "Official Radial compatibility and its formal benchmark are not implemented or verified yet.",
+      "expected_environment": {
+        "run_kind": "radial_conservative_baseline",
+        "attention_method": "radial",
+        "radial_profile": "conservative",
+        "use_cfg_cache": false,
+        "use_block_cache": false
+      }
+    },
+    {
+      "method_id": "radial_aggressive",
+      "label": "Radial aggressive",
+      "required": true,
+      "implementation_status": "pending",
+      "pending_reason": "Official Radial compatibility and its formal benchmark are not implemented or verified yet.",
+      "expected_environment": {
+        "run_kind": "radial_aggressive_baseline",
+        "attention_method": "radial",
+        "radial_profile": "aggressive",
+        "use_cfg_cache": false,
+        "use_block_cache": false
+      }
+    },
+    {
+      "method_id": "best_sparse_cfg",
+      "label": "Best sparse + CFG cache",
+      "required": true,
+      "implementation_status": "pending",
+      "pending_reason": "The best sparse method cannot be selected until valid sparse performance and quality results exist.",
+      "selection_policy": "After sparse quality review, select the fastest accepted sparse profile and rerun it with only CFG cache additionally enabled.",
+      "expected_environment": {
+        "run_kind": "best_sparse_cfg_benchmark",
+        "use_cfg_cache": true,
+        "use_block_cache": false
+      }
+    },
+    {
+      "method_id": "block_cache",
+      "label": "Dense + block cache",
+      "required": false,
+      "implementation_status": "ready",
+      "expected_environment": {
+        "run_kind": "block_cache_benchmark",
+        "attention_method": "dense",
+        "use_cfg_cache": false,
+        "use_block_cache": true,
+        "block_cache_policy": "fixed"
+      }
+    }
+  ]
+}
