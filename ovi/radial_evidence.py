@@ -52,7 +52,7 @@ FLASHINFER_REQUIRED_APIS = (
     "merge_state",
 )
 FLASHINFER_MANIFEST_FILENAME = "radial-flashinfer-manifest.json"
-FLASHINFER_MANIFEST_SCHEMA = "fasta2v.flashinfer-install-manifest.v1"
+FLASHINFER_MANIFEST_SCHEMA = "fasta2v.flashinfer-install-manifest.v2"
 
 RADIAL_SEQUENCE = 15004
 RADIAL_PREFIX_SEQUENCE = 14976
@@ -66,6 +66,10 @@ RADIAL_EMPTY_ROWS = (22, 56, 90)
 RADIAL_EXPECTED_DEVICE = "NVIDIA A100-SXM4-80GB"
 RADIAL_EXPECTED_TORCH = "2.6.0+cu124"
 RADIAL_EXPECTED_TORCH_CUDA = "12.4"
+RADIAL_CUDA_HOME = "/usr/local/cuda-12.1"
+RADIAL_LDD_EXECUTABLE = "/usr/bin/ldd"
+RADIAL_FORBIDDEN_LOADER_PREFIXES = ("LD_",)
+RADIAL_FORBIDDEN_LOADER_VARIABLES = ("GLIBC_TUNABLES",)
 
 RADIAL_PROFILE_AUDITS = {
     "aggressive": {
@@ -126,6 +130,91 @@ def normalize_ldd_output(output):
     return re.sub(r"0x[0-9A-Fa-f]+", "0xADDR", str(output))
 
 
+def ldd_resolved_library_paths(output):
+    """Return unique absolute paths reported by one raw ``ldd`` invocation."""
+
+    paths = []
+    for line in str(output).splitlines():
+        match = re.search(
+            r"(?:=>\s+)?(/[^\s]+)\s+\(0x[0-9A-Fa-f]+\)", line
+        )
+        if match and match.group(1) not in paths:
+            paths.append(match.group(1))
+    return tuple(paths)
+
+
+def _canonical_loader_search_paths(search_paths):
+    try:
+        raw_paths = tuple(search_paths)
+    except TypeError as exc:
+        raise ValueError("ldd search paths must be an iterable") from exc
+    if not raw_paths:
+        raise ValueError("ldd search paths must be non-empty")
+    canonical = []
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, (str, Path)):
+            raise ValueError("ldd search path entries must be strings or Paths")
+        text = str(raw_path)
+        if not text:
+            raise ValueError("ldd search paths cannot contain an empty entry")
+        if ":" in text:
+            raise ValueError("ldd search paths cannot contain ':'")
+        path = Path(text)
+        if not path.is_absolute():
+            raise ValueError("ldd search paths must be absolute")
+        resolved = str(path.resolve())
+        if resolved != text:
+            raise ValueError("ldd search paths must be canonical absolute paths")
+        canonical.append(resolved)
+    if len(set(canonical)) != len(canonical):
+        raise ValueError("ldd search paths cannot contain duplicates")
+    return tuple(canonical)
+
+
+def radial_ldd_search_paths(
+    cache_root="/cache/liluchen/FastA2V",
+):
+    """Return the fixed library search order used for FlashInfer ldd audits."""
+
+    cache_root = Path(cache_root)
+    return (
+        str(
+            cache_root
+            / "envs"
+            / "ovi"
+            / "lib"
+            / "python3.11"
+            / "site-packages"
+            / "torch"
+            / "lib"
+        ),
+        str(Path(RADIAL_CUDA_HOME) / "lib64"),
+    )
+
+
+def deterministic_ldd_environment(search_paths):
+    """Build an ldd environment that cannot inherit loader settings."""
+
+    paths = _canonical_loader_search_paths(search_paths)
+    return {
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "LD_LIBRARY_PATH": ":".join(paths),
+    }
+
+
+def radial_runtime_loader_environment(search_paths):
+    """Return the exact loader contract required by Radial Python processes."""
+
+    paths = _canonical_loader_search_paths(search_paths)
+    return {
+        "LD_LIBRARY_PATH": ":".join(paths),
+        "forbidden_prefixes": list(RADIAL_FORBIDDEN_LOADER_PREFIXES),
+        "unset": list(RADIAL_FORBIDDEN_LOADER_VARIABLES),
+    }
+
+
 def expected_flashinfer_manifest(receipt):
     """Return the immutable FlashInfer provenance manifest bound by a receipt."""
 
@@ -139,6 +228,13 @@ def expected_flashinfer_manifest(receipt):
         "wheel_url": receipt.get("flashinfer_wheel_url"),
         "wheel": receipt.get("flashinfer_wheel"),
         "required_apis": receipt.get("flashinfer_required_apis"),
+        "cuda_home": receipt.get("cuda_home"),
+        "ldd_executable": receipt.get("ldd_executable"),
+        "ldd_search_paths": receipt.get("ldd_search_paths"),
+        "ldd_dependencies": receipt.get("ldd_dependencies"),
+        "runtime_loader_environment": receipt.get(
+            "runtime_loader_environment"
+        ),
         "package_root": receipt.get("installed_flashinfer_package_root"),
         "module": receipt.get("flashinfer_module"),
         "files": receipt.get("installed_flashinfer_files"),
@@ -187,6 +283,11 @@ def radial_receipt_evidence_errors(
         "flashinfer_wheel_index": FLASHINFER_WHEEL_INDEX,
         "flashinfer_wheel_url": FLASHINFER_WHEEL_URL,
         "flashinfer_required_apis": list(FLASHINFER_REQUIRED_APIS),
+        "cuda_home": RADIAL_CUDA_HOME,
+        "ldd_search_paths": list(radial_ldd_search_paths(cache_root)),
+        "runtime_loader_environment": radial_runtime_loader_environment(
+            radial_ldd_search_paths(cache_root)
+        ),
         "installed_flashinfer_package_root": str(
             cache_root
             / "envs"
@@ -233,6 +334,10 @@ def radial_receipt_evidence_errors(
             cache_root / "wheels" / FLASHINFER_WHEEL_FILENAME,
             FLASHINFER_WHEEL_SHA256,
         ),
+        "ldd_executable": (
+            Path(RADIAL_LDD_EXECUTABLE).resolve(),
+            None,
+        ),
     }
     for field, (expected_path, expected_digest) in fingerprints.items():
         metadata = receipt.get(field)
@@ -256,6 +361,7 @@ def radial_receipt_evidence_errors(
         errors.append("receipt flashinfer_module path differs from package root")
     installed_files = receipt.get("installed_flashinfer_files")
     native_files = []
+    native_dependency_paths = set()
     if not isinstance(installed_files, dict) or not installed_files:
         errors.append("receipt installed_flashinfer_files is missing")
     else:
@@ -280,6 +386,7 @@ def radial_receipt_evidence_errors(
                 ldd_output = metadata.get("ldd_output")
                 ldd_normalized_output = metadata.get("ldd_normalized_output")
                 ldd_sha256 = metadata.get("ldd_sha256")
+                ldd_dependency_paths = metadata.get("ldd_dependency_paths")
                 if not isinstance(ldd_output, str) or not ldd_output.strip():
                     errors.append(
                         f"receipt FlashInfer native ldd output is missing: {name}"
@@ -302,6 +409,16 @@ def radial_receipt_evidence_errors(
                     errors.append(
                         f"receipt FlashInfer native ldd has unresolved libraries: {name}"
                     )
+                parsed_dependency_paths = list(
+                    ldd_resolved_library_paths(ldd_output or "")
+                )
+                if ldd_dependency_paths != parsed_dependency_paths:
+                    errors.append(
+                        "receipt FlashInfer native dependency paths differ from "
+                        f"ldd output: {name}"
+                    )
+                else:
+                    native_dependency_paths.update(parsed_dependency_paths)
         installed_init = installed_files.get("__init__.py")
         if isinstance(installed_init, dict) and isinstance(flashinfer_module, dict):
             if (
@@ -314,6 +431,30 @@ def radial_receipt_evidence_errors(
                 )
     if not native_files:
         errors.append("receipt installed FlashInfer files lack a native .so")
+
+    ldd_dependencies = receipt.get("ldd_dependencies")
+    if not isinstance(ldd_dependencies, dict) or not ldd_dependencies:
+        errors.append("receipt ldd_dependencies is missing")
+    else:
+        if set(ldd_dependencies) != native_dependency_paths:
+            errors.append(
+                "receipt ldd dependency inventory differs from native ldd outputs"
+            )
+        for reported_path, metadata in ldd_dependencies.items():
+            if not Path(reported_path).is_absolute():
+                errors.append(
+                    f"receipt ldd dependency path is not absolute: {reported_path}"
+                )
+            if not _valid_fingerprint(metadata):
+                errors.append(
+                    "receipt ldd dependency fingerprint is missing or invalid: "
+                    f"{reported_path}"
+                )
+            elif not Path(metadata.get("path", "")).is_absolute():
+                errors.append(
+                    "receipt resolved ldd dependency path is not absolute: "
+                    f"{reported_path}"
+                )
 
     audits = receipt.get("cpu_mask_audits")
     if not isinstance(audits, dict):

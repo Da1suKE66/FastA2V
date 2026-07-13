@@ -2,6 +2,7 @@ import base64
 import copy
 import hashlib
 import importlib.util
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -17,11 +18,14 @@ from ovi.radial_evidence import (
     FLASHINFER_WHEEL_URL,
     RADIAL_COMMIT,
     RADIAL_DERIVED_MODULE_SHA256,
+    RADIAL_FORBIDDEN_LOADER_VARIABLES,
     RADIAL_OPTIONAL_IMPORTS_PATCH_SHA256,
     RADIAL_PROFILE_AUDITS,
     RADIAL_SOURCE_MODULE_SHA256,
     expected_flashinfer_manifest,
+    deterministic_ldd_environment,
     flashinfer_manifest_evidence_errors,
+    ldd_resolved_library_paths,
     normalize_ldd_output,
     radial_profile,
     radial_microtest_evidence_errors,
@@ -291,6 +295,31 @@ def complete_receipt():
             "single_prefill_with_kv_cache",
             "merge_state",
         ],
+        "cuda_home": "/usr/local/cuda-12.1",
+        "ldd_executable": {
+            "path": "/usr/bin/ldd",
+            "bytes": 1,
+            "sha256": "d" * 64,
+        },
+        "ldd_search_paths": [
+            f"{root}/envs/ovi/lib/python3.11/site-packages/torch/lib",
+            "/usr/local/cuda-12.1/lib64",
+        ],
+        "ldd_dependencies": {
+            "/fixed/libtorch.so": {
+                "path": "/fixed/libtorch.so",
+                "bytes": 1,
+                "sha256": "c" * 64,
+            }
+        },
+        "runtime_loader_environment": {
+            "LD_LIBRARY_PATH": (
+                f"{root}/envs/ovi/lib/python3.11/site-packages/torch/lib:"
+                "/usr/local/cuda-12.1/lib64"
+            ),
+            "forbidden_prefixes": ["LD_"],
+            "unset": list(RADIAL_FORBIDDEN_LOADER_VARIABLES),
+        },
         "installed_flashinfer_package_root": flashinfer_root,
         "flashinfer_module": {
             "path": f"{flashinfer_root}/__init__.py",
@@ -307,6 +336,7 @@ def complete_receipt():
                 "ldd_sha256": hashlib.sha256(
                     native_ldd_normalized.encode("utf-8")
                 ).hexdigest(),
+                "ldd_dependency_paths": ["/fixed/libtorch.so"],
             },
         },
         "flashinfer_manifest": {
@@ -337,15 +367,26 @@ class RadialMaskAuditTests(unittest.TestCase):
         )
 
     def test_installed_flashinfer_inventory_and_native_ldd_are_rechecked(self):
-        ldd_output = "libtorch.so => /fixed/libtorch.so (0x1234)\n"
-        normalized = normalize_ldd_output(ldd_output)
         with tempfile.TemporaryDirectory() as directory:
             package_root = Path(directory) / "flashinfer"
             package_root.mkdir()
             init_path = package_root / "__init__.py"
             native_path = package_root / "kernels.so"
+            torch_lib = Path(directory) / "torch" / "lib"
+            cuda_home = (Path(directory) / "cuda").resolve()
+            cuda_lib = cuda_home / "lib64"
+            ldd_path = (Path(directory) / "ldd").resolve()
+            dependency_path = (Path(directory) / "libtorch.so").resolve()
             init_path.write_bytes(b"init")
             native_path.write_bytes(b"native")
+            torch_lib.mkdir(parents=True)
+            cuda_lib.mkdir(parents=True)
+            ldd_path.write_bytes(b"ldd")
+            dependency_path.write_bytes(b"dependency")
+            ldd_output = (
+                f"libtorch.so => {dependency_path} (0x1234)\n"
+            )
+            normalized = normalize_ldd_output(ldd_output)
 
             def file_metadata(path):
                 payload = path.read_bytes()
@@ -355,6 +396,28 @@ class RadialMaskAuditTests(unittest.TestCase):
                 }
 
             receipt = {
+                "cuda_home": str(cuda_home),
+                "ldd_executable": {
+                    "path": str(ldd_path),
+                    **file_metadata(ldd_path),
+                },
+                "ldd_search_paths": [
+                    str(torch_lib.resolve()),
+                    str(cuda_lib.resolve()),
+                ],
+                "ldd_dependencies": {
+                    str(dependency_path): {
+                        "path": str(dependency_path),
+                        **file_metadata(dependency_path),
+                    }
+                },
+                "runtime_loader_environment": {
+                    "LD_LIBRARY_PATH": (
+                        f"{torch_lib.resolve()}:{cuda_lib.resolve()}"
+                    ),
+                    "forbidden_prefixes": ["LD_"],
+                    "unset": list(RADIAL_FORBIDDEN_LOADER_VARIABLES),
+                },
                 "installed_flashinfer_package_root": str(package_root),
                 "flashinfer_module": {
                     "path": str(init_path),
@@ -370,21 +433,105 @@ class RadialMaskAuditTests(unittest.TestCase):
                         "ldd_sha256": hashlib.sha256(
                             normalized.encode("utf-8")
                         ).hexdigest(),
+                        "ldd_dependency_paths": [str(dependency_path)],
                     },
                 },
             }
-            with mock.patch.object(
-                BACKEND_MODULE.subprocess,
-                "check_output",
-                return_value=ldd_output,
+            with (
+                mock.patch.object(
+                    BACKEND_MODULE, "RADIAL_CUDA_HOME", str(cuda_home)
+                ),
+                mock.patch.object(
+                    BACKEND_MODULE, "RADIAL_LDD_EXECUTABLE", str(ldd_path)
+                ),
+                mock.patch.object(
+                    BACKEND_MODULE.subprocess,
+                    "check_output",
+                    return_value=ldd_output,
+                ) as run_ldd,
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "CUDA_HOME": "/ambient/cuda",
+                        "LD_LIBRARY_PATH": "/ambient/lib",
+                        "LD_PRELOAD": "/ambient/preload.so",
+                    },
+                ),
             ):
                 verified = BACKEND_MODULE._verify_installed_flashinfer_files(
                     receipt
                 )
                 self.assertEqual(verified, package_root.resolve())
+                self.assertEqual(
+                    run_ldd.call_args.kwargs["env"],
+                    {
+                        "PATH": "/usr/bin:/bin",
+                        "LANG": "C",
+                        "LC_ALL": "C",
+                        "LD_LIBRARY_PATH": (
+                            f"{torch_lib.resolve()}:{cuda_lib.resolve()}"
+                        ),
+                    },
+                )
+                dependency_path.write_bytes(b"dependency drift")
+                with self.assertRaises(RadialAttentionDependencyError):
+                    BACKEND_MODULE._verify_installed_flashinfer_files(receipt)
+                dependency_path.write_bytes(b"dependency")
                 (package_root / "unexpected.py").write_text("drift")
                 with self.assertRaises(RadialAttentionDependencyError):
                     BACKEND_MODULE._verify_installed_flashinfer_files(receipt)
+
+    def test_runtime_loader_contract_rejects_ambient_injection(self):
+        receipt = complete_receipt()
+        expected = receipt["runtime_loader_environment"]
+        with mock.patch.dict(
+            os.environ,
+            {"LD_LIBRARY_PATH": expected["LD_LIBRARY_PATH"]},
+            clear=True,
+        ):
+            self.assertEqual(
+                BACKEND_MODULE.verify_radial_runtime_loader_environment(receipt),
+                expected,
+            )
+            for variable in (
+                "LD_PRELOAD",
+                "LD_HWCAP_MASK",
+                "GLIBC_TUNABLES",
+            ):
+                with self.subTest(variable=variable):
+                    os.environ[variable] = "ambient"
+                    with self.assertRaises(RadialAttentionDependencyError):
+                        BACKEND_MODULE.verify_radial_runtime_loader_environment(
+                            receipt
+                        )
+                    os.environ.pop(variable)
+
+    def test_ldd_helpers_reject_ambiguous_search_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            canonical = str(Path(directory).resolve())
+            self.assertEqual(
+                deterministic_ldd_environment([canonical])["LD_LIBRARY_PATH"],
+                canonical,
+            )
+        for invalid in (
+            [],
+            [""],
+            ["relative"],
+            ["/absolute:split"],
+            ["/tmp/../tmp"],
+            ["/tmp", "/tmp"],
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    deterministic_ldd_environment(invalid)
+        self.assertEqual(
+            ldd_resolved_library_paths(
+                "linux-vdso.so.1 (0x1)\n"
+                "libtorch.so => /fixed/libtorch.so (0x2)\n"
+                "/lib64/ld-linux-x86-64.so.2 (0x3)\n"
+            ),
+            ("/fixed/libtorch.so", "/lib64/ld-linux-x86-64.so.2"),
+        )
 
     def test_cpu_fixtures_bind_hash_count_and_official_empty_rows(self):
         for profile, expected in RADIAL_PROFILE_AUDITS.items():
@@ -414,6 +561,14 @@ class RadialMaskAuditTests(unittest.TestCase):
     def test_receipt_validator_rejects_dependency_or_mask_drift(self):
         receipt = complete_receipt()
         self.assertEqual(radial_receipt_evidence_errors(receipt), [])
+        ldd_drift = copy.deepcopy(receipt)
+        ldd_drift["ldd_search_paths"].append("/ambient/lib")
+        self.assertTrue(
+            any(
+                "ldd_search_paths" in error
+                for error in radial_receipt_evidence_errors(ldd_drift)
+            )
+        )
         manifest = expected_flashinfer_manifest(receipt)
         self.assertEqual(
             flashinfer_manifest_evidence_errors(manifest, receipt), []

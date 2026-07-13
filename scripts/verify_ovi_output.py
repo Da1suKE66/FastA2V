@@ -1156,6 +1156,7 @@ def verify_run_protocol(run_dir, reports):
                 "source_files_verified": True,
                 "flashinfer_files_verified": True,
                 "flashinfer_manifest_verified": True,
+                "runtime_loader_environment_verified": True,
                 "cpu_mask_audits_verified": True,
                 "flashinfer_version": FLASHINFER_VERSION,
                 "flashinfer_apis": {

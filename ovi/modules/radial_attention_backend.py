@@ -27,15 +27,19 @@ from ovi.radial_evidence import (
     FLASHINFER_VERSION,
     FLASHINFER_WHEEL_FILENAME,
     FLASHINFER_WHEEL_SHA256,
+    RADIAL_CUDA_HOME,
     RADIAL_BLOCK_SIZE,
     RADIAL_COMMIT,
     RADIAL_DERIVED_MODULE_SHA256,
     RADIAL_EMPTY_ROWS,
+    RADIAL_FORBIDDEN_LOADER_PREFIXES,
+    RADIAL_FORBIDDEN_LOADER_VARIABLES,
     RADIAL_GRID,
     RADIAL_HEAD_DIM,
     RADIAL_HEADS,
     RADIAL_MASK_API,
     RADIAL_MODEL_TYPE,
+    RADIAL_LDD_EXECUTABLE,
     RADIAL_OPTIONAL_IMPORTS_PATCH_SHA256,
     RADIAL_PREFIX_SEQUENCE,
     RADIAL_PROFILE_AUDITS,
@@ -44,9 +48,12 @@ from ovi.radial_evidence import (
     RADIAL_SOURCE_MODULE_SHA256,
     RADIAL_TAIL_SEQUENCE,
     flashinfer_manifest_evidence_errors,
+    deterministic_ldd_environment,
+    ldd_resolved_library_paths,
     normalize_ldd_output,
     radial_profile,
     radial_receipt_evidence_errors,
+    radial_runtime_loader_environment,
 )
 
 
@@ -113,15 +120,36 @@ def _verify_installed_flashinfer_files(receipt):
             f"missing={sorted(expected_files - actual_files)} "
             f"unexpected={sorted(actual_files - expected_files)}"
         )
-    ldd_env = os.environ.copy()
-    search_paths = [package_root.parent / "torch" / "lib"]
-    cuda_home = os.environ.get("CUDA_HOME")
-    if cuda_home:
-        search_paths.append(Path(cuda_home) / "lib64")
-    existing_ld_path = ldd_env.get("LD_LIBRARY_PATH")
-    if existing_ld_path:
-        search_paths.append(existing_ld_path)
-    ldd_env["LD_LIBRARY_PATH"] = ":".join(str(path) for path in search_paths)
+    ldd_path = _verify_fingerprint(
+        receipt.get("ldd_executable"), "ldd executable"
+    )
+    if ldd_path != Path(RADIAL_LDD_EXECUTABLE).resolve():
+        raise RadialAttentionDependencyError(
+            "Radial receipt points to an unexpected ldd executable"
+        )
+    expected_search_paths = (
+        str(package_root.parent / "torch" / "lib"),
+        str(Path(RADIAL_CUDA_HOME) / "lib64"),
+    )
+    search_paths = tuple(receipt.get("ldd_search_paths", ()))
+    if receipt.get("cuda_home") != RADIAL_CUDA_HOME:
+        raise RadialAttentionDependencyError(
+            "Radial receipt does not bind the fixed CUDA home"
+        )
+    if search_paths != expected_search_paths:
+        raise RadialAttentionDependencyError(
+            "Radial receipt ldd search paths differ from the installed environment"
+        )
+    missing_search_paths = [
+        path for path in search_paths if not Path(path).is_dir()
+    ]
+    if missing_search_paths:
+        raise RadialAttentionDependencyError(
+            "Radial ldd search directories are missing: "
+            f"{missing_search_paths}"
+        )
+    ldd_env = deterministic_ldd_environment(search_paths)
+    actual_dependency_paths = set()
     for relative_name, expected in sorted(
         receipt["installed_flashinfer_files"].items()
     ):
@@ -143,7 +171,7 @@ def _verify_installed_flashinfer_files(receipt):
         if path.suffix == ".so":
             try:
                 ldd_output = subprocess.check_output(
-                    ["ldd", str(path)],
+                    [str(ldd_path), str(path)],
                     text=True,
                     stderr=subprocess.STDOUT,
                     env=ldd_env,
@@ -160,11 +188,78 @@ def _verify_installed_flashinfer_files(receipt):
                 )
             if actual_ldd_sha256 != expected.get("ldd_sha256"):
                 mismatches.append(f"ldd fingerprint mismatch: {relative_name}")
+            dependency_paths = list(ldd_resolved_library_paths(ldd_output))
+            if dependency_paths != expected.get("ldd_dependency_paths"):
+                mismatches.append(
+                    f"ldd dependency paths mismatch: {relative_name}"
+                )
+            else:
+                actual_dependency_paths.update(dependency_paths)
+    expected_dependencies = receipt.get("ldd_dependencies", {})
+    if set(expected_dependencies) != actual_dependency_paths:
+        mismatches.append(
+            "ldd dependency inventory mismatch: "
+            f"expected={sorted(expected_dependencies)} "
+            f"actual={sorted(actual_dependency_paths)}"
+        )
+    for reported_path, expected in sorted(expected_dependencies.items()):
+        resolved_path = Path(reported_path).resolve()
+        if str(resolved_path) != expected.get("path"):
+            mismatches.append(
+                f"ldd dependency resolution changed: {reported_path}"
+            )
+            continue
+        if not resolved_path.is_file():
+            mismatches.append(f"ldd dependency is missing: {reported_path}")
+            continue
+        if (
+            resolved_path.stat().st_size != expected.get("bytes")
+            or _sha256_file(resolved_path) != expected.get("sha256")
+        ):
+            mismatches.append(
+                f"ldd dependency fingerprint mismatch: {reported_path}"
+            )
     if mismatches:
         raise RadialAttentionDependencyError(
             f"Installed FlashInfer files differ from receipt: {mismatches}"
         )
     return package_root
+
+
+def verify_radial_runtime_loader_environment(receipt):
+    """Reject Python processes whose loader environment differs from ldd."""
+
+    expected = radial_runtime_loader_environment(
+        receipt.get("ldd_search_paths", ())
+    )
+    if receipt.get("runtime_loader_environment") != expected:
+        raise RadialAttentionDependencyError(
+            "Radial receipt runtime loader contract is invalid"
+        )
+    actual_ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if actual_ld_library_path != expected["LD_LIBRARY_PATH"]:
+        raise RadialAttentionDependencyError(
+            "Radial Python process LD_LIBRARY_PATH differs from the audited "
+            f"loader contract: {actual_ld_library_path!r}"
+        )
+    forbidden = sorted(
+        name
+        for name in os.environ
+        if (
+            name != "LD_LIBRARY_PATH"
+            and any(
+                name.startswith(prefix)
+                for prefix in RADIAL_FORBIDDEN_LOADER_PREFIXES
+            )
+        )
+        or name in RADIAL_FORBIDDEN_LOADER_VARIABLES
+    )
+    if forbidden:
+        raise RadialAttentionDependencyError(
+            "Radial Python process has forbidden loader variables: "
+            f"{forbidden}"
+        )
+    return expected
 
 
 def _verify_flashinfer_manifest(receipt):
@@ -789,6 +884,7 @@ def build_radial_video_backend(config):
     receipt_path, receipt = verify_radial_install_receipt(
         config.get("radial_install_receipt", None)
     )
+    verify_radial_runtime_loader_environment(receipt)
     flashinfer = load_flashinfer_api(
         receipt["installed_flashinfer_package_root"]
     )

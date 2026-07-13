@@ -136,6 +136,9 @@ class RadialRunProtocolTests(unittest.TestCase):
                 source,
             )
             self.assertIn("--attention-method radial", source)
+            radial_env_offset = source.index("scripts/radial_env.sh")
+            preflight_offset = source.index("scripts/preflight_ovi.py")
+            self.assertLess(radial_env_offset, preflight_offset)
         self.assertEqual(len(parents), len(names))
 
     def test_dispatcher_validator_requires_real_radial_calls_and_tail_audit(self):
@@ -243,6 +246,14 @@ class RadialPinAndInstallerTests(unittest.TestCase):
             FLASHINFER_WHEEL_SHA256,
             'FLASHINFER_MANIFEST_PATH="${FASTA2V_CACHE_ROOT}/',
             'metadata_value["ldd_output"] = ldd_output',
+            'FIXED_CUDA_HOME="/usr/local/cuda-12.1"',
+            'FIXED_LDD_EXECUTABLE="/usr/bin/ldd"',
+            "ldd_env = deterministic_ldd_environment(ldd_search_paths)",
+            '[str(ldd_executable), str(installed_path)]',
+            'source "${REPO_ROOT}/scripts/radial_env.sh"',
+            'metadata_value["ldd_dependency_paths"] = dependency_paths',
+            '"ldd_dependencies": ldd_dependencies',
+            '"runtime_loader_environment": runtime_loader_environment',
             '"flashinfer_manifest": fingerprint(flashinfer_manifest_path)',
             '"cuda_kernel_launched": False',
         ):
@@ -250,6 +261,16 @@ class RadialPinAndInstallerTests(unittest.TestCase):
         self.assertNotIn("scripts/check_pre_run_gpu.py", source)
         self.assertNotIn("torch.cuda", source)
         self.assertNotIn(".cuda()", source)
+        self.assertNotIn("ldd_env = os.environ.copy()", source)
+
+        radial_env = (REPO_ROOT / "scripts" / "radial_env.sh").read_text()
+        self.assertIn("compgen -e", radial_env)
+        self.assertIn('== LD_*', radial_env)
+        self.assertIn("unset GLIBC_TUNABLES", radial_env)
+        self.assertIn(
+            'export LD_LIBRARY_PATH="${FASTA2V_OVI_ENV}/lib/python3.11/',
+            radial_env,
+        )
 
     def test_backend_has_no_custom_cuda_or_dense_fallback(self):
         source = (
@@ -267,10 +288,18 @@ class RadialPinAndInstallerTests(unittest.TestCase):
         ).read_text()
         self.assertIn("RadialVideoSelfAttentionBackend", microtest_source)
         self.assertIn("torch.isfinite", microtest_source)
+        self.assertLess(
+            microtest_source.index("verify_radial_runtime_loader_environment(receipt)"),
+            microtest_source.index("    import torch"),
+        )
         self.assertIn("os.getpid()", microtest_source)
         self.assertIn('gpu_identity.get("process_count") != 1', microtest_source)
         self.assertNotIn("import triton", microtest_source)
         self.assertNotIn("scaled_dot_product_attention", microtest_source)
+        verifier_source = (
+            REPO_ROOT / "scripts" / "verify_ovi_output.py"
+        ).read_text()
+        self.assertIn('"runtime_loader_environment_verified": True', verifier_source)
 
 
 if __name__ == "__main__":

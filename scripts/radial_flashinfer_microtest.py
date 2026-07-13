@@ -6,9 +6,6 @@ import os
 from pathlib import Path
 import sys
 
-import torch
-
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -19,6 +16,7 @@ from ovi.modules.radial_attention_backend import (
     load_flashinfer_api,
     load_official_radial_mask_module,
     verify_radial_install_receipt,
+    verify_radial_runtime_loader_environment,
 )
 from ovi.radial_evidence import (
     RADIAL_GRID,
@@ -65,11 +63,14 @@ def run_microtest(device_index=0):
         raise RadialAttentionDependencyError(
             "Radial microtest must launch on logical CUDA device 0"
         )
+    receipt_path, receipt = verify_radial_install_receipt()
+    verify_radial_runtime_loader_environment(receipt)
+    import torch
+
     if not torch.cuda.is_available():
         raise RadialAttentionDependencyError(
             "CUDA is unavailable for the required Radial FlashInfer microtest"
         )
-    receipt_path, receipt = verify_radial_install_receipt()
     flashinfer = load_flashinfer_api(
         receipt["installed_flashinfer_package_root"]
     )

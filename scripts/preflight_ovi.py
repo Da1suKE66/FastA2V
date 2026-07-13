@@ -144,6 +144,7 @@ def main(output_path=None, attention_method="dense"):
                 load_flashinfer_api,
                 load_official_radial_mask_module,
                 verify_radial_install_receipt,
+                verify_radial_runtime_loader_environment,
             )
             from ovi.radial_evidence import (
                 RADIAL_COMMIT,
@@ -166,6 +167,7 @@ def main(output_path=None, attention_method="dense"):
                 )
 
             receipt_path, receipt = verify_radial_install_receipt()
+            verify_radial_runtime_loader_environment(receipt)
             cached_flashinfer_manifest = Path(
                 receipt["flashinfer_manifest"]["path"]
             )
@@ -195,6 +197,7 @@ def main(output_path=None, attention_method="dense"):
                 "source_files_verified": True,
                 "flashinfer_files_verified": True,
                 "flashinfer_manifest_verified": True,
+                "runtime_loader_environment_verified": True,
                 "cpu_mask_audits_verified": True,
                 "flashinfer_version": package_version("flashinfer-python"),
                 "flashinfer_apis": {

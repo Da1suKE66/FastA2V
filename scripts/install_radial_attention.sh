@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/scripts/env.sh"
+source "${REPO_ROOT}/scripts/radial_env.sh"
 
 UPSTREAM_URL="https://github.com/mit-han-lab/radial-attention.git"
 UPSTREAM_CLONE_URL="ssh://git@ssh.github.com:443/mit-han-lab/radial-attention.git"
@@ -24,6 +25,8 @@ FLASHINFER_WHEEL_URL="https://github.com/flashinfer-ai/flashinfer/releases/downl
 FLASHINFER_WHEEL_DIR="${FASTA2V_CACHE_ROOT}/wheels"
 FLASHINFER_WHEEL_PATH="${FLASHINFER_WHEEL_DIR}/${FLASHINFER_WHEEL_FILENAME}"
 FLASHINFER_WHEEL_PARTIAL="${FLASHINFER_WHEEL_PATH}.partial"
+FIXED_CUDA_HOME="/usr/local/cuda-12.1"
+FIXED_LDD_EXECUTABLE="/usr/bin/ldd"
 EXPECTED_FLASHINFER_WHEEL_BYTES="544230876"
 EXPECTED_FLASHINFER_WHEEL_SHA256="43d767b912c0c43a04be99595e0123eab9385fc72530a2874b5fb08e3145c0be"
 EXPECTED_SOURCE_SHA256="663dd94c8be0b20d8ab71c56209f0d03514b2fb90d4a2dfdb2cfaf3238b529ee"
@@ -46,8 +49,12 @@ if ! command -v patch >/dev/null 2>&1; then
   echo "Required patch executable was not found" >&2
   exit 2
 fi
-if ! command -v ldd >/dev/null 2>&1; then
-  echo "Required ldd executable was not found" >&2
+if [[ "${CUDA_HOME}" != "${FIXED_CUDA_HOME}" ]]; then
+  echo "Radial requires CUDA_HOME=${FIXED_CUDA_HOME}, got ${CUDA_HOME}" >&2
+  exit 2
+fi
+if [[ ! -x "${FIXED_LDD_EXECUTABLE}" ]]; then
+  echo "Required fixed ldd executable was not found: ${FIXED_LDD_EXECUTABLE}" >&2
   exit 2
 fi
 if ! command -v curl >/dev/null 2>&1; then
@@ -180,11 +187,17 @@ from ovi.radial_evidence import (
     FLASHINFER_REQUIRED_APIS,
     FLASHINFER_VERSION,
     RADIAL_BLOCK_SIZE,
+    RADIAL_CUDA_HOME,
     RADIAL_GRID,
+    RADIAL_LDD_EXECUTABLE,
     RADIAL_MODEL_TYPE,
     RADIAL_PROFILE_AUDITS,
     RADIAL_SEQUENCE,
+    deterministic_ldd_environment,
+    ldd_resolved_library_paths,
     normalize_ldd_output,
+    radial_ldd_search_paths,
+    radial_runtime_loader_environment,
 )
 
 if Path(sys.prefix).resolve() != Path(os.environ["FASTA2V_OVI_ENV"]).resolve():
@@ -250,12 +263,36 @@ if not any(
     )
 installed_flashinfer_files = {}
 native_flashinfer_files = []
-ldd_env = os.environ.copy()
 torch_lib = Path(torch.__file__).resolve().parent / "lib"
-cuda_lib = Path(os.environ["CUDA_HOME"]) / "lib64"
-ldd_env["LD_LIBRARY_PATH"] = ":".join(
-    [str(torch_lib), str(cuda_lib), ldd_env.get("LD_LIBRARY_PATH", "")]
-).rstrip(":")
+if os.environ.get("CUDA_HOME") != RADIAL_CUDA_HOME:
+    raise RuntimeError("installer CUDA_HOME differs from the fixed Radial contract")
+ldd_search_paths = radial_ldd_search_paths(os.environ["FASTA2V_CACHE_ROOT"])
+if torch_lib.resolve() != Path(ldd_search_paths[0]).resolve():
+    raise RuntimeError("installed torch library path differs from fixed Ovi environment")
+missing_ldd_paths = [path for path in ldd_search_paths if not Path(path).is_dir()]
+if missing_ldd_paths:
+    raise RuntimeError(f"fixed ldd search directories are missing: {missing_ldd_paths}")
+ldd_executable = Path(RADIAL_LDD_EXECUTABLE).resolve()
+if not ldd_executable.is_file():
+    raise RuntimeError(f"fixed ldd executable is missing: {ldd_executable}")
+ldd_env = deterministic_ldd_environment(ldd_search_paths)
+runtime_loader_environment = radial_runtime_loader_environment(ldd_search_paths)
+if os.environ.get("LD_LIBRARY_PATH", "") != runtime_loader_environment["LD_LIBRARY_PATH"]:
+    raise RuntimeError("installer LD_LIBRARY_PATH differs from fixed Radial contract")
+for variable in runtime_loader_environment["unset"]:
+    if variable in os.environ:
+        raise RuntimeError(f"installer retained forbidden loader variable: {variable}")
+unexpected_ld_variables = sorted(
+    variable
+    for variable in os.environ
+    if variable != "LD_LIBRARY_PATH" and variable.startswith("LD_")
+)
+if unexpected_ld_variables:
+    raise RuntimeError(
+        "installer retained forbidden LD_* variables: "
+        f"{unexpected_ld_variables}"
+    )
+ldd_dependencies = {}
 for installed_path in sorted(flashinfer_package_root.rglob("*")):
     if (
         not installed_path.is_file()
@@ -268,7 +305,7 @@ for installed_path in sorted(flashinfer_package_root.rglob("*")):
     metadata_value.pop("path")
     if installed_path.suffix == ".so":
         ldd_output = subprocess.check_output(
-            ["ldd", str(installed_path)],
+            [str(ldd_executable), str(installed_path)],
             text=True,
             stderr=subprocess.STDOUT,
             env=ldd_env,
@@ -291,6 +328,21 @@ for installed_path in sorted(flashinfer_package_root.rglob("*")):
         metadata_value["ldd_sha256"] = hashlib.sha256(
             metadata_value["ldd_normalized_output"].encode("utf-8")
         ).hexdigest()
+        dependency_paths = list(ldd_resolved_library_paths(ldd_output))
+        if not dependency_paths:
+            raise RuntimeError(
+                f"FlashInfer native library resolved no file-backed dependencies: {installed_path}"
+            )
+        metadata_value["ldd_dependency_paths"] = dependency_paths
+        for reported_path in dependency_paths:
+            dependency_fingerprint = fingerprint(reported_path)
+            previous = ldd_dependencies.get(reported_path)
+            if previous is not None and previous != dependency_fingerprint:
+                raise RuntimeError(
+                    "FlashInfer native libraries resolved one dependency "
+                    f"inconsistently: {reported_path}"
+                )
+            ldd_dependencies[reported_path] = dependency_fingerprint
         native_flashinfer_files.append(relative_name)
     installed_flashinfer_files[relative_name] = metadata_value
 if "__init__.py" not in installed_flashinfer_files:
@@ -299,6 +351,8 @@ if not native_flashinfer_files:
     raise RuntimeError(
         "fixed FlashInfer candidate exposes no native .so to hash and ldd-audit"
     )
+if not ldd_dependencies:
+    raise RuntimeError("fixed FlashInfer candidate exposes no file-backed dependencies")
 
 flashinfer_manifest = {
     "schema": FLASHINFER_MANIFEST_SCHEMA,
@@ -308,6 +362,11 @@ flashinfer_manifest = {
     "wheel_url": os.environ["RADIAL_FLASHINFER_WHEEL_URL"],
     "wheel": fingerprint(os.environ["RADIAL_FLASHINFER_WHEEL_PATH"]),
     "required_apis": list(FLASHINFER_REQUIRED_APIS),
+    "cuda_home": RADIAL_CUDA_HOME,
+    "ldd_executable": fingerprint(ldd_executable),
+    "ldd_search_paths": list(ldd_search_paths),
+    "ldd_dependencies": ldd_dependencies,
+    "runtime_loader_environment": runtime_loader_environment,
     "package_root": str(flashinfer_package_root),
     "module": fingerprint(flashinfer_module_path),
     "files": installed_flashinfer_files,
@@ -345,6 +404,11 @@ receipt = {
     "flashinfer_wheel_url": os.environ["RADIAL_FLASHINFER_WHEEL_URL"],
     "flashinfer_wheel": fingerprint(os.environ["RADIAL_FLASHINFER_WHEEL_PATH"]),
     "flashinfer_required_apis": list(FLASHINFER_REQUIRED_APIS),
+    "cuda_home": RADIAL_CUDA_HOME,
+    "ldd_executable": fingerprint(ldd_executable),
+    "ldd_search_paths": list(ldd_search_paths),
+    "ldd_dependencies": ldd_dependencies,
+    "runtime_loader_environment": runtime_loader_environment,
     "installed_flashinfer_package_root": str(flashinfer_package_root),
     "flashinfer_module": fingerprint(flashinfer_module_path),
     "installed_flashinfer_files": installed_flashinfer_files,
