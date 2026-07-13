@@ -11,6 +11,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
+os.chdir(REPO_ROOT)
 
 CACHE_ROOT = Path(os.environ.get("FASTA2V_CACHE_ROOT", "/cache/liluchen/FastA2V"))
 CHECKPOINT_ROOT = CACHE_ROOT / "ckpts"

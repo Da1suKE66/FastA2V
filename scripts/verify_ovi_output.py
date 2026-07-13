@@ -94,6 +94,7 @@ def as_int(value):
 
 def verify(path):
     info = probe(path)
+    artifact_sha256 = sha256(path)
     videos = [stream for stream in info.get("streams", []) if stream.get("codec_type") == "video"]
     audios = [stream for stream in info.get("streams", []) if stream.get("codec_type") == "audio"]
     errors = []
@@ -157,6 +158,7 @@ def verify(path):
             "artifact_ready_seconds",
             "output_hash_seconds",
             "measurement_index",
+            "benchmark_candidate",
         )
         missing = [field for field in required_fields if field not in metrics]
         if missing:
@@ -176,16 +178,16 @@ def verify(path):
                 f"metrics generated shape {generated_shape} != stream shape "
                 f"[channels,{frames},{height},{width}]"
             )
-        actual_sha256 = sha256(path)
-        if metrics.get("output_sha256") != actual_sha256:
+        if metrics.get("output_sha256") != artifact_sha256:
             errors.append(
-                f"output SHA256 mismatch: metrics={metrics.get('output_sha256')} actual={actual_sha256}"
+                f"output SHA256 mismatch: metrics={metrics.get('output_sha256')} actual={artifact_sha256}"
             )
         if Path(metrics.get("output_path", "")).resolve() != path.resolve():
             errors.append(f"metrics output_path does not match artifact: {metrics.get('output_path')}")
 
     return {
         "path": str(path.resolve()),
+        "sha256": artifact_sha256,
         "status": "failed" if errors else "ok",
         "errors": errors,
         "video": {
@@ -261,6 +263,11 @@ def verify_run_protocol(run_dir, reports):
             errors.append("warmup_timings.jsonl contains an invalid warm-up record")
             break
 
+    artifact_hashes = {report["sha256"] for report in reports}
+    timing_hashes = {item.get("output_sha256") for item in timings}
+    if artifact_hashes != timing_hashes:
+        errors.append("timings.jsonl output hashes do not match the verified artifacts")
+
     preflight_path = run_dir / "preflight.json"
     if preflight_path.is_file():
         preflight = json.loads(preflight_path.read_text())
@@ -280,6 +287,8 @@ def verify_run_protocol(run_dir, reports):
         errors.append("run_config.yaml SHA256 does not match environment.json")
 
     candidate = bool(environment.get("benchmark_eligible"))
+    if any(item.get("benchmark_candidate") != candidate for item in timings):
+        errors.append("per-measurement benchmark_candidate disagrees with environment.json")
     benchmark_valid = bool(
         candidate
         and not errors
