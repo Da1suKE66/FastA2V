@@ -25,6 +25,7 @@ warmup_runs: 1
 measurement_runs: 3
 run_kind: "sparge_baseline"
 benchmark_eligible: true
+gpu_process_monitor_interval_seconds: 5.0
 
 attention_method: "sparge"
 sparge_topk: 0.5
@@ -35,5 +36,10 @@ cfg_cache_start_step: 10
 cfg_cache_end_step: 39
 cfg_cache_refresh_interval: 5
 use_block_cache: false
+block_cache_start_block: 10
+block_cache_end_block: 19
+block_cache_policy: "fixed"
+block_cache_cosine_threshold: 0.95
+block_cache_max_consecutive_reuses: 1
 debug_forward: false
 debug_forward_step: 0

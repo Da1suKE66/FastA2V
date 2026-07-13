@@ -23,8 +23,9 @@ text_prompt: prompts/ovi_smoke.csv
 each_example_n_times: 1
 warmup_runs: 0
 measurement_runs: 1
-run_kind: "diagnostic_smoke"
+run_kind: "sparge_diagnostic_smoke"
 benchmark_eligible: false
+gpu_process_monitor_interval_seconds: 5.0
 
 attention_method: "sparge"
 sparge_topk: 0.5
@@ -35,5 +36,10 @@ cfg_cache_start_step: 10
 cfg_cache_end_step: 39
 cfg_cache_refresh_interval: 5
 use_block_cache: false
+block_cache_start_block: 10
+block_cache_end_block: 19
+block_cache_policy: "fixed"
+block_cache_cosine_threshold: 0.95
+block_cache_max_consecutive_reuses: 1
 debug_forward: true
 debug_forward_step: 0
