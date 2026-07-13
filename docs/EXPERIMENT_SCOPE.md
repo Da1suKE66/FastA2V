@@ -19,6 +19,17 @@ The first reproducible baseline is fixed to:
 - seed `103` and `prompts/ovi_smoke.csv`
 - dense video and audio attention
 
+`720x720_5s` is the official checkpoint/model name. Ovi's official helper
+requires dimensions divisible by 32 and snaps a requested square `720 x 720`
+frame to an actual `704 x 704` output (`round(720 / 32) * 32`). FastA2V records
+both requested and actual dimensions and uses the actual dimensions in artifact
+filenames; it does not relabel a 704-pixel artifact as literal 720 pixels.
+
+The formal baseline performs one full warm-up generation in the same process,
+excludes it from measurements, then records three repeated measurements with
+the same prompt, seed, shape, and loaded engine. Every invocation receives a
+unique run directory so failed reruns cannot leave old videos looking current.
+
 Acceleration work is restricted to Python/PyTorch integration. Official
 third-party kernels may be installed and called through their public APIs, but
 FastA2V does not implement or modify CUDA or Triton kernels and does not train
@@ -35,4 +46,3 @@ use_block_cache = true | false
 All acceleration options default to the official dense path. Sparse attention
 will only replace video self-attention; audio self-attention, text
 cross-attention, and bidirectional audio-video cross-attention remain dense.
-

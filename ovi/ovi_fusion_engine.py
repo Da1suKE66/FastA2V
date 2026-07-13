@@ -62,8 +62,20 @@ class OviFusionEngine:
             )
         self.use_cfg_cache = bool(config.get("use_cfg_cache", False))
         self.use_block_cache = bool(config.get("use_block_cache", False))
+        if self.attention_method != "dense":
+            raise NotImplementedError(
+                f"attention_method={self.attention_method!r} is not wired yet; "
+                "refusing to silently run the dense path."
+            )
+        if self.use_cfg_cache or self.use_block_cache:
+            raise NotImplementedError(
+                "CFG cache and block cache are not wired yet; refusing to "
+                "silently run without the requested cache."
+            )
         self.debug_forward = bool(config.get("debug_forward", False))
         self.debug_forward_step = int(config.get("debug_forward_step", 0))
+        self.run_kind = str(config.get("run_kind", "unspecified"))
+        self.benchmark_eligible = bool(config.get("benchmark_eligible", False))
         self.last_run_metrics = {}
         meta_init = True
         self.cpu_offload = config.get("cpu_offload", False) or config.get("mode") == "t2i2v"
@@ -178,9 +190,20 @@ class OviFusionEngine:
             "attention_method": self.attention_method,
             "use_cfg_cache": self.use_cfg_cache,
             "use_block_cache": self.use_block_cache,
+            "debug_forward": self.debug_forward,
+            "run_kind": self.run_kind,
+            "benchmark_candidate": self.benchmark_eligible and not self.debug_forward,
+            # Only the post-run verifier can certify benchmark validity after
+            # checking warm-up/measurement cardinality and every artifact.
+            "benchmark_valid": False,
             "sample_steps": int(sample_steps),
             "seed": int(seed),
             "original_text_prompt": original_text_prompt,
+            "requested_video_frame_height_width": (
+                list(video_frame_height_width)
+                if video_frame_height_width is not None
+                else None
+            ),
         }
 
         params = {
@@ -244,6 +267,10 @@ class OviFusionEngine:
                 video_h, video_w = video_frame_height_width
                 video_h, video_w = snap_hw_to_multiple_of_32(video_h, video_w, area = self.target_area)
                 video_latent_h, video_latent_w = video_h // 16, video_w // 16
+                self.last_run_metrics.update({
+                    "actual_video_frame_height_width": [video_h, video_w],
+                    "video_latent_height_width": [video_latent_h, video_latent_w],
+                })
                 if self.image_model is not None:
                     # this already means t2v mode with image model
                     image_h, image_w = scale_hw_to_area_divisible(video_h, video_w, area = 1024 * 1024)
@@ -294,6 +321,10 @@ class OviFusionEngine:
             max_seq_len_audio = audio_noise.shape[0]  # L dimension from latents_audios shape [1, L, D]
             _patch_size_h, _patch_size_w = self.model.video_model.patch_size[1], self.model.video_model.patch_size[2]
             max_seq_len_video = video_noise.shape[1] * video_noise.shape[2] * video_noise.shape[3] // (_patch_size_h*_patch_size_w) # f * h * w from [1, c, f, h, w]
+            self.last_run_metrics.update({
+                "audio_sequence_length": int(max_seq_len_audio),
+                "video_sequence_length": int(max_seq_len_video),
+            })
             
             # Sampling loop
             if self.cpu_offload:
@@ -306,7 +337,10 @@ class OviFusionEngine:
                 for i, (t_v, t_a) in tqdm(enumerate(zip(timesteps_video, timesteps_audio))):
                     timestep_input = torch.full((1,), t_v, device=self.device)
                     debug_this_step = self.debug_forward and i == self.debug_forward_step
-                    timestep_value = float(t_v.detach().cpu().item())
+                    # Avoid a GPU-to-CPU synchronization on every timed step.
+                    timestep_value = (
+                        float(t_v.detach().cpu().item()) if debug_this_step else None
+                    )
 
                     if is_i2v:
                         video_noise[:, :1] = latents_images
@@ -425,11 +459,15 @@ class OviFusionEngine:
                 # Decode audio
                 audio_latents_for_vae = audio_noise.unsqueeze(0).transpose(1, 2)  # 1, c, l
                 generated_audio = self.vae_model_audio.wrapped_decode(audio_latents_for_vae)
+                if not torch.isfinite(generated_audio).all():
+                    raise FloatingPointError("audio decoder returned NaN or Inf")
                 generated_audio = generated_audio.squeeze().cpu().float().numpy()
                 
                 # Decode video  
                 video_latents_for_vae = video_noise.unsqueeze(0)  # 1, c, f, h, w
                 generated_video = self.vae_model_video.wrapped_decode(video_latents_for_vae)
+                if not torch.isfinite(generated_video).all():
+                    raise FloatingPointError("video decoder returned NaN or Inf")
                 generated_video = generated_video.squeeze(0).cpu().float().numpy()  # c, f, h, w
                 if self.cpu_offload:
                     self.offload_to_cpu(self.vae_model_video.model)

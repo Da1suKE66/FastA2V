@@ -1,0 +1,2 @@
+# Dependencies imported directly by Ovi but omitted from the upstream file.
+einops==0.8.2

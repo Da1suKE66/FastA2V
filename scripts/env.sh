@@ -2,7 +2,7 @@
 
 export FASTA2V_CACHE_ROOT="${FASTA2V_CACHE_ROOT:-/cache/liluchen/FastA2V}"
 export FASTA2V_OVI_ENV="${FASTA2V_OVI_ENV:-${FASTA2V_CACHE_ROOT}/envs/ovi}"
-export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}"
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.1}"
 
 export PATH="${FASTA2V_OVI_ENV}/bin:${CUDA_HOME}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CUDA_HOME}/compat:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
@@ -23,4 +23,3 @@ mkdir -p \
   "${TORCH_EXTENSIONS_DIR}" \
   "${XDG_CACHE_HOME}" \
   "${TMPDIR}"
-

@@ -13,6 +13,14 @@
 > bash scripts/download_ovi_720x720_5s.sh
 > bash scripts/run_ovi_smoke.sh
 > ```
+>
+> If the remote host cannot reach Hugging Face directly, select a transport
+> mirror explicitly without changing any model repository identifiers:
+>
+> ```bash
+> FASTA2V_HF_ENDPOINT=https://hf-mirror.com \
+>   bash scripts/download_ovi_720x720_5s.sh
+> ```
 
 <div align="center">
 <h1> Ovi: Twin Backbone Cross-Modal Fusion for Audio-Video Generation </h1>

@@ -1,5 +1,5 @@
 ckpt_dir: /cache/liluchen/FastA2V/ckpts
-output_dir: /cache/liluchen/FastA2V/runs/ovi_dense_720x720_5s_50step
+output_dir: ${oc.env:FASTA2V_RUN_DIR,/cache/liluchen/FastA2V/runs/ovi_720ckpt_dense_50step_manual}
 
 model_name: "720x720_5s"
 mode: "t2v"
@@ -21,10 +21,13 @@ cpu_offload: false
 seed: 103
 text_prompt: prompts/ovi_smoke.csv
 each_example_n_times: 1
+warmup_runs: 1
+measurement_runs: 3
+run_kind: "dense_baseline"
+benchmark_eligible: true
 
 attention_method: "dense"
 use_cfg_cache: false
 use_block_cache: false
 debug_forward: false
 debug_forward_step: 0
-
