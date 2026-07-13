@@ -12,6 +12,8 @@ Triton kernel and does not copy the upstream mask algorithm.
 - Official mask API: `gen_log_mask_shrinked`
 - Fixed FlashInfer candidate: `flashinfer-python==0.2.5+cu124torch2.6` from
   the CUDA 12.4, PyTorch 2.6 wheel index
+- Fixed Linux wheel SHA256:
+  `43d767b912c0c43a04be99595e0123eab9385fc72530a2874b5fb08e3145c0be`
 
 The upstream checkout under `/cache/liluchen/FastA2V/sources` must remain
 pristine. The installer creates a separate derived copy and applies
@@ -21,12 +23,14 @@ their plotting or Sage execution branch is explicitly called; source, patch,
 and derived-file SHA256 values are fixed in
 `ovi/radial_evidence.py` and in the install receipt.
 
-The receipt also binds the resolved FlashInfer module path and every installed
-package file. Native `.so` files must exist, have fixed SHA256 values, and pass
-`ldd` with no unresolved library. ASLR addresses are normalized while resolved
-library paths remain part of the `ldd` fingerprint. The immutable manifest is
-copied to each run as `radial-flashinfer-manifest.json` and rechecked by the
-final verifier.
+The installer caches the exact wheel under
+`/cache/liluchen/FastA2V/wheels`, resumes interrupted downloads, and verifies
+its fixed byte count and SHA256 before installation. The receipt also binds
+the wheel, resolved FlashInfer module path, and every installed package file.
+Native `.so` files must exist, have fixed SHA256 values, and pass `ldd` with no
+unresolved library. ASLR addresses are normalized while resolved library paths
+remain part of the `ldd` fingerprint. The immutable manifest is copied to each
+run as `radial-flashinfer-manifest.json` and rechecked by the final verifier.
 
 ## Exact Ovi execution protocol
 

@@ -8,6 +8,7 @@ from unittest import mock
 
 from ovi.eval_protocol import materialize_run_protocol, run_protocol_errors
 from ovi.radial_evidence import (
+    FLASHINFER_WHEEL_SHA256,
     RADIAL_COMMIT,
     RADIAL_DERIVED_MODULE_SHA256,
     RADIAL_OPTIONAL_IMPORTS_PATCH_SHA256,
@@ -238,6 +239,8 @@ class RadialPinAndInstallerTests(unittest.TestCase):
             'UPSTREAM_CLONE_URL="ssh://git@ssh.github.com:443/',
             'GITHUB_SSH_KEY="/home/ma-user/.ssh/id_ed25519_github"',
             'FLASHINFER_VERSION="0.2.5+cu124torch2.6"',
+            'FLASHINFER_WHEEL_DIR="${FASTA2V_CACHE_ROOT}/wheels"',
+            FLASHINFER_WHEEL_SHA256,
             'FLASHINFER_MANIFEST_PATH="${FASTA2V_CACHE_ROOT}/',
             'metadata_value["ldd_output"] = ldd_output',
             '"flashinfer_manifest": fingerprint(flashinfer_manifest_path)',

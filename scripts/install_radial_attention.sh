@@ -19,6 +19,13 @@ RECEIPT_PATH="${FASTA2V_CACHE_ROOT}/radialattn-install.json"
 FLASHINFER_MANIFEST_PATH="${FASTA2V_CACHE_ROOT}/radial-flashinfer-manifest.json"
 FLASHINFER_VERSION="0.2.5+cu124torch2.6"
 FLASHINFER_INDEX="https://flashinfer.ai/whl/cu124/torch2.6/"
+FLASHINFER_WHEEL_FILENAME="flashinfer_python-0.2.5+cu124torch2.6-cp38-abi3-linux_x86_64.whl"
+FLASHINFER_WHEEL_URL="https://github.com/flashinfer-ai/flashinfer/releases/download/v0.2.5/${FLASHINFER_WHEEL_FILENAME}"
+FLASHINFER_WHEEL_DIR="${FASTA2V_CACHE_ROOT}/wheels"
+FLASHINFER_WHEEL_PATH="${FLASHINFER_WHEEL_DIR}/${FLASHINFER_WHEEL_FILENAME}"
+FLASHINFER_WHEEL_PARTIAL="${FLASHINFER_WHEEL_PATH}.partial"
+EXPECTED_FLASHINFER_WHEEL_BYTES="544230876"
+EXPECTED_FLASHINFER_WHEEL_SHA256="43d767b912c0c43a04be99595e0123eab9385fc72530a2874b5fb08e3145c0be"
 EXPECTED_SOURCE_SHA256="663dd94c8be0b20d8ab71c56209f0d03514b2fb90d4a2dfdb2cfaf3238b529ee"
 EXPECTED_PATCH_SHA256="2adf006c3a81600ecf3bc0c228372385b1c99009fc0c30be95ee45c2bd208997"
 EXPECTED_DERIVED_SHA256="aafac6551f0a73a7548ed7ec987d718c17cf1269605e454af7d5089b4f9263c5"
@@ -43,12 +50,19 @@ if ! command -v ldd >/dev/null 2>&1; then
   echo "Required ldd executable was not found" >&2
   exit 2
 fi
+if ! command -v curl >/dev/null 2>&1; then
+  echo "Required curl executable was not found" >&2
+  exit 2
+fi
 if [[ "$(sha256sum "${PATCH_FILE}" | awk '{print $1}')" != "${EXPECTED_PATCH_SHA256}" ]]; then
   echo "Radial optional-imports patch hash mismatch" >&2
   exit 2
 fi
 
-mkdir -p "${FASTA2V_CACHE_ROOT}/sources" "${FASTA2V_CACHE_ROOT}/derived"
+mkdir -p \
+  "${FASTA2V_CACHE_ROOT}/sources" \
+  "${FASTA2V_CACHE_ROOT}/derived" \
+  "${FLASHINFER_WHEEL_DIR}"
 if [[ ! -e "${SOURCE_DIR}/.git" ]]; then
   if [[ -e "${SOURCE_DIR}" ]]; then
     echo "Refusing non-git Radial source path: ${SOURCE_DIR}" >&2
@@ -96,13 +110,40 @@ if [[ "$(sha256sum "${DERIVED_MODULE}" | awk '{print $1}')" != "${EXPECTED_DERIV
   exit 2
 fi
 
+if [[ ! -f "${FLASHINFER_WHEEL_PATH}" ]]; then
+  curl \
+    --fail \
+    --location \
+    --retry 5 \
+    --retry-delay 5 \
+    --continue-at - \
+    --output "${FLASHINFER_WHEEL_PARTIAL}" \
+    "${FLASHINFER_WHEEL_URL}"
+  if [[ "$(stat -c '%s' "${FLASHINFER_WHEEL_PARTIAL}")" != "${EXPECTED_FLASHINFER_WHEEL_BYTES}" ]]; then
+    echo "Downloaded FlashInfer wheel byte count mismatch" >&2
+    exit 2
+  fi
+  if [[ "$(sha256sum "${FLASHINFER_WHEEL_PARTIAL}" | awk '{print $1}')" != "${EXPECTED_FLASHINFER_WHEEL_SHA256}" ]]; then
+    echo "Downloaded FlashInfer wheel SHA256 mismatch" >&2
+    exit 2
+  fi
+  mv "${FLASHINFER_WHEEL_PARTIAL}" "${FLASHINFER_WHEEL_PATH}"
+fi
+if [[ "$(stat -c '%s' "${FLASHINFER_WHEEL_PATH}")" != "${EXPECTED_FLASHINFER_WHEEL_BYTES}" ]]; then
+  echo "Cached FlashInfer wheel byte count mismatch" >&2
+  exit 2
+fi
+if [[ "$(sha256sum "${FLASHINFER_WHEEL_PATH}" | awk '{print $1}')" != "${EXPECTED_FLASHINFER_WHEEL_SHA256}" ]]; then
+  echo "Cached FlashInfer wheel SHA256 mismatch" >&2
+  exit 2
+fi
+
 # Wheel installation does not execute an attention kernel.  The formal runner
 # owns the physical-GPU idle guard; runtime shape/API checks remain fail-closed.
 "${FASTA2V_OVI_ENV}/bin/python" -m pip install \
   --no-deps \
   --force-reinstall \
-  --index-url "${FLASHINFER_INDEX}" \
-  "flashinfer-python==${FLASHINFER_VERSION}"
+  "${FLASHINFER_WHEEL_PATH}"
 
 FASTA2V_REPO_ROOT="${REPO_ROOT}" \
 RADIAL_SOURCE_DIR="${SOURCE_DIR}" \
@@ -112,6 +153,8 @@ RADIAL_DERIVED_MODULE="${DERIVED_MODULE}" \
 RADIAL_PATCH_FILE="${PATCH_FILE}" \
 RADIAL_RECEIPT_PATH="${RECEIPT_PATH}" \
 RADIAL_FLASHINFER_MANIFEST_PATH="${FLASHINFER_MANIFEST_PATH}" \
+RADIAL_FLASHINFER_WHEEL_PATH="${FLASHINFER_WHEEL_PATH}" \
+RADIAL_FLASHINFER_WHEEL_URL="${FLASHINFER_WHEEL_URL}" \
 RADIAL_UPSTREAM_URL="${UPSTREAM_URL}" \
 RADIAL_CLONE_URL="${UPSTREAM_CLONE_URL}" \
 RADIAL_PINNED_COMMIT="${PINNED_COMMIT}" \
@@ -262,6 +305,8 @@ flashinfer_manifest = {
     "distribution": "flashinfer-python",
     "version": importlib.metadata.version("flashinfer-python"),
     "wheel_index": "https://flashinfer.ai/whl/cu124/torch2.6/",
+    "wheel_url": os.environ["RADIAL_FLASHINFER_WHEEL_URL"],
+    "wheel": fingerprint(os.environ["RADIAL_FLASHINFER_WHEEL_PATH"]),
     "required_apis": list(FLASHINFER_REQUIRED_APIS),
     "package_root": str(flashinfer_package_root),
     "module": fingerprint(flashinfer_module_path),
@@ -297,6 +342,8 @@ receipt = {
     "flashinfer_distribution": "flashinfer-python",
     "flashinfer_version": importlib.metadata.version("flashinfer-python"),
     "flashinfer_wheel_index": "https://flashinfer.ai/whl/cu124/torch2.6/",
+    "flashinfer_wheel_url": os.environ["RADIAL_FLASHINFER_WHEEL_URL"],
+    "flashinfer_wheel": fingerprint(os.environ["RADIAL_FLASHINFER_WHEEL_PATH"]),
     "flashinfer_required_apis": list(FLASHINFER_REQUIRED_APIS),
     "installed_flashinfer_package_root": str(flashinfer_package_root),
     "flashinfer_module": fingerprint(flashinfer_module_path),

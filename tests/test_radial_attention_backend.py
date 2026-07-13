@@ -11,6 +11,10 @@ import zlib
 
 from ovi.radial_evidence import (
     FLASHINFER_VERSION,
+    FLASHINFER_WHEEL_BYTES,
+    FLASHINFER_WHEEL_FILENAME,
+    FLASHINFER_WHEEL_SHA256,
+    FLASHINFER_WHEEL_URL,
     RADIAL_COMMIT,
     RADIAL_DERIVED_MODULE_SHA256,
     RADIAL_OPTIONAL_IMPORTS_PATCH_SHA256,
@@ -276,6 +280,12 @@ def complete_receipt():
         "flashinfer_distribution": "flashinfer-python",
         "flashinfer_version": FLASHINFER_VERSION,
         "flashinfer_wheel_index": "https://flashinfer.ai/whl/cu124/torch2.6/",
+        "flashinfer_wheel_url": FLASHINFER_WHEEL_URL,
+        "flashinfer_wheel": {
+            "path": f"{root}/wheels/{FLASHINFER_WHEEL_FILENAME}",
+            "bytes": FLASHINFER_WHEEL_BYTES,
+            "sha256": FLASHINFER_WHEEL_SHA256,
+        },
         "flashinfer_required_apis": [
             "BlockSparseAttentionWrapper",
             "single_prefill_with_kv_cache",

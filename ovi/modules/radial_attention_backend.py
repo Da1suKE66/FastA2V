@@ -25,6 +25,8 @@ from ovi.radial_evidence import (
     FLASHINFER_DISTRIBUTION,
     FLASHINFER_REQUIRED_APIS,
     FLASHINFER_VERSION,
+    FLASHINFER_WHEEL_FILENAME,
+    FLASHINFER_WHEEL_SHA256,
     RADIAL_BLOCK_SIZE,
     RADIAL_COMMIT,
     RADIAL_DERIVED_MODULE_SHA256,
@@ -219,6 +221,9 @@ def verify_radial_install_receipt(receipt_path=None):
     patch_path = _verify_fingerprint(
         receipt["optional_imports_patch"], "optional-imports patch"
     )
+    wheel_path = _verify_fingerprint(
+        receipt["flashinfer_wheel"], "FlashInfer wheel"
+    )
     expected_paths = {
         "source": Path(receipt["source_dir"]) / "radial_attn" / "attn_mask.py",
         "derived": Path(receipt["derived_dir"])
@@ -241,10 +246,18 @@ def verify_radial_install_receipt(receipt_path=None):
         raise RadialAttentionDependencyError(
             "Radial receipt points to an unexpected optional-imports patch"
         )
+    expected_wheel_path = (
+        Path(cache_root) / "wheels" / FLASHINFER_WHEEL_FILENAME
+    ).resolve()
+    if wheel_path != expected_wheel_path:
+        raise RadialAttentionDependencyError(
+            "Radial receipt points to an unexpected FlashInfer wheel"
+        )
     fixed_hashes = {
         source_path: RADIAL_SOURCE_MODULE_SHA256,
         derived_path: RADIAL_DERIVED_MODULE_SHA256,
         patch_path: RADIAL_OPTIONAL_IMPORTS_PATCH_SHA256,
+        wheel_path: FLASHINFER_WHEEL_SHA256,
     }
     for path, expected_digest in fixed_hashes.items():
         if _sha256_file(path) != expected_digest:

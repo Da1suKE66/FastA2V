@@ -35,6 +35,17 @@ RADIAL_MASK_API = "gen_log_mask_shrinked"
 FLASHINFER_DISTRIBUTION = "flashinfer-python"
 FLASHINFER_VERSION = "0.2.5+cu124torch2.6"
 FLASHINFER_WHEEL_INDEX = "https://flashinfer.ai/whl/cu124/torch2.6/"
+FLASHINFER_WHEEL_FILENAME = (
+    "flashinfer_python-0.2.5+cu124torch2.6-cp38-abi3-linux_x86_64.whl"
+)
+FLASHINFER_WHEEL_URL = (
+    "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.2.5/"
+    + FLASHINFER_WHEEL_FILENAME
+)
+FLASHINFER_WHEEL_BYTES = 544230876
+FLASHINFER_WHEEL_SHA256 = (
+    "43d767b912c0c43a04be99595e0123eab9385fc72530a2874b5fb08e3145c0be"
+)
 FLASHINFER_REQUIRED_APIS = (
     "BlockSparseAttentionWrapper",
     "single_prefill_with_kv_cache",
@@ -125,6 +136,8 @@ def expected_flashinfer_manifest(receipt):
         "distribution": receipt.get("flashinfer_distribution"),
         "version": receipt.get("flashinfer_version"),
         "wheel_index": receipt.get("flashinfer_wheel_index"),
+        "wheel_url": receipt.get("flashinfer_wheel_url"),
+        "wheel": receipt.get("flashinfer_wheel"),
         "required_apis": receipt.get("flashinfer_required_apis"),
         "package_root": receipt.get("installed_flashinfer_package_root"),
         "module": receipt.get("flashinfer_module"),
@@ -172,6 +185,7 @@ def radial_receipt_evidence_errors(
         "flashinfer_distribution": FLASHINFER_DISTRIBUTION,
         "flashinfer_version": FLASHINFER_VERSION,
         "flashinfer_wheel_index": FLASHINFER_WHEEL_INDEX,
+        "flashinfer_wheel_url": FLASHINFER_WHEEL_URL,
         "flashinfer_required_apis": list(FLASHINFER_REQUIRED_APIS),
         "installed_flashinfer_package_root": str(
             cache_root
@@ -215,6 +229,10 @@ def radial_receipt_evidence_errors(
             cache_root / FLASHINFER_MANIFEST_FILENAME,
             None,
         ),
+        "flashinfer_wheel": (
+            cache_root / "wheels" / FLASHINFER_WHEEL_FILENAME,
+            FLASHINFER_WHEEL_SHA256,
+        ),
     }
     for field, (expected_path, expected_digest) in fingerprints.items():
         metadata = receipt.get(field)
@@ -225,6 +243,8 @@ def radial_receipt_evidence_errors(
             errors.append(f"receipt {field} path differs from fixed cache path")
         if expected_digest is not None and metadata.get("sha256") != expected_digest:
             errors.append(f"receipt {field} SHA256 differs from audited content")
+        if field == "flashinfer_wheel" and metadata.get("bytes") != FLASHINFER_WHEEL_BYTES:
+            errors.append("receipt FlashInfer wheel byte count differs from audited file")
 
     flashinfer_root = receipt.get("installed_flashinfer_package_root")
     flashinfer_module = receipt.get("flashinfer_module")
