@@ -5,7 +5,6 @@ export FASTA2V_OVI_ENV="${FASTA2V_OVI_ENV:-${FASTA2V_CACHE_ROOT}/envs/ovi}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.1}"
 
 export PATH="${FASTA2V_OVI_ENV}/bin:${CUDA_HOME}/bin:${PATH}"
-export LD_LIBRARY_PATH="${CUDA_HOME}/compat:${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
 export PYTHONNOUSERSITE=1
 
 export PIP_CACHE_DIR="${FASTA2V_CACHE_ROOT}/pip"
