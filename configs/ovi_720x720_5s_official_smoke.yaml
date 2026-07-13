@@ -21,3 +21,25 @@ cpu_offload: false
 seed: 103
 text_prompt: ${oc.env:FASTA2V_PROMPT_FILE}
 each_example_n_times: 1
+warmup_runs: 0
+measurement_runs: 1
+run_kind: "official_reference"
+benchmark_eligible: false
+gpu_process_monitor_interval_seconds: 5.0
+
+# These fields are ignored by the pinned upstream inference implementation.
+# They make its evaluation identity explicit and keep the official-reference
+# config aligned with FastA2V's immutable CPU-side protocol registry.
+attention_method: "dense"
+use_cfg_cache: false
+cfg_cache_start_step: 10
+cfg_cache_end_step: 39
+cfg_cache_refresh_interval: 5
+use_block_cache: false
+block_cache_start_block: 10
+block_cache_end_block: 19
+block_cache_policy: "fixed"
+block_cache_cosine_threshold: 0.95
+block_cache_max_consecutive_reuses: 1
+debug_forward: false
+debug_forward_step: 0

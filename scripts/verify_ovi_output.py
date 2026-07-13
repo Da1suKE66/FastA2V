@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from ovi.block_cache import fixed_block_cache_metric_errors
+from ovi.eval_protocol import prompt_sequence_sha256, validate_run_protocol
 from ovi.sparge_evidence import (
     sparge_microtest_evidence_errors,
     sparge_receipt_evidence_errors,
@@ -33,67 +34,6 @@ SPARGE_PROVENANCE = {
     "tensor_layout": "NHD",
     "return_sparsity": False,
 }
-
-SPARGE_COMMON_RUN_PROTOCOL = {
-    "model_name": "720x720_5s",
-    "mode": "t2v",
-    "video_frame_height_width": [720, 720],
-    "solver_name": "unipc",
-    "shift": 5.0,
-    "seed": 103,
-    "video_guidance_scale": 4.0,
-    "audio_guidance_scale": 3.0,
-    "fp8": False,
-    "qint8": False,
-    "cpu_offload": False,
-    "sp_size": 1,
-    "slg_layer": 11,
-    "prompt_count": 1,
-    "each_example_n_times": 1,
-    "sparge_pvthreshd": 50.0,
-    "sparge_smooth_k": True,
-    "use_cfg_cache": False,
-    "use_block_cache": False,
-}
-SPARGE_RUN_KIND_PROTOCOLS = {
-    "sparge_baseline": {
-        **SPARGE_COMMON_RUN_PROTOCOL,
-        "sparge_topk": 0.50,
-        "sample_steps": 50,
-        "warmup_runs": 1,
-        "measurement_runs": 3,
-        "benchmark_eligible": True,
-        "debug_forward": False,
-    },
-    "sparge_diagnostic_smoke": {
-        **SPARGE_COMMON_RUN_PROTOCOL,
-        "sparge_topk": 0.50,
-        "sample_steps": 20,
-        "warmup_runs": 0,
-        "measurement_runs": 1,
-        "benchmark_eligible": False,
-        "debug_forward": True,
-    },
-    "sparge_topk75_baseline": {
-        **SPARGE_COMMON_RUN_PROTOCOL,
-        "sparge_topk": 0.75,
-        "sample_steps": 50,
-        "warmup_runs": 1,
-        "measurement_runs": 3,
-        "benchmark_eligible": True,
-        "debug_forward": False,
-    },
-    "sparge_topk75_diagnostic_smoke": {
-        **SPARGE_COMMON_RUN_PROTOCOL,
-        "sparge_topk": 0.75,
-        "sample_steps": 20,
-        "warmup_runs": 0,
-        "measurement_runs": 1,
-        "benchmark_eligible": False,
-        "debug_forward": True,
-    },
-}
-
 
 def run(command):
     return subprocess.check_output(command, stderr=subprocess.STDOUT)
@@ -416,25 +356,6 @@ def validate_sparge_dispatcher(
                 )
 
 
-def validate_sparge_run_protocol(environment, errors):
-    """Bind each audited Sparge run kind to one immutable parameter set."""
-
-    run_kind = environment.get("run_kind")
-    expected_protocol = SPARGE_RUN_KIND_PROTOCOLS.get(run_kind)
-    if expected_protocol is None:
-        errors.append(
-            f"Sparge run_kind {run_kind!r} is not an audited pure-Sparge "
-            "protocol"
-        )
-        return
-    for field, expected in expected_protocol.items():
-        if environment.get(field) != expected:
-            errors.append(
-                f"Sparge {run_kind} protocol {field}="
-                f"{environment.get(field)!r} != fixed value {expected!r}"
-            )
-
-
 def verify(path, require_metrics=True, expected_video_frames=121):
     info = probe(path)
     artifact_sha256 = sha256(path)
@@ -747,6 +668,7 @@ def verify_run_protocol(run_dir, reports):
     errors = []
     environment_path = run_dir / "environment.json"
     environment = json.loads(environment_path.read_text()) if environment_path.is_file() else {}
+    validate_run_protocol(environment, errors)
     attention_method = environment.get("attention_method")
     required_files = [
         "environment.json",
@@ -818,6 +740,35 @@ def verify_run_protocol(run_dir, reports):
             errors.append("warmup_timings.jsonl contains an invalid warm-up record")
             break
 
+    expected_prompts_sha256 = environment.get("prompts_sha256")
+    for measurement_index in range(max(measurement_runs, 0)):
+        measurement_prompts = [
+            item.get("prompt")
+            for item in timings
+            if item.get("measurement_index") == measurement_index
+        ]
+        if not all(isinstance(prompt, str) for prompt in measurement_prompts):
+            errors.append(
+                f"measurement index {measurement_index} contains an invalid "
+                "prompt value"
+            )
+        elif prompt_sequence_sha256(measurement_prompts) != expected_prompts_sha256:
+            errors.append(
+                f"measurement index {measurement_index} prompt sequence does "
+                "not match the fixed environment prompt hash"
+            )
+    for warmup_index, item in enumerate(warmups):
+        warmup_prompt = item.get("prompt")
+        if not isinstance(warmup_prompt, str):
+            errors.append(
+                f"warmup index {warmup_index} has an invalid prompt value"
+            )
+        elif prompt_sequence_sha256([warmup_prompt]) != expected_prompts_sha256:
+            errors.append(
+                f"warmup index {warmup_index} prompt does not match the fixed "
+                "environment prompt hash"
+            )
+
     all_run_records = [*warmups, *timings]
     if environment.get("use_block_cache") or any(
         item.get("use_block_cache") for item in all_run_records
@@ -881,7 +832,6 @@ def verify_run_protocol(run_dir, reports):
             errors.append(f"preflight contains errors: {preflight['errors']}")
 
     if attention_method == "sparge":
-        validate_sparge_run_protocol(environment, errors)
         receipt_path = run_dir / "spargeattn-install.json"
         try:
             copied_receipt = json.loads(receipt_path.read_text())

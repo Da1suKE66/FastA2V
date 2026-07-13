@@ -16,6 +16,7 @@ from ovi.utils.utils import get_arguments
 from ovi.distributed_comms.util import get_world_size, get_local_rank, get_global_rank
 from ovi.distributed_comms.parallel_states import initialize_sequence_parallel_state, get_sequence_parallel_state, nccl_info
 from ovi.ovi_fusion_engine import OviFusionEngine
+from ovi.eval_protocol import prompt_sequence_sha256
 from ovi.gpu_process_monitor import (
     GpuProcessMonitor,
     validate_pre_run_gpu_report,
@@ -61,7 +62,7 @@ def _write_json(path, payload):
         handle.write("\n")
 
 
-def _collect_environment(config, config_file, engine_load_seconds, prompt_count):
+def _collect_environment(config, config_file, engine_load_seconds, text_prompts):
     driver_version = _command_output([
         "nvidia-smi",
         "--query-gpu=driver_version",
@@ -97,6 +98,7 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
 
     measurement_runs = int(config.get("measurement_runs", 1))
     each_example_n_times = int(config.get("each_example_n_times", 1))
+    prompt_count = len(text_prompts)
     return {
         "config_file": os.path.abspath(config_file),
         "git_commit": git_commit,
@@ -144,6 +146,13 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
         "sparge_smooth_k": bool(config.get("sparge_smooth_k", True)),
         "sample_steps": int(config.get("sample_steps", 50)),
         "slg_layer": int(config.get("slg_layer", 11)),
+        "prompts_sha256": prompt_sequence_sha256(text_prompts),
+        "video_negative_prompt": str(
+            config.get("video_negative_prompt", "")
+        ),
+        "audio_negative_prompt": str(
+            config.get("audio_negative_prompt", "")
+        ),
         "use_cfg_cache": bool(config.get("use_cfg_cache", False)),
         "cfg_cache_start_step": int(config.get("cfg_cache_start_step", 10)),
         "cfg_cache_end_step": int(config.get("cfg_cache_end_step", 39)),
@@ -169,6 +178,7 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
             config.get("block_cache_max_consecutive_reuses", 1)
         ),
         "debug_forward": bool(config.get("debug_forward", False)),
+        "debug_forward_step": int(config.get("debug_forward_step", 0)),
         "run_kind": config.get("run_kind", "unspecified"),
         "benchmark_eligible": bool(config.get("benchmark_eligible", False)),
         "gpu_process_monitor_interval_seconds": float(
@@ -334,7 +344,7 @@ def main(config, args):
                 config,
                 args.config_file,
                 engine_load_seconds,
-                prompt_count=len(text_prompts),
+                text_prompts=text_prompts,
             ),
             "run_config_sha256": _sha256(run_config_path),
         },
