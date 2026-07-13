@@ -19,6 +19,9 @@ fi
 export FASTA2V_RUN_DIR="${RUN_DIR}"
 cd "${REPO_ROOT}"
 
+"${FASTA2V_OVI_ENV}/bin/python" scripts/check_pre_run_gpu.py \
+  --device-index 0 \
+  --output "${RUN_DIR}/pre_run_gpu.json"
 cp "${FASTA2V_CACHE_ROOT}/ovi-environment.freeze.txt" "${RUN_DIR}/environment.freeze.txt"
 cp "${FASTA2V_CACHE_ROOT}/checkpoint_manifest.json" "${RUN_DIR}/checkpoint_manifest.json"
 "${FASTA2V_OVI_ENV}/bin/python" scripts/preflight_ovi.py --output "${RUN_DIR}/preflight.json"

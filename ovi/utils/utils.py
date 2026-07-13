@@ -28,12 +28,9 @@ def get_arguments(args=argv[1:]):
     # no cuda mode is not supported
     args.no_cuda = False
 
-    # Optionally bind this process to a specific CUDA device
-    if torch.cuda.is_available() and getattr(args, "local_rank", -1) >= 0:
-        try:
-            torch.cuda.set_device(args.local_rank % torch.cuda.device_count())
-        except Exception:
-            pass
+    # Device selection is intentionally owned by inference.main, after the
+    # run script's physical-GPU idle evidence has been validated.  Argument
+    # parsing must not initialize CUDA as a hidden side effect.
 
     return args
 

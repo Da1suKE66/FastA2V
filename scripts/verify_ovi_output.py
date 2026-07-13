@@ -111,6 +111,171 @@ def as_int(value):
         return None
 
 
+def validate_pre_run_gpu(report, environment, errors):
+    """Validate idle evidence and return its physical-GPU identity tuple."""
+    if not isinstance(report, dict):
+        errors.append("pre_run_gpu.json must be a JSON object")
+        return None
+    if report.get("schema_version") != 1:
+        errors.append("unsupported pre-run GPU evidence schema")
+    if report.get("check_type") != "pre_run_idle":
+        errors.append("pre-run GPU evidence has the wrong check type")
+    if report.get("physical_device_index") != 0 or report.get("device_index") != 0:
+        errors.append("pre-run GPU evidence must target physical GPU index 0")
+    device_uuid = report.get("device_uuid")
+    device_name = report.get("device_name")
+    if not isinstance(device_uuid, str) or not device_uuid:
+        errors.append("pre-run GPU UUID is missing")
+    if not isinstance(device_name, str) or not device_name:
+        errors.append("pre-run GPU name is missing")
+    if report.get("available") is not True:
+        errors.append("pre-run GPU query was unavailable")
+    if report.get("process_count") != 0 or report.get("processes") != []:
+        errors.append("pre-run GPU was not idle")
+    if report.get("idle") is not True or report.get("valid_for_run") is not True:
+        errors.append("pre-run GPU evidence was not approved for this run")
+    if report.get("error") is not None or report.get("errors") != []:
+        errors.append("pre-run GPU evidence contains errors")
+
+    expected_environment = {
+        "gpu_physical_index": 0,
+        "gpu_uuid": device_uuid,
+        "gpu_name": device_name,
+        "gpu": device_name,
+        "pre_run_gpu_valid": True,
+        "cuda_visible_devices": report.get("cuda_visible_devices"),
+    }
+    for field, expected in expected_environment.items():
+        if environment.get(field) != expected:
+            errors.append(
+                f"environment {field}={environment.get(field)!r} does not "
+                f"match pre-run GPU evidence {expected!r}"
+            )
+    if not device_uuid or not device_name:
+        return None
+    return (0, device_uuid, device_name)
+
+
+def validate_gpu_monitor(monitor, expected_identity, candidate, context, errors):
+    """Cross-bind every nvidia-smi sample to pre-run physical GPU 0."""
+    if not isinstance(monitor, dict):
+        errors.append(f"{context}: gpu_process_monitor must be a JSON object")
+        return
+    if expected_identity is not None:
+        expected_index, expected_uuid, expected_name = expected_identity
+        summary_identity = (
+            monitor.get("device_index"),
+            monitor.get("device_uuid"),
+            monitor.get("device_name"),
+        )
+        if summary_identity != expected_identity:
+            errors.append(
+                f"{context}: monitor GPU identity {summary_identity!r} does not "
+                f"match pre-run identity {expected_identity!r}"
+            )
+    else:
+        expected_index = expected_uuid = expected_name = None
+
+    samples = monitor.get("samples")
+    if not isinstance(samples, list) or not samples:
+        errors.append(f"{context}: monitor must retain every raw sample")
+        return
+    if monitor.get("sample_count") != len(samples):
+        errors.append(f"{context}: monitor sample_count does not match samples")
+
+    counts = []
+    distinct_pids = set()
+    for sample_index, sample in enumerate(samples):
+        sample_context = f"{context}.samples[{sample_index}]"
+        if not isinstance(sample, dict):
+            errors.append(f"{sample_context}: sample must be a JSON object")
+            continue
+        if sample.get("available") is not True or sample.get("error") is not None:
+            errors.append(f"{sample_context}: nvidia-smi query was unavailable")
+        if expected_identity is not None:
+            sample_identity = (
+                sample.get("device_index"),
+                sample.get("device_uuid"),
+                sample.get("device_name"),
+            )
+            if sample_identity != expected_identity:
+                errors.append(
+                    f"{sample_context}: GPU identity {sample_identity!r} does "
+                    f"not match pre-run identity {expected_identity!r}"
+                )
+        count = sample.get("process_count")
+        processes = sample.get("processes")
+        if not isinstance(count, int) or count < 0:
+            errors.append(f"{sample_context}: invalid process_count {count!r}")
+            continue
+        if not isinstance(processes, list) or len(processes) != count:
+            errors.append(
+                f"{sample_context}: process list does not match process_count"
+            )
+            continue
+        counts.append(count)
+        for process in processes:
+            pid = process.get("host_pid") if isinstance(process, dict) else None
+            used_memory = (
+                process.get("used_memory_mib")
+                if isinstance(process, dict)
+                else None
+            )
+            if not isinstance(pid, int) or pid <= 0:
+                errors.append(f"{sample_context}: invalid host PID evidence")
+            else:
+                distinct_pids.add(pid)
+            if not isinstance(used_memory, int) or used_memory < 0:
+                errors.append(f"{sample_context}: invalid used-memory evidence")
+
+    if len(counts) != len(samples):
+        errors.append(f"{context}: one or more monitor samples are incomplete")
+        return
+    if monitor.get("available_sample_count") != len(samples):
+        errors.append(f"{context}: not every monitor sample was available")
+    if monitor.get("unavailable_sample_count") != 0:
+        errors.append(f"{context}: unavailable monitor samples were recorded")
+    if monitor.get("identity_consistent") is not True:
+        errors.append(f"{context}: monitor GPU identity was not consistent")
+    if monitor.get("min_process_count") != min(counts):
+        errors.append(f"{context}: min_process_count disagrees with raw samples")
+    if monitor.get("max_process_count") != max(counts):
+        errors.append(f"{context}: max_process_count disagrees with raw samples")
+    if monitor.get("distinct_host_pids") != sorted(distinct_pids):
+        errors.append(f"{context}: distinct_host_pids disagrees with raw samples")
+    if monitor.get("collection_errors") != []:
+        errors.append(f"{context}: monitor recorded collection errors")
+
+    exact_singleton = all(count == 1 for count in counts)
+    single_distinct_pid = exact_singleton and len(distinct_pids) == 1
+    contention_detected = any(count > 1 for count in counts)
+    no_process_detected = any(count == 0 for count in counts)
+    if monitor.get("exact_singleton_process_per_sample") is not exact_singleton:
+        errors.append(f"{context}: exact-singleton summary disagrees with samples")
+    if monitor.get("single_distinct_host_pid") is not single_distinct_pid:
+        errors.append(f"{context}: single-distinct-PID summary disagrees with samples")
+    if monitor.get("contention_detected") is not contention_detected:
+        errors.append(f"{context}: contention summary disagrees with samples")
+    if monitor.get("no_process_detected") is not no_process_detected:
+        errors.append(f"{context}: no-process summary disagrees with samples")
+    if candidate:
+        if len(samples) < 2:
+            errors.append(
+                f"{context}: benchmark monitor requires at least entry and exit samples"
+            )
+        if not exact_singleton:
+            errors.append(
+                f"{context}: benchmark samples must each contain exactly one "
+                "compute process"
+            )
+        if not single_distinct_pid:
+            errors.append(
+                f"{context}: benchmark generation changed compute-process PID"
+            )
+        if monitor.get("valid_for_benchmark") is not True:
+            errors.append(f"{context}: monitor is not valid for benchmark use")
+
+
 def validate_sparge_dispatcher(
     dispatcher,
     errors,
@@ -470,6 +635,7 @@ def verify_run_protocol(run_dir, reports):
     required_files = [
         "environment.json",
         "run_config.yaml",
+        "pre_run_gpu.json",
         "preflight.json",
         "environment.freeze.txt",
         "checkpoint_manifest.json",
@@ -479,6 +645,16 @@ def verify_run_protocol(run_dir, reports):
     for filename in required_files:
         if not (run_dir / filename).is_file():
             errors.append(f"missing run evidence file: {filename}")
+
+    pre_run_gpu_path = run_dir / "pre_run_gpu.json"
+    try:
+        pre_run_gpu = json.loads(pre_run_gpu_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        pre_run_gpu = None
+        errors.append(f"invalid pre_run_gpu.json: {exc}")
+    expected_gpu_identity = validate_pre_run_gpu(
+        pre_run_gpu, environment, errors
+    )
 
     candidate = bool(environment.get("benchmark_eligible"))
     expected_measurements = int(environment.get("expected_measurement_records", -1))
@@ -560,17 +736,15 @@ def verify_run_protocol(run_dir, reports):
                         for error in fixed_block_cache_metric_errors(item)
                     )
 
-    if candidate:
-        for item in [*warmups, *timings]:
-            monitor = item.get("gpu_process_monitor")
-            if not isinstance(monitor, dict) or monitor.get(
-                "valid_for_benchmark"
-            ) is not True:
-                errors.append(
-                    "benchmark run has missing, unavailable, or contaminated "
-                    "GPU process monitoring evidence"
-                )
-                break
+    for record_type, records in (("warmup", warmups), ("measurement", timings)):
+        for record_index, item in enumerate(records):
+            validate_gpu_monitor(
+                item.get("gpu_process_monitor"),
+                expected_gpu_identity,
+                candidate,
+                f"{record_type}[{record_index}]",
+                errors,
+            )
 
     artifact_hashes = {report["sha256"] for report in reports}
     timing_hashes = {item.get("output_sha256") for item in timings}
@@ -664,6 +838,20 @@ def verify_run_protocol(run_dir, reports):
                 )
 
     evidence_hashes = environment.get("evidence_file_sha256", {})
+    if not isinstance(evidence_hashes, dict):
+        errors.append("environment evidence_file_sha256 must be a JSON object")
+        evidence_hashes = {}
+    required_hashed_evidence = {
+        "pre_run_gpu.json",
+        "preflight.json",
+        "environment.freeze.txt",
+        "checkpoint_manifest.json",
+    }
+    if attention_method == "sparge":
+        required_hashed_evidence.add("spargeattn-install.json")
+    missing_hashes = sorted(required_hashed_evidence - set(evidence_hashes))
+    if missing_hashes:
+        errors.append(f"environment is missing evidence hashes: {missing_hashes}")
     for filename, expected_hash in evidence_hashes.items():
         path = run_dir / filename
         actual_hash = sha256(path) if path.is_file() else None
@@ -671,6 +859,11 @@ def verify_run_protocol(run_dir, reports):
             errors.append(
                 f"evidence hash mismatch for {filename}: expected={expected_hash} actual={actual_hash}"
             )
+    actual_pre_run_hash = (
+        sha256(pre_run_gpu_path) if pre_run_gpu_path.is_file() else None
+    )
+    if environment.get("pre_run_gpu_sha256") != actual_pre_run_hash:
+        errors.append("pre_run_gpu.json SHA256 does not match environment.json")
     run_config_path = run_dir / "run_config.yaml"
     if run_config_path.is_file() and environment.get("run_config_sha256") != sha256(run_config_path):
         errors.append("run_config.yaml SHA256 does not match environment.json")

@@ -16,7 +16,10 @@ from ovi.utils.utils import get_arguments
 from ovi.distributed_comms.util import get_world_size, get_local_rank, get_global_rank
 from ovi.distributed_comms.parallel_states import initialize_sequence_parallel_state, get_sequence_parallel_state, nccl_info
 from ovi.ovi_fusion_engine import OviFusionEngine
-from ovi.gpu_process_monitor import GpuProcessMonitor
+from ovi.gpu_process_monitor import (
+    GpuProcessMonitor,
+    validate_pre_run_gpu_report,
+)
 
 
 def _command_output(command):
@@ -61,11 +64,18 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
     git_status = _command_output(["git", "status", "--porcelain"])
     evidence_files = {}
     output_dir = os.path.abspath(config.get("output_dir"))
+    pre_run_gpu_path = os.path.join(output_dir, "pre_run_gpu.json")
+    pre_run_gpu = {}
+    if os.path.isfile(pre_run_gpu_path):
+        with open(pre_run_gpu_path, "r", encoding="utf-8") as handle:
+            pre_run_gpu = json.load(handle)
     evidence_filenames = [
         "preflight.json",
         "environment.freeze.txt",
         "checkpoint_manifest.json",
     ]
+    if config.get("run_kind", "unspecified") != "unspecified":
+        evidence_filenames.insert(0, "pre_run_gpu.json")
     if config.get("attention_method", "dense") == "sparge":
         evidence_filenames.append("spargeattn-install.json")
     for filename in evidence_filenames:
@@ -87,6 +97,14 @@ def _collect_environment(config, config_file, engine_load_seconds, prompt_count)
         "transformers": _package_version("transformers"),
         "gpu": torch.cuda.get_device_name(0),
         "gpu_count": torch.cuda.device_count(),
+        "gpu_physical_index": pre_run_gpu.get("device_index"),
+        "gpu_uuid": pre_run_gpu.get("device_uuid"),
+        "gpu_name": pre_run_gpu.get("device_name"),
+        "pre_run_gpu_sha256": (
+            _sha256(pre_run_gpu_path) if os.path.isfile(pre_run_gpu_path) else None
+        ),
+        "pre_run_gpu_valid": pre_run_gpu.get("valid_for_run") is True,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "driver_version": driver_version.splitlines()[0] if driver_version else None,
         "engine_load_seconds": engine_load_seconds,
         "model_name": config.get("model_name"),
@@ -159,6 +177,7 @@ def _prepare_output_dir(config):
         allowed_pre_run_files = {
             "checkpoint_manifest.json",
             "environment.freeze.txt",
+            "pre_run_gpu.json",
             "preflight.json",
             "stdout.log",
         }
@@ -195,9 +214,31 @@ def main(config, args):
     world_size = get_world_size()
     global_rank = get_global_rank()
     local_rank = get_local_rank()
+    sp_size = config.get("sp_size", 1)
+    run_kind = str(config.get("run_kind", "unspecified"))
+    if run_kind != "unspecified":
+        if (world_size, global_rank, local_rank, int(sp_size)) != (1, 0, 0, 1):
+            raise RuntimeError(
+                "formal FastA2V GPU evidence currently supports exactly one "
+                "process on physical GPU 0 with sp_size=1"
+            )
+        pre_run_gpu_path = os.path.join(
+            os.path.abspath(config.get("output_dir")), "pre_run_gpu.json"
+        )
+        try:
+            with open(pre_run_gpu_path, "r", encoding="utf-8") as handle:
+                pre_run_gpu = json.load(handle)
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"missing or invalid pre-run GPU evidence: {pre_run_gpu_path}"
+            ) from error
+        pre_run_errors = validate_pre_run_gpu_report(pre_run_gpu)
+        if pre_run_errors:
+            raise RuntimeError(
+                "pre-run GPU evidence is not valid: " + "; ".join(pre_run_errors)
+            )
     device = local_rank
     torch.cuda.set_device(local_rank)
-    sp_size = config.get("sp_size", 1)
     assert sp_size <= world_size and world_size % sp_size == 0, "sp_size must be less than or equal to world_size and world_size must be divisible by sp_size."
 
     _init_logging(global_rank)
@@ -311,7 +352,9 @@ def main(config, args):
 
     def run_one(text_prompt, image_path, sample_seed):
         monitor = GpuProcessMonitor(
-            device_index=device,
+            # nvidia-smi indexes the physical GPU namespace; formal runs above
+            # prove that logical CUDA 0 maps to physical GPU 0.
+            device_index=0,
             interval_seconds=gpu_monitor_interval,
         )
         try:
