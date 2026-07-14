@@ -1364,6 +1364,7 @@ class QualityProtocolTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("trusted_environment_packages", source)
+        self.assertIn("umask 027", source)
         self.assertIn("from pip._vendor.packaging.utils", source)
         self.assertIn('--no-index \\\n', source)
         self.assertIn('--find-links "${WHEELHOUSE}"', source)

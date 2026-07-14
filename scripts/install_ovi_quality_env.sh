@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 027
 
 # One-shot CPU-only quality environment bootstrap.  The generated hashes are
 # candidates, not trust roots: an independent reviewer must promote the full

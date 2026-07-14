@@ -57,7 +57,9 @@ dependencies additionally bind the exact import module path and source-file
 hash. It separately records the LPIPS AlexNet linear calibration weight and
 torchvision AlexNet backbone with absolute path, byte count, full SHA256, and
 source. Installation uses wheels only, disables bytecode compilation, and
-rejects symlinks and any distribution not present in the resolver reports.
+rejects symlinks and any distribution not present in the resolver reports. It
+sets `umask 027` before creating the fixed environment so every directory is
+deterministically owner/group-readable but never world-accessible.
 
 Every pip resolver invocation combines `--isolated` with
 `PIP_CONFIG_FILE=/dev/null`: the first disables ambient `PIP_*` options and
