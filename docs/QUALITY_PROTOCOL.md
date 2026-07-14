@@ -59,6 +59,17 @@ torchvision AlexNet backbone with absolute path, byte count, full SHA256, and
 source. Installation uses wheels only, disables bytecode compilation, and
 rejects symlinks and any distribution not present in the resolver reports.
 
+The canonical CPU resolver entry remains
+`https://download.pytorch.org/whl/cpu`, while PyTorch currently serves wheel
+bytes from either `download.pytorch.org` or its official
+`download-r2.pytorch.org` CDN host. Both hosts map to that one canonical
+`source_index`. Dependency URLs are accepted only as HTTPS on the default port
+or explicit port 443, without credentials, query, or fragment, and below the
+exact `/whl/cpu/` path boundary. PyPI wheels remain restricted to the exact
+`files.pythonhosted.org` host below `/packages/` under the canonical
+`https://pypi.org/simple` source index. Lookalike hosts and path prefixes are
+rejected before any retained-wheel download.
+
 The first installer run is deliberately a bootstrap, not a trust decision. It
 also emits:
 

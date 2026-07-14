@@ -21,6 +21,7 @@ ALEXNET_URL="https://download.pytorch.org/models/alexnet-owt-7be5be79.pth"
 ALEXNET_PATH="${TORCH_HOME}/hub/checkpoints/alexnet-owt-7be5be79.pth"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROTOCOL_CONFIG="${SCRIPT_DIR}/../configs/quality_protocol.json"
+QUALITY_URL_POLICY="${SCRIPT_DIR}/quality_archive_urls.py"
 QUALITY_INSTALL_MODE="${QUALITY_INSTALL_MODE:-bootstrap}"
 PINNED_PIP_REPORT="${EVAL_CHECKPOINT_ROOT}/quality-pinned-pip-report.json"
 PINNED_REQUIREMENTS="${EVAL_CHECKPOINT_ROOT}/quality-pinned-requirements.txt"
@@ -45,6 +46,7 @@ command -v "${PYTHON_BOOTSTRAP}" >/dev/null
 command -v ffmpeg >/dev/null
 command -v ffprobe >/dev/null
 [[ -f "${PROTOCOL_CONFIG}" ]]
+[[ -f "${QUALITY_URL_POLICY}" ]]
 BOOTSTRAP_PYTHON_MINOR="$("${PYTHON_BOOTSTRAP}" -I -S -B -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
 if [[ "${BOOTSTRAP_PYTHON_MINOR}" != "3.11" ]]; then
   echo "PYTHON_BOOTSTRAP must be Python 3.11, found ${BOOTSTRAP_PYTHON_MINOR}" >&2
@@ -131,6 +133,7 @@ if [[ "${QUALITY_INSTALL_MODE}" == "bootstrap" ]]; then
     "lpips==0.1.4"
 else
   EVAL_PROTOCOL_CONFIG="${PROTOCOL_CONFIG}" \
+  EVAL_QUALITY_URL_POLICY="${QUALITY_URL_POLICY}" \
   EVAL_WHEELHOUSE="${WHEELHOUSE}" \
   EVAL_PINNED_REQUIREMENTS="${PINNED_REQUIREMENTS}" \
   "${PYTHON_BOOTSTRAP}" -I -S -B - <<'PY'
@@ -142,6 +145,16 @@ from urllib.parse import unquote, urlparse
 import urllib.request
 
 
+def load_url_policy(path):
+    path = Path(path).resolve()
+    namespace = {
+        "__name__": "_fasta2v_quality_archive_urls",
+        "__file__": str(path),
+    }
+    exec(compile(path.read_bytes(), str(path), "exec"), namespace)
+    return namespace
+
+
 def sha256(path):
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -151,6 +164,7 @@ def sha256(path):
 
 
 protocol = json.loads(Path(os.environ["EVAL_PROTOCOL_CONFIG"]).read_text(encoding="utf-8"))["lpips"]
+url_policy = load_url_policy(os.environ["EVAL_QUALITY_URL_POLICY"])
 packages = protocol.get("trusted_environment_packages")
 if protocol.get("trusted_lock_status") != "pinned" or not isinstance(packages, list):
     raise SystemExit("checked-in full dependency lock is not pinned")
@@ -160,6 +174,16 @@ requirements = []
 for package in packages:
     url = package["archive_url"]
     expected_hash = package["archive_sha256"]
+    try:
+        url_policy["validate_dependency_archive_url"](
+            url,
+            expected_source_index=package["source_index"],
+        )
+    except ValueError as exc:
+        raise SystemExit(
+            f"pinned dependency URL violates the fixed source policy: "
+            f"{package['distribution']}: {exc}"
+        ) from exc
     filename = Path(unquote(urlparse(url).path)).name
     if not filename.endswith(".whl"):
         raise SystemExit(f"pinned dependency is not a wheel: {filename}")
@@ -234,6 +258,7 @@ EVAL_WHEELHOUSE="${WHEELHOUSE}" \
 EVAL_ALEXNET_PATH="${ALEXNET_PATH}" \
 EVAL_INSTALL_MODE="${QUALITY_INSTALL_MODE}" \
 EVAL_PROTOCOL_CONFIG="${PROTOCOL_CONFIG}" \
+EVAL_QUALITY_URL_POLICY="${QUALITY_URL_POLICY}" \
 "${EVAL_ENV}/bin/python" -I -B - <<'PY'
 import hashlib
 import importlib
@@ -271,6 +296,16 @@ def write_exclusive_json(path, payload):
         os.fsync(handle.fileno())
 
 
+def load_url_policy(path):
+    path = Path(path).resolve()
+    namespace = {
+        "__name__": "_fasta2v_quality_archive_urls",
+        "__file__": str(path),
+    }
+    exec(compile(path.read_bytes(), str(path), "exec"), namespace)
+    return namespace
+
+
 environment_root = str(Path(os.environ["EVAL_ENV"]).resolve())
 site_packages = (
     Path(environment_root) / "lib" / "python3.11" / "site-packages"
@@ -283,6 +318,7 @@ install_mode = os.environ["EVAL_INSTALL_MODE"]
 protocol_config = json.loads(
     Path(os.environ["EVAL_PROTOCOL_CONFIG"]).read_text(encoding="utf-8")
 )["lpips"]
+url_policy = load_url_policy(os.environ["EVAL_QUALITY_URL_POLICY"])
 if install_mode == "bootstrap":
     wheelhouse.mkdir(parents=True, exist_ok=False)
 elif not wheelhouse.is_dir():
@@ -309,6 +345,16 @@ archive_receipts = {}
 if install_mode == "pinned":
     for locked in protocol_config["trusted_environment_packages"]:
         distribution = locked["distribution"]
+        try:
+            url_policy["validate_dependency_archive_url"](
+                locked["archive_url"],
+                expected_source_index=locked["source_index"],
+            )
+        except ValueError as exc:
+            raise SystemExit(
+                f"pinned dependency URL violates the fixed source policy: "
+                f"{distribution}: {exc}"
+            ) from exc
         filename = Path(unquote(urlparse(locked["archive_url"]).path)).name
         wheel_path = wheelhouse / filename
         if not wheel_path.is_file() or sha256(wheel_path) != locked["archive_sha256"]:
@@ -336,12 +382,15 @@ else:
                 raise SystemExit(f"incomplete pip report dependency in {report_path}")
             if re.fullmatch(r"[0-9a-f]{64}", str(archive_hash)) is None:
                 raise SystemExit(f"pip report omitted full SHA256 for {distribution}")
-            if archive_url.startswith("https://download.pytorch.org/"):
-                source_index = "https://download.pytorch.org/whl/cpu"
-            elif archive_url.startswith("https://files.pythonhosted.org/"):
-                source_index = "https://pypi.org/simple"
-            else:
-                raise SystemExit(f"unapproved archive source for {distribution}: {archive_url}")
+            try:
+                source_index = url_policy[
+                    "classify_dependency_archive_url"
+                ](archive_url)
+            except ValueError as exc:
+                raise SystemExit(
+                    f"unapproved archive source for {distribution}: "
+                    f"{archive_url}: {exc}"
+                ) from exc
             if distribution in archive_receipts:
                 raise SystemExit(f"dependency appeared in multiple pip reports: {distribution}")
             filename = Path(unquote(urlparse(archive_url).path)).name

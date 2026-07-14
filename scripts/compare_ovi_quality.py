@@ -63,6 +63,11 @@ def _load_fixed_module(module_name: str, path: Path) -> Any:
 
 
 RUN_VALIDATOR_PATH = SCRIPT_DIR / "build_ovi_eval_csv.py"
+ARCHIVE_URL_POLICY_PATH = SCRIPT_DIR / "quality_archive_urls.py"
+_ARCHIVE_URL_POLICY = _load_fixed_module(
+    "_fasta2v_quality_archive_urls",
+    ARCHIVE_URL_POLICY_PATH,
+)
 _FIXED_RUN_VALIDATOR: Any | None = None
 
 
@@ -430,17 +435,15 @@ def _dependency_lock_records(
         )
         archive_url = package.get("archive_url")
         _require(isinstance(archive_url, str), context, f"{distribution} archive URL is missing")
-        if source_index == "https://download.pytorch.org/whl/cpu":
-            _require(
-                archive_url.startswith("https://download.pytorch.org/"),
-                context,
-                f"{distribution} archive URL differs from the PyTorch trust source",
+        try:
+            _ARCHIVE_URL_POLICY.validate_dependency_archive_url(
+                archive_url,
+                expected_source_index=source_index,
             )
-        else:
-            _require(
-                archive_url.startswith("https://files.pythonhosted.org/"),
+        except ValueError as exc:
+            _fail(
                 context,
-                f"{distribution} archive URL differs from the PyPI trust source",
+                f"{distribution} archive URL violates the fixed source policy: {exc}",
             )
         records.append(
             {
@@ -1797,6 +1800,7 @@ def capture_evaluator_source_receipt(
         "comparison_script": Path(__file__).resolve(),
         "compare_media_script": (REPO_ROOT / "scripts" / "compare_media.py").resolve(),
         "run_validator_script": RUN_VALIDATOR_PATH.resolve(),
+        "archive_url_policy": ARCHIVE_URL_POLICY_PATH.resolve(),
         "quality_protocol": protocol_path,
         "evaluation_matrix": matrix_path,
     }
@@ -1852,6 +1856,7 @@ def validate_evaluator_source_receipt(receipt: Mapping[str, Any]) -> None:
             "comparison_script",
             "compare_media_script",
             "run_validator_script",
+            "archive_url_policy",
             "quality_protocol",
             "evaluation_matrix",
         },
@@ -1862,6 +1867,7 @@ def validate_evaluator_source_receipt(receipt: Mapping[str, Any]) -> None:
         "comparison_script": Path(__file__).resolve(),
         "compare_media_script": (REPO_ROOT / "scripts" / "compare_media.py").resolve(),
         "run_validator_script": RUN_VALIDATOR_PATH.resolve(),
+        "archive_url_policy": ARCHIVE_URL_POLICY_PATH.resolve(),
         "quality_protocol": DEFAULT_PROTOCOL.resolve(),
         "evaluation_matrix": DEFAULT_MATRIX.resolve(),
     }

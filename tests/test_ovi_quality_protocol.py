@@ -251,6 +251,7 @@ class QualityProtocolTests(unittest.TestCase):
             "comparison_script": REPO_ROOT / "scripts" / "compare_ovi_quality.py",
             "compare_media_script": REPO_ROOT / "scripts" / "compare_media.py",
             "run_validator_script": REPO_ROOT / "scripts" / "build_ovi_eval_csv.py",
+            "archive_url_policy": REPO_ROOT / "scripts" / "quality_archive_urls.py",
             "quality_protocol": REPO_ROOT / "configs" / "quality_protocol.json",
             "evaluation_matrix": REPO_ROOT / "configs" / "ovi_eval_matrix.json",
         }
@@ -314,7 +315,7 @@ class QualityProtocolTests(unittest.TestCase):
         receipt_path = self.root / f"receipt-{len(list(self.root.glob('receipt-*')))}.json"
         receipt_package = {
             **package,
-            "archive_url": "https://files.pythonhosted.org/fake.whl",
+            "archive_url": "https://files.pythonhosted.org/packages/fake.whl",
             "archive_sha256": digest(archive),
             "archive_path": str(archive),
             "module_sha256": digest(module_file),
@@ -432,6 +433,101 @@ class QualityProtocolTests(unittest.TestCase):
         write_json(path, mutated)
         with self.assertRaisesRegex(QUALITY.QualityError, "weight path/source"):
             QUALITY.load_quality_protocol(path)
+
+    def test_dependency_lock_accepts_official_pytorch_r2_cdn(self):
+        archive_url = (
+            "https://download-r2.pytorch.org/whl/cpu/"
+            "torch-2.6.0%2Bcpu-cp311-cp311-linux_x86_64.whl"
+        )
+        records = QUALITY._dependency_lock_records(
+            [
+                {
+                    "distribution": "torch",
+                    "version": "2.6.0+cpu",
+                    "source_index": "https://download.pytorch.org/whl/cpu",
+                    "archive_url": archive_url,
+                    "archive_sha256": "a" * 64,
+                }
+            ],
+            context="test dependency URL policy",
+        )
+        self.assertEqual(records[0]["archive_url"], archive_url)
+        self.assertEqual(
+            records[0]["source_index"],
+            "https://download.pytorch.org/whl/cpu",
+        )
+
+    def test_dependency_lock_rejects_noncanonical_archive_urls(self):
+        invalid_urls = {
+            "lookalike host": (
+                "https://download-r2.pytorch.org.evil.example/whl/cpu/torch.whl"
+            ),
+            "userinfo": (
+                "https://user@download-r2.pytorch.org/whl/cpu/torch.whl"
+            ),
+            "non-443 port": (
+                "https://download-r2.pytorch.org:444/whl/cpu/torch.whl"
+            ),
+            "non-https scheme": (
+                "http://download-r2.pytorch.org/whl/cpu/torch.whl"
+            ),
+            "query": (
+                "https://download-r2.pytorch.org/whl/cpu/torch.whl?mirror=1"
+            ),
+            "fragment": (
+                "https://download-r2.pytorch.org/whl/cpu/torch.whl#sha256=x"
+            ),
+            "path lookalike": (
+                "https://download-r2.pytorch.org/whl/cpu.evil/torch.whl"
+            ),
+        }
+        for label, archive_url in invalid_urls.items():
+            with self.subTest(label=label), self.assertRaisesRegex(
+                QUALITY.QualityError,
+                "archive URL violates the fixed source policy",
+            ):
+                QUALITY._dependency_lock_records(
+                    [
+                        {
+                            "distribution": "torch",
+                            "version": "2.6.0+cpu",
+                            "source_index": (
+                                "https://download.pytorch.org/whl/cpu"
+                            ),
+                            "archive_url": archive_url,
+                            "archive_sha256": "a" * 64,
+                        }
+                    ],
+                    context="test dependency URL policy",
+                )
+
+    def test_dependency_lock_keeps_exact_pythonhosted_rule(self):
+        accepted = {
+            "distribution": "numpy",
+            "version": "1.26.4",
+            "source_index": "https://pypi.org/simple",
+            "archive_url": (
+                "https://files.pythonhosted.org:443/packages/aa/bb/numpy.whl"
+            ),
+            "archive_sha256": "b" * 64,
+        }
+        records = QUALITY._dependency_lock_records(
+            [accepted],
+            context="test PyPI dependency URL policy",
+        )
+        self.assertEqual(records[0]["source_index"], "https://pypi.org/simple")
+        for archive_url in (
+            "https://files.pythonhosted.org.evil.example/packages/numpy.whl",
+            "https://user@files.pythonhosted.org/packages/numpy.whl",
+            "https://files.pythonhosted.org/simple/numpy.whl",
+        ):
+            with self.subTest(archive_url=archive_url), self.assertRaises(
+                QUALITY.QualityError
+            ):
+                QUALITY._dependency_lock_records(
+                    [{**accepted, "archive_url": archive_url}],
+                    context="test PyPI dependency URL policy",
+                )
 
     def test_unpinned_bootstrap_hashes_fail_before_receipt_or_score(self):
         with self.assertRaisesRegex(QUALITY.QualityError, "not pinned"):
@@ -1058,7 +1154,7 @@ class QualityProtocolTests(unittest.TestCase):
         protocol, receipt_path, _weight, kwargs = self.make_dependency_fixture()
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
         receipt["packages"][0]["archive_url"] = (
-            "https://files.pythonhosted.org/tampered/fake.whl"
+            "https://files.pythonhosted.org/packages/tampered/fake.whl"
         )
         receipt["environment_lock_sha256"] = (
             QUALITY.dependency_environment_lock_sha256(receipt["packages"])
@@ -1204,6 +1300,13 @@ class QualityProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(QUALITY.QualityError, "run_validator_script"):
             QUALITY.validate_evaluator_source_receipt(receipt)
 
+    def test_archive_url_policy_source_is_hash_bound(self):
+        receipt = self.evaluator_source_receipt()
+        QUALITY.validate_evaluator_source_receipt(receipt)
+        receipt["files"]["archive_url_policy"]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(QUALITY.QualityError, "archive_url_policy"):
+            QUALITY.validate_evaluator_source_receipt(receipt)
+
     def test_manual_validation_rejects_tampered_median_metrics(self):
         report = self.build()
         median_path = QUALITY.write_quality_sidecars(
@@ -1227,6 +1330,13 @@ class QualityProtocolTests(unittest.TestCase):
         self.assertIn('--no-index \\\n', source)
         self.assertIn('--find-links "${WHEELHOUSE}"', source)
         self.assertIn("--no-compile", source)
+        self.assertIn('EVAL_QUALITY_URL_POLICY="${QUALITY_URL_POLICY}"', source)
+        self.assertIn('"classify_dependency_archive_url"', source)
+        self.assertIn('url_policy["validate_dependency_archive_url"]', source)
+        self.assertNotIn(
+            'archive_url.startswith("https://download.pytorch.org/")',
+            source,
+        )
 
     def test_missing_weight_fails_before_any_lpips_score_exists(self):
         protocol, _receipt_path, _weight, kwargs = self.make_dependency_fixture(
