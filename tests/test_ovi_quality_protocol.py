@@ -418,8 +418,23 @@ class QualityProtocolTests(unittest.TestCase):
         with template.open("r", encoding="utf-8", newline="") as handle:
             rows = list(csv.DictReader(handle))
         self.assertEqual(rows, [])
-        self.assertIsNone(
-            self.protocol["lpips"]["trusted_environment_packages"]
+        lpips = self.protocol["lpips"]
+        self.assertEqual(lpips["trusted_lock_status"], "pinned")
+        self.assertRegex(
+            lpips["trusted_environment_lock_sha256"], r"^[0-9a-f]{64}$"
+        )
+        self.assertEqual(len(lpips["trusted_environment_packages"]), 17)
+        self.assertTrue(
+            all(
+                re.fullmatch(r"[0-9a-f]{64}", package["trusted_archive_sha256"])
+                for package in lpips["packages"]
+            )
+        )
+        self.assertTrue(
+            all(
+                re.fullmatch(r"[0-9a-f]{64}", weight["trusted_sha256"])
+                for weight in lpips["weights"]
+            )
         )
 
     def test_protocol_rejects_dependency_version_and_source_mutations(self):
@@ -539,9 +554,17 @@ class QualityProtocolTests(unittest.TestCase):
                 )
 
     def test_unpinned_bootstrap_hashes_fail_before_receipt_or_score(self):
+        unpinned = copy.deepcopy(self.protocol["lpips"])
+        unpinned["trusted_lock_status"] = "bootstrap_unpinned"
+        unpinned["trusted_environment_lock_sha256"] = None
+        unpinned["trusted_environment_packages"] = None
+        for package in unpinned["packages"]:
+            package["trusted_archive_sha256"] = None
+        for weight in unpinned["weights"]:
+            weight["trusted_sha256"] = None
         with self.assertRaisesRegex(QUALITY.QualityError, "not pinned"):
             QUALITY.validate_lpips_receipt(
-                self.protocol["lpips"],
+                unpinned,
                 receipt_path=self.root / "does-not-exist.json",
             )
 

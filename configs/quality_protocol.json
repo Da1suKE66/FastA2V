@@ -68,9 +68,129 @@
     "environment_root": "/cache/liluchen/FastA2V/envs/eval",
     "torch_home": "/cache/liluchen/FastA2V/checkpoints/eval/torch",
     "receipt_path": "/cache/liluchen/FastA2V/checkpoints/eval/lpips_alex_v0.1_receipt.json",
-    "trusted_lock_status": "bootstrap_unpinned",
-    "trusted_environment_lock_sha256": null,
-    "trusted_environment_packages": null,
+    "trusted_lock_status": "pinned",
+    "trusted_environment_lock_sha256": "d6c856a60a3241efe1907351541e1d0843d057240276960fe27f32e45750279c",
+    "trusted_environment_packages": [
+      {
+        "archive_sha256": "987db6f789a3a2a59f55081801b2b3697cb97e2a736b5f1a9e99b559285fbc51",
+        "archive_url": "https://files.pythonhosted.org/packages/60/02/be4a57b60c7149b55b9e3b3c13f609cd8eb5307c751f22bd8fb8d262e75b/filelock-3.29.7-py3-none-any.whl",
+        "distribution": "filelock",
+        "source_index": "https://pypi.org/simple",
+        "version": "3.29.7"
+      },
+      {
+        "archive_sha256": "02e0b71817df9b2169dc30a16832045764def1191b43dcff5bb85bdee212d2a1",
+        "archive_url": "https://files.pythonhosted.org/packages/e5/22/4222d7ddf3da30f363edaa98e329c2bce6c65497c9cb2810931c8b2c0fbc/fsspec-2026.6.0-py3-none-any.whl",
+        "distribution": "fsspec",
+        "source_index": "https://pypi.org/simple",
+        "version": "2026.6.0"
+      },
+      {
+        "archive_sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67",
+        "archive_url": "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl",
+        "distribution": "jinja2",
+        "source_index": "https://pypi.org/simple",
+        "version": "3.1.6"
+      },
+      {
+        "archive_sha256": "fd537af5828b69d2e6ffc0a397bd506dbc28ca183543617690844c08e102ec5e",
+        "archive_url": "https://files.pythonhosted.org/packages/9b/13/1df50c7925d9d2746702719f40e864f51ed66f307b20ad32392f1ad2bb87/lpips-0.1.4-py3-none-any.whl",
+        "distribution": "lpips",
+        "source_index": "https://pypi.org/simple",
+        "version": "0.1.4"
+      },
+      {
+        "archive_sha256": "0bf2a864d67e76e5c9a34dc26ec616a66b9888e25e7b9460e1c76d3293bd9dbf",
+        "archive_url": "https://files.pythonhosted.org/packages/30/ac/0273f6fcb5f42e314c6d8cd99effae6a5354604d461b8d392b5ec9530a54/markupsafe-3.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "distribution": "markupsafe",
+        "source_index": "https://pypi.org/simple",
+        "version": "3.0.3"
+      },
+      {
+        "archive_sha256": "a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c",
+        "archive_url": "https://files.pythonhosted.org/packages/43/e3/7d92a15f894aa0c9c4b49b8ee9ac9850d6e63b03c9c32c0367a13ae62209/mpmath-1.3.0-py3-none-any.whl",
+        "distribution": "mpmath",
+        "source_index": "https://pypi.org/simple",
+        "version": "1.3.0"
+      },
+      {
+        "archive_sha256": "d47fbf302e7d9cbbb9e2555a0d267983d2aa476bac30e90dfbe5669bd57f3762",
+        "archive_url": "https://files.pythonhosted.org/packages/9e/c9/b2622292ea83fbb4ec318f5b9ab867d0a28ab43c5717bb85b0a5f6b3b0a4/networkx-3.6.1-py3-none-any.whl",
+        "distribution": "networkx",
+        "source_index": "https://pypi.org/simple",
+        "version": "3.6.1"
+      },
+      {
+        "archive_sha256": "666dbfb6ec68962c033a450943ded891bed2d54e6755e35e5835d63f4f6931d5",
+        "archive_url": "https://files.pythonhosted.org/packages/3a/d0/edc009c27b406c4f9cbc79274d6e46d634d139075492ad055e3d68445925/numpy-1.26.4-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "distribution": "numpy",
+        "source_index": "https://pypi.org/simple",
+        "version": "1.26.4"
+      },
+      {
+        "archive_sha256": "837060a8599b8f5d402e97197d4924f05a2e0d68756998345c829c33186217b1",
+        "archive_url": "https://files.pythonhosted.org/packages/48/a4/fbfe9d5581d7b111b28f1d8c2762dee92e9821bb209af9fa83c940e507a0/pillow-11.1.0-cp311-cp311-manylinux_2_28_x86_64.whl",
+        "distribution": "pillow",
+        "source_index": "https://pypi.org/simple",
+        "version": "11.1.0"
+      },
+      {
+        "archive_sha256": "2913a38a2abf4ea6b64ab507bd9e967f3b53dc1ede74b01b0931e1ce548751af",
+        "archive_url": "https://files.pythonhosted.org/packages/29/a2/d40fb2460e883eca5199c62cfc2463fd261f760556ae6290f88488c362c0/pip-25.1.1-py3-none-any.whl",
+        "distribution": "pip",
+        "source_index": "https://pypi.org/simple",
+        "version": "25.1.1"
+      },
+      {
+        "archive_sha256": "a78b4b3345f1b6f68a763c6e25c0c9a23a9fd0f39f5f3d200efe8feda560a5fa",
+        "archive_url": "https://files.pythonhosted.org/packages/36/07/035d22ff9795129c5a847c64cb43c1fa9188826b59344fee28a3ab02e283/scipy-1.13.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "distribution": "scipy",
+        "source_index": "https://pypi.org/simple",
+        "version": "1.13.1"
+      },
+      {
+        "archive_sha256": "e3982f444617239225d675215d51f6ba05f845d4eec313da4418fdbb56fb27e3",
+        "archive_url": "https://files.pythonhosted.org/packages/69/8a/b9dc7678803429e4a3bc9ba462fa3dd9066824d3c607490235c6a796be5a/setuptools-75.8.0-py3-none-any.whl",
+        "distribution": "setuptools",
+        "source_index": "https://pypi.org/simple",
+        "version": "75.8.0"
+      },
+      {
+        "archive_sha256": "db36cdc64bf61b9b24578b6f7bab1ecdd2452cf008f34faa33776680c26d66f8",
+        "archive_url": "https://files.pythonhosted.org/packages/b2/fe/81695a1aa331a842b582453b605175f419fe8540355886031328089d840a/sympy-1.13.1-py3-none-any.whl",
+        "distribution": "sympy",
+        "source_index": "https://pypi.org/simple",
+        "version": "1.13.1"
+      },
+      {
+        "archive_sha256": "5b6ae523bfb67088a17ca7734d131548a2e60346c622621e4248ed09dd0790cc",
+        "archive_url": "https://download-r2.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp311-cp311-linux_x86_64.whl",
+        "distribution": "torch",
+        "source_index": "https://download.pytorch.org/whl/cpu",
+        "version": "2.6.0+cpu"
+      },
+      {
+        "archive_sha256": "d67081026aad9642c46d3b14035f8ae69117468c09a07d628f3eafc7ae74841f",
+        "archive_url": "https://download-r2.pytorch.org/whl/cpu/torchvision-0.21.0%2Bcpu-cp311-cp311-linux_x86_64.whl",
+        "distribution": "torchvision",
+        "source_index": "https://download.pytorch.org/whl/cpu",
+        "version": "0.21.0+cpu"
+      },
+      {
+        "archive_sha256": "26445eca388f82e72884e0d580d5464cd801a3ea01e63e5601bdff9ba6a48de2",
+        "archive_url": "https://files.pythonhosted.org/packages/d0/30/dc54f88dd4a2b5dc8a0279bdd7270e735851848b762aeb1c1184ed1f6b14/tqdm-4.67.1-py3-none-any.whl",
+        "distribution": "tqdm",
+        "source_index": "https://pypi.org/simple",
+        "version": "4.67.1"
+      },
+      {
+        "archive_sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+        "archive_url": "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl",
+        "distribution": "typing-extensions",
+        "source_index": "https://pypi.org/simple",
+        "version": "4.16.0"
+      }
+    ],
     "packages": [
       {
         "distribution": "torch",
@@ -78,7 +198,7 @@
         "module": "torch",
         "module_path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/torch/__init__.py",
         "source_index": "https://download.pytorch.org/whl/cpu",
-        "trusted_archive_sha256": null
+        "trusted_archive_sha256": "5b6ae523bfb67088a17ca7734d131548a2e60346c622621e4248ed09dd0790cc"
       },
       {
         "distribution": "torchvision",
@@ -86,7 +206,7 @@
         "module": "torchvision",
         "module_path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/torchvision/__init__.py",
         "source_index": "https://download.pytorch.org/whl/cpu",
-        "trusted_archive_sha256": null
+        "trusted_archive_sha256": "d67081026aad9642c46d3b14035f8ae69117468c09a07d628f3eafc7ae74841f"
       },
       {
         "distribution": "lpips",
@@ -94,7 +214,7 @@
         "module": "lpips",
         "module_path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/lpips/__init__.py",
         "source_index": "https://pypi.org/simple",
-        "trusted_archive_sha256": null
+        "trusted_archive_sha256": "fd537af5828b69d2e6ffc0a397bd506dbc28ca183543617690844c08e102ec5e"
       },
       {
         "distribution": "numpy",
@@ -102,7 +222,7 @@
         "module": "numpy",
         "module_path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/numpy/__init__.py",
         "source_index": "https://pypi.org/simple",
-        "trusted_archive_sha256": null
+        "trusted_archive_sha256": "666dbfb6ec68962c033a450943ded891bed2d54e6755e35e5835d63f4f6931d5"
       },
       {
         "distribution": "scipy",
@@ -110,7 +230,7 @@
         "module": "scipy",
         "module_path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/scipy/__init__.py",
         "source_index": "https://pypi.org/simple",
-        "trusted_archive_sha256": null
+        "trusted_archive_sha256": "a78b4b3345f1b6f68a763c6e25c0c9a23a9fd0f39f5f3d200efe8feda560a5fa"
       },
       {
         "distribution": "tqdm",
@@ -118,7 +238,7 @@
         "module": "tqdm",
         "module_path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/tqdm/__init__.py",
         "source_index": "https://pypi.org/simple",
-        "trusted_archive_sha256": null
+        "trusted_archive_sha256": "26445eca388f82e72884e0d580d5464cd801a3ea01e63e5601bdff9ba6a48de2"
       },
       {
         "distribution": "pillow",
@@ -126,7 +246,7 @@
         "module": "PIL",
         "module_path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/PIL/__init__.py",
         "source_index": "https://pypi.org/simple",
-        "trusted_archive_sha256": null
+        "trusted_archive_sha256": "837060a8599b8f5d402e97197d4924f05a2e0d68756998345c829c33186217b1"
       }
     ],
     "weights": [
@@ -137,7 +257,7 @@
         "source": "https://pypi.org/project/lpips/0.1.4/",
         "source_distribution": "lpips",
         "source_version": "0.1.4",
-        "trusted_sha256": null
+        "trusted_sha256": "df73285e35b22355a2df87cdb6b70b343713b667eddbda73e1977e0c860835c0"
       },
       {
         "weight_id": "torchvision_alexnet_owt",
@@ -145,7 +265,7 @@
         "source_type": "url",
         "source": "https://download.pytorch.org/models/alexnet-owt-7be5be79.pth",
         "sha256_prefix": "7be5be79",
-        "trusted_sha256": null
+        "trusted_sha256": "7be5be791159472b1fbf3c69796f7cb30dca7ad8466c2df70058c37116cdee02"
       }
     ]
   },

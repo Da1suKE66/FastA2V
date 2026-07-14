@@ -115,6 +115,14 @@ commit the protocol. Partial locks, bootstrap `null` values, a lone digest
 without its reconstructible package payload, a self-signed receipt, or an
 uncommitted protocol fail before model construction.
 
+The checked-in lock was promoted from the independently audited v8 bootstrap.
+Its canonical 17-package lock is
+`d6c856a60a3241efe1907351541e1d0843d057240276960fe27f32e45750279c`;
+the audited dependency receipt is
+`4d15e1fcfb0074133c43763ed565e04f7eee75c3a6b24afd339cc041dc0d39ed`.
+The isolated read-only auditor used for that decision has SHA256
+`2a680b577be3735d1bf4c6300d7ad2914143741067fcb8faf1db635b9b8ce932`.
+
 After promotion, move the bootstrap artifacts aside and reproduce the fixed
 environment from the reviewed lock:
 
