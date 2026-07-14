@@ -19,6 +19,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from ovi.block_cache import fixed_block_cache_metric_errors
 from ovi.eval_protocol import prompt_sequence_sha256, validate_run_protocol
+from ovi.gpu_process_monitor import (
+    trusted_nvidia_smi_metadata_errors,
+    validate_pre_run_gpu_report,
+)
 from ovi.sparge_evidence import (
     sparge_microtest_evidence_errors,
     sparge_receipt_evidence_errors,
@@ -126,10 +130,16 @@ def read_jsonl(path):
 
 
 def as_int(value):
+    if isinstance(value, bool):
+        return None
     try:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def is_json_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def expected_radial_runtime_dependency_evidence(receipt):
@@ -239,26 +249,21 @@ def validate_pre_run_gpu(report, environment, errors):
     if not isinstance(report, dict):
         errors.append("pre_run_gpu.json must be a JSON object")
         return None
-    if report.get("schema_version") != 1:
-        errors.append("unsupported pre-run GPU evidence schema")
-    if report.get("check_type") != "pre_run_idle":
-        errors.append("pre-run GPU evidence has the wrong check type")
-    if report.get("physical_device_index") != 0 or report.get("device_index") != 0:
-        errors.append("pre-run GPU evidence must target physical GPU index 0")
+    errors.extend(
+        f"pre-run GPU {error}"
+        for error in validate_pre_run_gpu_report(
+            report,
+            cuda_visible_devices=report.get("cuda_visible_devices"),
+        )
+    )
     device_uuid = report.get("device_uuid")
     device_name = report.get("device_name")
     if not isinstance(device_uuid, str) or not device_uuid:
         errors.append("pre-run GPU UUID is missing")
     if not isinstance(device_name, str) or not device_name:
         errors.append("pre-run GPU name is missing")
-    if report.get("available") is not True:
-        errors.append("pre-run GPU query was unavailable")
-    if report.get("process_count") != 0 or report.get("processes") != []:
-        errors.append("pre-run GPU was not idle")
-    if report.get("idle") is not True or report.get("valid_for_run") is not True:
-        errors.append("pre-run GPU evidence was not approved for this run")
-    if report.get("error") is not None or report.get("errors") != []:
-        errors.append("pre-run GPU evidence contains errors")
+    if not is_json_int(environment.get("gpu_physical_index")):
+        errors.append("environment gpu_physical_index must be an integer")
 
     expected_environment = {
         "gpu_physical_index": 0,
@@ -274,12 +279,24 @@ def validate_pre_run_gpu(report, environment, errors):
                 f"environment {field}={environment.get(field)!r} does not "
                 f"match pre-run GPU evidence {expected!r}"
             )
-    if not device_uuid or not device_name:
+    if (
+        not device_uuid
+        or not device_name
+        or not is_json_int(report.get("physical_device_index"))
+        or not is_json_int(report.get("device_index"))
+    ):
         return None
     return (0, device_uuid, device_name)
 
 
-def validate_gpu_monitor(monitor, expected_identity, candidate, context, errors):
+def validate_gpu_monitor(
+    monitor,
+    expected_identity,
+    expected_nvidia_smi_binary,
+    candidate,
+    context,
+    errors,
+):
     """Cross-bind every nvidia-smi sample to pre-run physical GPU 0."""
     if not isinstance(monitor, dict):
         errors.append(f"{context}: gpu_process_monitor must be a JSON object")
@@ -296,6 +313,8 @@ def validate_gpu_monitor(monitor, expected_identity, candidate, context, errors)
                 f"{context}: monitor GPU identity {summary_identity!r} does not "
                 f"match pre-run identity {expected_identity!r}"
             )
+        if not is_json_int(monitor.get("device_index")):
+            errors.append(f"{context}: monitor device_index must be an integer")
     else:
         expected_index = expected_uuid = expected_name = None
 
@@ -303,11 +322,22 @@ def validate_gpu_monitor(monitor, expected_identity, candidate, context, errors)
     if not isinstance(samples, list) or not samples:
         errors.append(f"{context}: monitor must retain every raw sample")
         return
-    if monitor.get("sample_count") != len(samples):
+    if (
+        not is_json_int(monitor.get("sample_count"))
+        or monitor.get("sample_count") != len(samples)
+    ):
         errors.append(f"{context}: monitor sample_count does not match samples")
 
     counts = []
     distinct_pids = set()
+    first_nvidia_smi_binary = (
+        samples[0].get("nvidia_smi_binary")
+        if isinstance(samples[0], dict)
+        else None
+    )
+    available_nvidia_smi_binaries = []
+    nvidia_smi_binary_validation_errors = []
+    sample_validation_errors = []
     for sample_index, sample in enumerate(samples):
         sample_context = f"{context}.samples[{sample_index}]"
         if not isinstance(sample, dict):
@@ -315,6 +345,33 @@ def validate_gpu_monitor(monitor, expected_identity, candidate, context, errors)
             continue
         if sample.get("available") is not True or sample.get("error") is not None:
             errors.append(f"{sample_context}: nvidia-smi query was unavailable")
+        else:
+            available_nvidia_smi_binaries.append(
+                sample.get("nvidia_smi_binary")
+            )
+        if (
+            not is_json_int(sample.get("device_index"))
+            or sample.get("device_index") != 0
+        ):
+            sample_validation_errors.append(
+                f"samples[{sample_index}]: device_index must be integer 0"
+            )
+        sample_binary_errors = trusted_nvidia_smi_metadata_errors(
+            sample.get("nvidia_smi_binary")
+        )
+        nvidia_smi_binary_validation_errors.extend(
+            f"samples[{sample_index}]: {error}"
+            for error in sample_binary_errors
+        )
+        errors.extend(
+            f"{sample_context}: {error}"
+            for error in sample_binary_errors
+        )
+        if sample.get("nvidia_smi_binary") != expected_nvidia_smi_binary:
+            errors.append(
+                f"{sample_context}: nvidia-smi binary metadata does not "
+                "exactly match pre-run evidence"
+            )
         if expected_identity is not None:
             sample_identity = (
                 sample.get("device_index"),
@@ -328,48 +385,150 @@ def validate_gpu_monitor(monitor, expected_identity, candidate, context, errors)
                 )
         count = sample.get("process_count")
         processes = sample.get("processes")
-        if not isinstance(count, int) or count < 0:
+        if not is_json_int(count) or count < 0:
             errors.append(f"{sample_context}: invalid process_count {count!r}")
+            sample_validation_errors.append(
+                f"samples[{sample_index}]: process_count is invalid"
+            )
             continue
         if not isinstance(processes, list) or len(processes) != count:
             errors.append(
                 f"{sample_context}: process list does not match process_count"
             )
+            sample_validation_errors.append(
+                f"samples[{sample_index}]: processes do not match process_count"
+            )
             continue
         counts.append(count)
-        for process in processes:
+        for process_index, process in enumerate(processes):
             pid = process.get("host_pid") if isinstance(process, dict) else None
             used_memory = (
                 process.get("used_memory_mib")
                 if isinstance(process, dict)
                 else None
             )
-            if not isinstance(pid, int) or pid <= 0:
+            if not isinstance(process, dict):
+                sample_validation_errors.append(
+                    f"samples[{sample_index}].processes[{process_index}]: "
+                    "process must be an object"
+                )
+            if not is_json_int(pid) or pid <= 0:
                 errors.append(f"{sample_context}: invalid host PID evidence")
+                if isinstance(process, dict):
+                    sample_validation_errors.append(
+                        f"samples[{sample_index}].processes[{process_index}]: "
+                        "host_pid is invalid"
+                    )
             else:
                 distinct_pids.add(pid)
-            if not isinstance(used_memory, int) or used_memory < 0:
+            if not is_json_int(used_memory) or used_memory <= 0:
                 errors.append(f"{sample_context}: invalid used-memory evidence")
+                if isinstance(process, dict):
+                    sample_validation_errors.append(
+                        f"samples[{sample_index}].processes[{process_index}]: "
+                        "used_memory_mib is invalid"
+                    )
 
-    if len(counts) != len(samples):
+    incomplete_samples = len(counts) != len(samples)
+    if incomplete_samples:
         errors.append(f"{context}: one or more monitor samples are incomplete")
-        return
-    if monitor.get("available_sample_count") != len(samples):
+    if (
+        not is_json_int(monitor.get("available_sample_count"))
+        or monitor.get("available_sample_count") != len(samples)
+    ):
         errors.append(f"{context}: not every monitor sample was available")
-    if monitor.get("unavailable_sample_count") != 0:
+    if (
+        not is_json_int(monitor.get("unavailable_sample_count"))
+        or monitor.get("unavailable_sample_count") != 0
+    ):
         errors.append(f"{context}: unavailable monitor samples were recorded")
     if monitor.get("identity_consistent") is not True:
         errors.append(f"{context}: monitor GPU identity was not consistent")
-    if monitor.get("min_process_count") != min(counts):
+    expected_min_process_count = min(counts, default=None)
+    expected_max_process_count = max(counts, default=None)
+    if (
+        not is_json_int(monitor.get("min_process_count"))
+        or monitor.get("min_process_count") != expected_min_process_count
+    ):
         errors.append(f"{context}: min_process_count disagrees with raw samples")
-    if monitor.get("max_process_count") != max(counts):
+    if (
+        not is_json_int(monitor.get("max_process_count"))
+        or monitor.get("max_process_count") != expected_max_process_count
+    ):
         errors.append(f"{context}: max_process_count disagrees with raw samples")
-    if monitor.get("distinct_host_pids") != sorted(distinct_pids):
+    summary_pids = monitor.get("distinct_host_pids")
+    if (
+        not isinstance(summary_pids, list)
+        or any(not is_json_int(pid) or pid <= 0 for pid in summary_pids)
+        or summary_pids != sorted(distinct_pids)
+    ):
         errors.append(f"{context}: distinct_host_pids disagrees with raw samples")
     if monitor.get("collection_errors") != []:
         errors.append(f"{context}: monitor recorded collection errors")
+    if monitor.get("sample_validation_errors") != sample_validation_errors:
+        errors.append(
+            f"{context}: sample-validation summary disagrees with raw samples"
+        )
+    if monitor.get("sample_validation_errors") != []:
+        errors.append(f"{context}: monitor samples contain validation errors")
 
-    exact_singleton = all(count == 1 for count in counts)
+    nvidia_smi_binary_fixed_valid = (
+        bool(available_nvidia_smi_binaries)
+        and not nvidia_smi_binary_validation_errors
+    )
+    nvidia_smi_binary_consistent = (
+        bool(available_nvidia_smi_binaries)
+        and first_nvidia_smi_binary is not None
+        and all(
+            metadata == first_nvidia_smi_binary
+            for metadata in available_nvidia_smi_binaries
+        )
+    )
+    if monitor.get("nvidia_smi_binary") != first_nvidia_smi_binary:
+        errors.append(
+            f"{context}: nvidia-smi binary summary differs from first sample"
+        )
+    if monitor.get("nvidia_smi_binary") != expected_nvidia_smi_binary:
+        errors.append(
+            f"{context}: nvidia-smi binary summary does not exactly match "
+            "pre-run evidence"
+        )
+    if (
+        monitor.get("nvidia_smi_binary_fixed_valid")
+        is not nvidia_smi_binary_fixed_valid
+    ):
+        errors.append(
+            f"{context}: nvidia-smi fixed-metadata summary disagrees with samples"
+        )
+    if monitor.get("nvidia_smi_binary_fixed_valid") is not True:
+        errors.append(
+            f"{context}: nvidia-smi binary metadata is not fixed-valid"
+        )
+    if (
+        monitor.get("nvidia_smi_binary_consistent")
+        is not nvidia_smi_binary_consistent
+    ):
+        errors.append(
+            f"{context}: nvidia-smi binary-consistency summary disagrees with samples"
+        )
+    if monitor.get("nvidia_smi_binary_consistent") is not True:
+        errors.append(
+            f"{context}: nvidia-smi binary metadata changed between samples"
+        )
+    if (
+        monitor.get("nvidia_smi_binary_validation_errors")
+        != nvidia_smi_binary_validation_errors
+    ):
+        errors.append(
+            f"{context}: nvidia-smi binary validation-errors summary "
+            "disagrees with samples"
+        )
+
+    exact_singleton = (
+        not incomplete_samples
+        and not sample_validation_errors
+        and all(count == 1 for count in counts)
+    )
     single_distinct_pid = exact_singleton and len(distinct_pids) == 1
     contention_detected = any(count > 1 for count in counts)
     no_process_detected = any(count == 0 for count in counts)
@@ -1066,6 +1225,11 @@ def verify_run_protocol(run_dir, reports):
             validate_gpu_monitor(
                 item.get("gpu_process_monitor"),
                 expected_gpu_identity,
+                (
+                    pre_run_gpu.get("nvidia_smi_binary")
+                    if isinstance(pre_run_gpu, dict)
+                    else None
+                ),
                 candidate,
                 f"{record_type}[{record_index}]",
                 errors,
@@ -1320,6 +1484,14 @@ def verify_run_protocol(run_dir, reports):
         for error in radial_microtest_evidence_errors(
             preflight_microtest,
             expected_gpu_uuid=expected_gpu_uuid,
+            expected_pre_run_gpu=pre_run_gpu,
+            expected_pre_run_gpu_sha256=(
+                sha256(pre_run_gpu_path)
+                if pre_run_gpu_path.is_file()
+                else None
+            ),
+            expected_pre_run_gpu_path=str(pre_run_gpu_path.resolve()),
+            expected_python_executable=preflight.get("python_executable"),
         ):
             errors.append(f"Radial preflight microtest: {error}")
         if isinstance(preflight_microtest, dict):

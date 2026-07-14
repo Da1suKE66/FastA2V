@@ -5,6 +5,12 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from ovi.gpu_process_monitor import (
+    TRUSTED_NVIDIA_SMI_BYTES,
+    TRUSTED_NVIDIA_SMI_PATH,
+    TRUSTED_NVIDIA_SMI_SHA256,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VERIFIER_PATH = REPO_ROOT / "scripts" / "verify_ovi_output.py"
@@ -21,6 +27,20 @@ GPU_NAME = "NVIDIA A100-SXM4-80GB"
 IDENTITY = (0, GPU_UUID, GPU_NAME)
 
 
+def trusted_binary():
+    return {
+        "requested_path": TRUSTED_NVIDIA_SMI_PATH,
+        "resolved_path": TRUSTED_NVIDIA_SMI_PATH,
+        "owner_uid": 0,
+        "owner_gid": 0,
+        "mode": 0o755,
+        "device": 2050,
+        "inode": 2490545,
+        "bytes": TRUSTED_NVIDIA_SMI_BYTES,
+        "sha256": TRUSTED_NVIDIA_SMI_SHA256,
+    }
+
+
 def raw_sample(count=1, uuid=GPU_UUID):
     return {
         "available": True,
@@ -34,6 +54,7 @@ def raw_sample(count=1, uuid=GPU_UUID):
             for index in range(count)
         ],
         "sampled_at_unix_seconds": 0.0,
+        "nvidia_smi_binary": trusted_binary(),
     }
 
 
@@ -52,6 +73,11 @@ def monitor(samples):
         "device_uuid": GPU_UUID,
         "device_name": GPU_NAME,
         "identity_consistent": True,
+        "nvidia_smi_binary": trusted_binary(),
+        "nvidia_smi_binary_fixed_valid": True,
+        "nvidia_smi_binary_consistent": True,
+        "nvidia_smi_binary_validation_errors": [],
+        "sample_validation_errors": [],
         "sample_count": len(samples),
         "available_sample_count": len(samples),
         "unavailable_sample_count": 0,
@@ -74,6 +100,7 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
         VERIFIER.validate_gpu_monitor(
             monitor([raw_sample(), raw_sample()]),
             IDENTITY,
+            trusted_binary(),
             True,
             "measurement[0]",
             errors,
@@ -85,6 +112,7 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
         VERIFIER.validate_gpu_monitor(
             monitor([raw_sample(), raw_sample(0)]),
             IDENTITY,
+            trusted_binary(),
             True,
             "measurement[0]",
             errors,
@@ -97,11 +125,28 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
         VERIFIER.validate_gpu_monitor(
             evidence,
             IDENTITY,
+            trusted_binary(),
             True,
             "warmup[0]",
             errors,
         )
         self.assertTrue(any("does not match pre-run" in error for error in errors))
+
+    def test_monitor_binary_metadata_drift_is_rejected(self):
+        evidence = monitor([raw_sample(), raw_sample()])
+        evidence["samples"][1]["nvidia_smi_binary"]["inode"] += 1
+        errors = []
+        VERIFIER.validate_gpu_monitor(
+            evidence,
+            IDENTITY,
+            trusted_binary(),
+            True,
+            "measurement[0]",
+            errors,
+        )
+        self.assertTrue(
+            any("exactly match pre-run" in error for error in errors)
+        )
 
     def test_environment_is_bound_to_idle_pre_run_identity(self):
         report = {
@@ -119,6 +164,12 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
             "valid_for_run": True,
             "errors": [],
             "cuda_visible_devices": "0",
+            "nvidia_smi_binary": trusted_binary(),
+            "checked_at_utc": "2026-07-14T00:00:00+00:00",
+            "sampled_at_unix_seconds": 1.0,
+            "sampled_at_monotonic_seconds": 1.0,
+            "boot_id": "11111111-2222-3333-4444-555555555555",
+            "run_nonce": "1" * 32,
         }
         environment = {
             "gpu_physical_index": 0,
@@ -132,6 +183,128 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
         identity = VERIFIER.validate_pre_run_gpu(report, environment, errors)
         self.assertEqual(identity, IDENTITY)
         self.assertEqual(errors, [])
+
+    def test_pre_run_untrusted_binary_is_rejected(self):
+        report = {
+            "schema_version": 1,
+            "check_type": "pre_run_idle",
+            "physical_device_index": 0,
+            "available": True,
+            "error": None,
+            "device_index": 0,
+            "device_uuid": GPU_UUID,
+            "device_name": GPU_NAME,
+            "processes": [],
+            "process_count": 0,
+            "idle": True,
+            "valid_for_run": True,
+            "errors": [],
+            "cuda_visible_devices": "0",
+            "nvidia_smi_binary": trusted_binary(),
+            "checked_at_utc": "2026-07-14T00:00:00+00:00",
+            "sampled_at_unix_seconds": 1.0,
+            "sampled_at_monotonic_seconds": 1.0,
+            "boot_id": "11111111-2222-3333-4444-555555555555",
+            "run_nonce": "1" * 32,
+        }
+        report["nvidia_smi_binary"]["sha256"] = "0" * 64
+        environment = {
+            "gpu_physical_index": 0,
+            "gpu_uuid": GPU_UUID,
+            "gpu_name": GPU_NAME,
+            "gpu": GPU_NAME,
+            "pre_run_gpu_valid": True,
+            "cuda_visible_devices": "0",
+        }
+        errors = []
+        VERIFIER.validate_pre_run_gpu(report, environment, errors)
+        self.assertTrue(any("nvidia-smi sha256" in error for error in errors))
+
+    def test_pre_run_requires_canonical_fields_and_mapping(self):
+        base = {
+            "schema_version": 1,
+            "check_type": "pre_run_idle",
+            "physical_device_index": 0,
+            "available": True,
+            "error": None,
+            "device_index": 0,
+            "device_uuid": GPU_UUID,
+            "device_name": GPU_NAME,
+            "processes": [],
+            "process_count": 0,
+            "idle": True,
+            "valid_for_run": True,
+            "errors": [],
+            "cuda_visible_devices": "0",
+            "nvidia_smi_binary": trusted_binary(),
+            "checked_at_utc": "2026-07-14T00:00:00+00:00",
+            "sampled_at_unix_seconds": 1.0,
+            "sampled_at_monotonic_seconds": 1.0,
+            "boot_id": "11111111-2222-3333-4444-555555555555",
+            "run_nonce": "1" * 32,
+        }
+        environment = {
+            "gpu_physical_index": 0,
+            "gpu_uuid": GPU_UUID,
+            "gpu_name": GPU_NAME,
+            "gpu": GPU_NAME,
+            "pre_run_gpu_valid": True,
+            "cuda_visible_devices": "0",
+        }
+        mutations = []
+        for field in (
+            "checked_at_utc",
+            "sampled_at_unix_seconds",
+            "sampled_at_monotonic_seconds",
+            "boot_id",
+            "run_nonce",
+        ):
+            report = dict(base)
+            del report[field]
+            mutations.append((f"missing-{field}", report, environment))
+        for field, value in (("schema_version", 0), ("check_type", "old")):
+            report = dict(base)
+            report[field] = value
+            mutations.append((field, report, environment))
+        report = dict(base)
+        report["cuda_visible_devices"] = "1,0"
+        bad_environment = dict(environment)
+        bad_environment["cuda_visible_devices"] = "1,0"
+        mutations.append(("ambiguous-cvd", report, bad_environment))
+        for label, report, current_environment in mutations:
+            with self.subTest(label=label):
+                errors = []
+                VERIFIER.validate_pre_run_gpu(
+                    report,
+                    current_environment,
+                    errors,
+                )
+                self.assertTrue(errors)
+
+    def test_bool_forged_monitor_integer_fields_are_rejected(self):
+        mutations = (
+            ("device_index", lambda evidence: evidence["samples"][0].__setitem__("device_index", False)),
+            ("process_count", lambda evidence: evidence["samples"][0].__setitem__("process_count", True)),
+            ("host_pid", lambda evidence: evidence["samples"][0]["processes"][0].__setitem__("host_pid", True)),
+            ("used_memory", lambda evidence: evidence["samples"][0]["processes"][0].__setitem__("used_memory_mib", True)),
+            ("min_process_count", lambda evidence: evidence.__setitem__("min_process_count", True)),
+            ("max_process_count", lambda evidence: evidence.__setitem__("max_process_count", True)),
+            ("unavailable_sample_count", lambda evidence: evidence.__setitem__("unavailable_sample_count", False)),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                evidence = monitor([raw_sample(), raw_sample()])
+                mutate(evidence)
+                errors = []
+                VERIFIER.validate_gpu_monitor(
+                    evidence,
+                    IDENTITY,
+                    trusted_binary(),
+                    True,
+                    "measurement[0]",
+                    errors,
+                )
+                self.assertTrue(errors)
 
 
 class RunnerOrderingTests(unittest.TestCase):

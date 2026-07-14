@@ -10,6 +10,11 @@ import unittest
 from unittest import mock
 import zlib
 
+from ovi.gpu_process_monitor import (
+    TRUSTED_NVIDIA_SMI_BYTES,
+    TRUSTED_NVIDIA_SMI_PATH,
+    TRUSTED_NVIDIA_SMI_SHA256,
+)
 from ovi.radial_evidence import (
     FLASHINFER_VERSION,
     FLASHINFER_WHEEL_BYTES,
@@ -19,6 +24,7 @@ from ovi.radial_evidence import (
     RADIAL_COMMIT,
     RADIAL_DERIVED_MODULE_SHA256,
     RADIAL_FORBIDDEN_LOADER_VARIABLES,
+    RADIAL_QKV_STORAGE_BYTES,
     RADIAL_OPTIONAL_IMPORTS_PATCH_SHA256,
     RADIAL_PROFILE_AUDITS,
     RADIAL_SOURCE_MODULE_SHA256,
@@ -28,6 +34,8 @@ from ovi.radial_evidence import (
     ldd_resolved_libraries,
     ldd_resolved_library_paths,
     normalize_ldd_output,
+    parse_nvidia_smi_pmon_output,
+    radial_gpu_process_binding_errors,
     radial_profile,
     radial_ldd_search_paths,
     radial_microtest_evidence_errors,
@@ -701,8 +709,238 @@ class RadialMaskAuditTests(unittest.TestCase):
         }
         self.assertEqual(radial_receipt_evidence_errors(receipt), [])
 
+    def test_radial_preflight_passes_persisted_idle_evidence_path(self):
+        preflight_source = (
+            REPO_ROOT / "scripts" / "preflight_ovi.py"
+        ).read_text(encoding="utf-8")
+        microtest_source = (
+            REPO_ROOT / "scripts" / "radial_flashinfer_microtest.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pre_run_gpu_path=pre_run_path", preflight_source)
+        self.assertIn("pre_run_gpu_path=pre_run_path", microtest_source)
+        self.assertIn("_read_and_bind_pre_run_gpu", microtest_source)
+
+    def test_pmon_parser_uses_dynamic_header_and_retains_idle_rows(self):
+        parsed = parse_nvidia_smi_pmon_output(
+            "# gpu pid type sm mem enc dec jpg ofa command\n"
+            "0 - - - - - - - - -\n"
+            "0 42 C 1 2 - - - - python\n"
+        )
+        self.assertEqual(parsed["errors"], [])
+        self.assertEqual(parsed["header_columns"][-3:], ["jpg", "ofa", "command"])
+        self.assertIsNone(parsed["rows"][0]["host_pid"])
+        self.assertEqual(parsed["rows"][1]["host_pid"], 42)
+        self.assertEqual(parsed["rows"][1]["process_type"], "C")
+        self.assertTrue(
+            parse_nvidia_smi_pmon_output("0 42 C python\n")["errors"]
+        )
+
     def test_cuda_microtest_evidence_is_cross_bound_and_finite(self):
         gpu_uuid = "GPU-11111111-2222-3333-4444-555555555555"
+        boot_id = "11111111-2222-3333-4444-555555555555"
+        host_pid = 9876
+        container_pid = 4321
+        binary_metadata = {
+            "requested_path": TRUSTED_NVIDIA_SMI_PATH,
+            "resolved_path": TRUSTED_NVIDIA_SMI_PATH,
+            "owner_uid": 0,
+            "owner_gid": 0,
+            "mode": 0o755,
+            "device": 2050,
+            "inode": 2490545,
+            "bytes": TRUSTED_NVIDIA_SMI_BYTES,
+            "sha256": TRUSTED_NVIDIA_SMI_SHA256,
+        }
+
+        def gpu_sample(start, count):
+            return {
+                "available": True,
+                "error": None,
+                "device_index": 0,
+                "device_uuid": gpu_uuid,
+                "device_name": "NVIDIA A100-SXM4-80GB",
+                "processes": (
+                    [
+                        {
+                            "host_pid": host_pid,
+                            "process_name": "[Not Found]",
+                            "used_memory_mib": 600,
+                        }
+                    ]
+                    if count
+                    else []
+                ),
+                "process_count": count,
+                "sampled_at_unix_seconds": start,
+                "sampled_at_monotonic_seconds": start,
+                "query_started_at_unix_seconds": start,
+                "query_finished_at_unix_seconds": start + 0.01,
+                "query_started_at_monotonic_seconds": start,
+                "query_finished_at_monotonic_seconds": start + 0.01,
+                "boot_id": boot_id,
+                "nvidia_smi_binary": copy.deepcopy(binary_metadata),
+            }
+
+        pre_run_gpu = {
+            "schema_version": 1,
+            "check_type": "pre_run_idle",
+            "physical_device_index": 0,
+            "checked_at_utc": "2026-07-14T00:00:00+00:00",
+            "cuda_visible_devices": gpu_uuid,
+            "available": True,
+            "error": None,
+            "device_index": 0,
+            "device_uuid": gpu_uuid,
+            "device_name": "NVIDIA A100-SXM4-80GB",
+            "processes": [],
+            "process_count": 0,
+            "sampled_at_unix_seconds": 100.0,
+            "sampled_at_monotonic_seconds": 100.0,
+            "boot_id": boot_id,
+            "run_nonce": "a" * 32,
+            "nvidia_smi_binary": copy.deepcopy(binary_metadata),
+            "idle": True,
+            "valid_for_run": True,
+            "errors": [],
+        }
+        raw_stdout = (
+            "#Date Time gpu pid type sm mem enc dec command\n"
+            "#YYYYMMDD HH:MM:SS Idx # C/G % % % % name\n"
+            "19700101 00:01:42 0 - - - - - - -\n"
+            "19700101 00:01:43 0 9876 C 5 4 - - [Not Found]\n"
+        )
+        parsed_pmon = parse_nvidia_smi_pmon_output(raw_stdout)
+        self.assertEqual(parsed_pmon["errors"], [])
+        rows_by_line = {
+            row["line_number"]: row for row in parsed_pmon["rows"]
+        }
+        line_times = [101.12, 101.13, 102.1, 103.2]
+        line_records = [
+            {
+                "line_index": index,
+                "raw_line": line,
+                "received_at_unix_seconds": line_times[index],
+                "received_at_monotonic_seconds": line_times[index],
+                "parsed_row": rows_by_line.get(index + 1),
+            }
+            for index, line in enumerate(raw_stdout.splitlines(keepends=True))
+        ]
+        pmon = {
+            "status": "ok",
+            "command": [
+                "/usr/bin/nvidia-smi",
+                "pmon",
+                "-i",
+                "0",
+                "-s",
+                "um",
+                "-d",
+                "1",
+                "-o",
+                "DT",
+            ],
+            "resolved_executable": "/usr/bin/nvidia-smi",
+            "nvidia_smi_binary": copy.deepcopy(binary_metadata),
+            "locale": {"LC_ALL": "C", "LANG": "C", "TZ": "UTC"},
+            "process_pid": 5555,
+            "raw_stdout": raw_stdout,
+            "raw_stderr": "",
+            "raw_stdout_bytes": len(raw_stdout.encode()),
+            "raw_stdout_sha256": hashlib.sha256(raw_stdout.encode()).hexdigest(),
+            "raw_stderr_bytes": 0,
+            "raw_stderr_sha256": hashlib.sha256(b"").hexdigest(),
+            "exit_code": -15,
+            "termination_method": "terminate",
+            "timed_out": False,
+            "header_columns": parsed_pmon["header_columns"],
+            "rows": parsed_pmon["rows"],
+            "parser_errors": [],
+            "stdout_line_records": line_records,
+            "stderr_line_records": [],
+            "errors": [],
+            "expected_host_pid": host_pid,
+            "spawn_started_at_unix_seconds": 101.1,
+            "spawn_started_at_monotonic_seconds": 101.1,
+            "process_started_at_unix_seconds": 101.11,
+            "process_started_at_monotonic_seconds": 101.11,
+            "header_ready_at_unix_seconds": 101.12,
+            "header_ready_at_monotonic_seconds": 101.12,
+            "idle_baseline_ready_at_unix_seconds": 102.1,
+            "idle_baseline_ready_at_monotonic_seconds": 102.1,
+            "idle_baseline_line_number": 3,
+            "host_pid_bound_at_unix_seconds": 102.62,
+            "host_pid_bound_at_monotonic_seconds": 102.62,
+            "backend_window_started_at_unix_seconds": 102.7,
+            "backend_window_started_at_monotonic_seconds": 102.7,
+            "backend_window_start_line_number": 3,
+            "window_compute_ready_at_unix_seconds": 103.2,
+            "window_compute_ready_at_monotonic_seconds": 103.2,
+            "window_compute_line_number": 4,
+            "stop_requested_at_unix_seconds": 103.71,
+            "stop_requested_at_monotonic_seconds": 103.71,
+            "process_exited_at_unix_seconds": 103.8,
+            "process_exited_at_monotonic_seconds": 103.8,
+        }
+        binding = {
+            "schema_version": 1,
+            "binding_method": "snapshot_bound_singleton_after_idle_guard",
+            "claim_scope": "snapshot_bound_not_continuous_exclusivity",
+            "pre_run_gpu_path": "/runs/test/pre_run_gpu.json",
+            "pre_run_gpu_sha256": "b" * 64,
+            "pre_run_gpu": copy.deepcopy(pre_run_gpu),
+            "microtest_started_at_unix_seconds": 100.5,
+            "microtest_started_at_monotonic_seconds": 100.5,
+            "cuda_touch_started_at_unix_seconds": 102.2,
+            "cuda_touch_started_at_monotonic_seconds": 102.2,
+            "setup_cuda_synchronize_started_at_unix_seconds": 102.3,
+            "setup_cuda_synchronize_started_at_monotonic_seconds": 102.3,
+            "setup_cuda_synchronized_at_unix_seconds": 102.5,
+            "setup_cuda_synchronized_at_monotonic_seconds": 102.5,
+            "exact_backend_started_at_unix_seconds": 102.7,
+            "exact_backend_started_at_monotonic_seconds": 102.7,
+            "exact_backend_returned_at_unix_seconds": 103.5,
+            "exact_backend_returned_at_monotonic_seconds": 103.5,
+            "cuda_synchronize_started_at_unix_seconds": 103.6,
+            "cuda_synchronize_started_at_monotonic_seconds": 103.6,
+            "cuda_synchronized_at_unix_seconds": 103.7,
+            "cuda_synchronized_at_monotonic_seconds": 103.7,
+            "exact_kernel_completed": True,
+            "exact_backend_call_count": 2,
+            "cuda_synchronize_completed": True,
+            "current_cuda_device_uuid": gpu_uuid,
+            "current_cuda_device_name": "NVIDIA A100-SXM4-80GB",
+            "current_cuda_device_index": 0,
+            "cuda_visible_devices": gpu_uuid,
+            "qkv_storage_bytes": RADIAL_QKV_STORAGE_BYTES,
+            "allocator_memory_bytes": RADIAL_QKV_STORAGE_BYTES + 1024,
+            "reserved_memory_bytes": 512 * 1024 * 1024,
+            "python_executable": "/cache/liluchen/FastA2V/envs/ovi/bin/python",
+            "python_executable_resolved": (
+                "/cache/liluchen/FastA2V/envs/ovi/bin/python3.11"
+            ),
+            "container_pid": container_pid,
+            "nvidia_smi_host_pid": host_pid,
+            "nspid": {"status": "ok", "error": None, "chain": [container_pid]},
+            "host_pid_proc_visibility": {"status": "not_visible", "error": None},
+            "mps": {
+                "cuda_mps_environment_variables": [],
+                "pmon": pmon,
+                "mps_process_detected": False,
+            },
+            "immediate_pre_cuda_sample": gpu_sample(101.0, 0),
+            "context_live_sample": gpu_sample(102.6, 1),
+            "interval_seconds": 0.1,
+            "interval_samples": [
+                gpu_sample(101.0, 0),
+                gpu_sample(102.6, 1),
+                gpu_sample(103.0, 1),
+                gpu_sample(104.5, 1),
+            ],
+            "post_cuda_samples": [
+                gpu_sample(104.0, 1),
+                gpu_sample(104.2, 1),
+            ],
+        }
         evidence = {
             "status": "ok",
             "device": "NVIDIA A100-SXM4-80GB",
@@ -710,13 +948,24 @@ class RadialMaskAuditTests(unittest.TestCase):
             "cuda_visible_devices": gpu_uuid,
             "physical_device_index": 0,
             "logical_cuda_device_index": 0,
-            "host_pid": 4321,
-            "python_pid": 4321,
-            "pid_namespace_chain": [4321],
+            "host_pid": host_pid,
+            "python_pid": container_pid,
+            "pid_namespace_chain": [container_pid],
+            "host_pid_namespace_visible": False,
+            "pid_binding_method": "snapshot_bound_singleton_after_idle_guard",
+            "pre_run_gpu": copy.deepcopy(pre_run_gpu),
+            "pre_run_gpu_sha256": "b" * 64,
+            "post_cuda_sampled_at_unix_seconds": 104.2,
             "gpu_process_count": 1,
             "gpu_processes": [
-                {"host_pid": 4321, "used_memory_mib": 4096}
+                {
+                    "host_pid": host_pid,
+                    "process_name": "[Not Found]",
+                    "used_memory_mib": 600,
+                }
             ],
+            "cuda_synchronized": True,
+            "gpu_process_binding": copy.deepcopy(binding),
             "compute_capability": [8, 0],
             "torch": "2.6.0+cu124",
             "torch_cuda": "12.4",
@@ -729,10 +978,11 @@ class RadialMaskAuditTests(unittest.TestCase):
             "prefix_sequence": 14976,
             "tail_sequence": 28,
             "tail_strategy": "dense_lse_merge_no_padding",
-            "calls": 1,
+            "exact_backend_call_count": 2,
+            "calls": 2,
             "plan_cache_entries": 1,
             "plan_cache_misses": 1,
-            "plan_cache_hits": 0,
+            "plan_cache_hits": 1,
             "mask_audit": copy.deepcopy(
                 RADIAL_PROFILE_AUDITS["conservative"]
             ),
@@ -754,17 +1004,194 @@ class RadialMaskAuditTests(unittest.TestCase):
         }
         self.assertEqual(
             radial_microtest_evidence_errors(
-                evidence, expected_gpu_uuid=gpu_uuid
+                evidence,
+                expected_gpu_uuid=gpu_uuid,
+                expected_pre_run_gpu=pre_run_gpu,
+                expected_pre_run_gpu_sha256="b" * 64,
+                expected_pre_run_gpu_path="/runs/test/pre_run_gpu.json",
+                expected_python_executable=(
+                    "/cache/liluchen/FastA2V/envs/ovi/bin/python"
+                ),
             ),
             [],
         )
+        pre_backend_c = copy.deepcopy(binding)
+        pre_backend_c.update(
+            {
+                "exact_backend_started_at_unix_seconds": 103.5,
+                "exact_backend_started_at_monotonic_seconds": 103.5,
+                "exact_backend_returned_at_unix_seconds": 104.2,
+                "exact_backend_returned_at_monotonic_seconds": 104.2,
+                "cuda_synchronize_started_at_unix_seconds": 104.3,
+                "cuda_synchronize_started_at_monotonic_seconds": 104.3,
+                "cuda_synchronized_at_unix_seconds": 104.4,
+                "cuda_synchronized_at_monotonic_seconds": 104.4,
+                "post_cuda_samples": [
+                    gpu_sample(104.6, 1),
+                    gpu_sample(104.8, 1),
+                ],
+            }
+        )
+        pre_backend_pmon = pre_backend_c["mps"]["pmon"]
+        pre_backend_pmon.update(
+            {
+                "backend_window_started_at_unix_seconds": 103.5,
+                "backend_window_started_at_monotonic_seconds": 103.5,
+                "window_compute_ready_at_unix_seconds": 103.9,
+                "window_compute_ready_at_monotonic_seconds": 103.9,
+                "stop_requested_at_unix_seconds": 104.5,
+                "stop_requested_at_monotonic_seconds": 104.5,
+                "process_exited_at_unix_seconds": 104.6,
+                "process_exited_at_monotonic_seconds": 104.6,
+            }
+        )
+        pre_backend_pmon["stdout_line_records"][3].update(
+            {
+                "received_at_unix_seconds": 103.9,
+                "received_at_monotonic_seconds": 103.9,
+            }
+        )
+        pre_backend_errors = radial_gpu_process_binding_errors(
+            pre_backend_c,
+            expected_pre_run_gpu=pre_run_gpu,
+            expected_pre_run_gpu_sha256="b" * 64,
+            expected_pre_run_gpu_path="/runs/test/pre_run_gpu.json",
+            expected_python_executable=(
+                "/cache/liluchen/FastA2V/envs/ovi/bin/python"
+            ),
+        )
+        self.assertTrue(
+            any(
+                "source-DT sample is not strictly inside" in error
+                for error in pre_backend_errors
+            ),
+            pre_backend_errors,
+        )
+        direct = copy.deepcopy(binding)
+        direct["binding_method"] = "direct_nspid"
+        direct["nspid"]["chain"] = [host_pid, container_pid]
+        direct["host_pid_proc_visibility"] = {"status": "visible", "error": None}
+        self.assertEqual(
+            radial_gpu_process_binding_errors(
+                direct,
+                expected_pre_run_gpu=pre_run_gpu,
+                expected_pre_run_gpu_sha256="b" * 64,
+                expected_pre_run_gpu_path="/runs/test/pre_run_gpu.json",
+                expected_python_executable=(
+                    "/cache/liluchen/FastA2V/envs/ovi/bin/python"
+                ),
+            ),
+            [],
+        )
+        for field in tuple(binding):
+            missing = copy.deepcopy(binding)
+            missing.pop(field)
+            self.assertTrue(
+                radial_gpu_process_binding_errors(
+                    missing,
+                    expected_pre_run_gpu=pre_run_gpu,
+                    expected_pre_run_gpu_sha256="b" * 64,
+                    expected_pre_run_gpu_path="/runs/test/pre_run_gpu.json",
+                    expected_python_executable=(
+                        "/cache/liluchen/FastA2V/envs/ovi/bin/python"
+                    ),
+                ),
+                field,
+            )
+        for field in tuple(binding["mps"]["pmon"]):
+            missing = copy.deepcopy(binding)
+            missing["mps"]["pmon"].pop(field)
+            self.assertTrue(
+                radial_gpu_process_binding_errors(
+                    missing,
+                    expected_pre_run_gpu=pre_run_gpu,
+                    expected_pre_run_gpu_sha256="b" * 64,
+                    expected_pre_run_gpu_path="/runs/test/pre_run_gpu.json",
+                    expected_python_executable=(
+                        "/cache/liluchen/FastA2V/envs/ovi/bin/python"
+                    ),
+                ),
+                f"pmon.{field}",
+            )
+        for field in tuple(binding["context_live_sample"]):
+            missing = copy.deepcopy(binding)
+            missing["context_live_sample"].pop(field)
+            self.assertTrue(
+                radial_gpu_process_binding_errors(
+                    missing,
+                    expected_pre_run_gpu=pre_run_gpu,
+                    expected_pre_run_gpu_sha256="b" * 64,
+                    expected_pre_run_gpu_path="/runs/test/pre_run_gpu.json",
+                    expected_python_executable=(
+                        "/cache/liluchen/FastA2V/envs/ovi/bin/python"
+                    ),
+                ),
+                f"context_live_sample.{field}",
+            )
+
+        mutations = []
+        wrong_hash = copy.deepcopy(binding)
+        wrong_hash["pre_run_gpu_sha256"] = "c" * 64
+        mutations.append(wrong_hash)
+        stale = copy.deepcopy(binding)
+        stale["microtest_started_at_unix_seconds"] = 800.0
+        mutations.append(stale)
+        short_gap = copy.deepcopy(binding)
+        short_gap["post_cuda_samples"][1].update(
+            {
+                "sampled_at_unix_seconds": 104.05,
+                "sampled_at_monotonic_seconds": 104.05,
+                "query_started_at_unix_seconds": 104.05,
+                "query_started_at_monotonic_seconds": 104.05,
+                "query_finished_at_unix_seconds": 104.06,
+                "query_finished_at_monotonic_seconds": 104.06,
+            }
+        )
+        mutations.append(short_gap)
+        pid_drift = copy.deepcopy(binding)
+        pid_drift["interval_samples"][-1]["processes"][0]["host_pid"] += 1
+        mutations.append(pid_drift)
+        mps = copy.deepcopy(binding)
+        mps["mps"]["cuda_mps_environment_variables"] = ["CUDA_MPS_PIPE_DIRECTORY"]
+        mutations.append(mps)
+        weak_memory = copy.deepcopy(binding)
+        weak_memory["allocator_memory_bytes"] = RADIAL_QKV_STORAGE_BYTES - 1
+        mutations.append(weak_memory)
+        visible_proc = copy.deepcopy(binding)
+        visible_proc["host_pid_proc_visibility"]["status"] = "visible"
+        mutations.append(visible_proc)
+        forged_pmon = copy.deepcopy(binding)
+        forged_pmon["mps"]["pmon"]["rows"][0]["process_type"] = "M"
+        mutations.append(forged_pmon)
+        for mutated in mutations:
+            self.assertTrue(
+                radial_gpu_process_binding_errors(
+                    mutated,
+                    expected_pre_run_gpu=pre_run_gpu,
+                    expected_pre_run_gpu_sha256="b" * 64,
+                    expected_pre_run_gpu_path="/runs/test/pre_run_gpu.json",
+                    expected_python_executable=(
+                        "/cache/liluchen/FastA2V/envs/ovi/bin/python"
+                    ),
+                )
+            )
+
         evidence["finite"] = False
         evidence["output_abs_max"] = float("nan")
+        evidence["pre_run_gpu"]["process_count"] = 1
         errors = radial_microtest_evidence_errors(
-            evidence, expected_gpu_uuid="GPU-different"
+            evidence,
+            expected_gpu_uuid="GPU-different",
+            expected_pre_run_gpu=pre_run_gpu,
+            expected_pre_run_gpu_sha256="b" * 64,
+            expected_pre_run_gpu_path="/runs/test/pre_run_gpu.json",
+            expected_python_executable=(
+                "/cache/liluchen/FastA2V/envs/ovi/bin/python"
+            ),
         )
         self.assertTrue(any("finite" in error for error in errors))
         self.assertTrue(any("device_uuid" in error for error in errors))
+        self.assertTrue(any("pre-run" in error for error in errors))
 
 
 class RadialBackendExecutionTests(unittest.TestCase):

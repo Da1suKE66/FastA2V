@@ -8,6 +8,12 @@ import sys
 import tempfile
 import unittest
 
+from ovi.gpu_process_monitor import (
+    TRUSTED_NVIDIA_SMI_BYTES,
+    TRUSTED_NVIDIA_SMI_PATH,
+    TRUSTED_NVIDIA_SMI_SHA256,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "build_ovi_eval_csv.py"
@@ -19,6 +25,20 @@ SPEC.loader.exec_module(EVAL)
 GPU_UUID = "GPU-11111111-2222-3333-4444-555555555555"
 GPU_NAME = "NVIDIA A100-SXM4-80GB"
 PROMPT = "A fixed audiovisual benchmark prompt."
+
+
+def trusted_binary():
+    return {
+        "requested_path": TRUSTED_NVIDIA_SMI_PATH,
+        "resolved_path": TRUSTED_NVIDIA_SMI_PATH,
+        "owner_uid": 0,
+        "owner_gid": 0,
+        "mode": 0o755,
+        "device": 2050,
+        "inode": 2490545,
+        "bytes": TRUSTED_NVIDIA_SMI_BYTES,
+        "sha256": TRUSTED_NVIDIA_SMI_SHA256,
+    }
 
 
 def sha256(path):
@@ -48,6 +68,7 @@ def monitor(*, contention=False):
             "process_count": process_count,
             "processes": processes,
             "sampled_at_unix_seconds": float(index),
+            "nvidia_smi_binary": trusted_binary(),
         }
         for index in range(2)
     ]
@@ -56,6 +77,11 @@ def monitor(*, contention=False):
         "device_uuid": GPU_UUID,
         "device_name": GPU_NAME,
         "identity_consistent": True,
+        "nvidia_smi_binary": trusted_binary(),
+        "nvidia_smi_binary_fixed_valid": True,
+        "nvidia_smi_binary_consistent": True,
+        "nvidia_smi_binary_validation_errors": [],
+        "sample_validation_errors": [],
         "sample_count": 2,
         "available_sample_count": 2,
         "unavailable_sample_count": 0,
@@ -115,6 +141,31 @@ class RunFactory:
         checkpoint_path = run_dir / "checkpoint_manifest.json"
         write_json(checkpoint_path, checkpoint)
 
+        pre_run_gpu = {
+            "schema_version": 1,
+            "check_type": "pre_run_idle",
+            "physical_device_index": 0,
+            "available": True,
+            "error": None,
+            "device_index": 0,
+            "device_uuid": GPU_UUID,
+            "device_name": GPU_NAME,
+            "processes": [],
+            "process_count": 0,
+            "idle": True,
+            "valid_for_run": True,
+            "errors": [],
+            "checked_at_utc": "2026-07-14T00:00:00+00:00",
+            "cuda_visible_devices": "0",
+            "sampled_at_unix_seconds": 1.0,
+            "sampled_at_monotonic_seconds": 1.0,
+            "boot_id": "11111111-2222-3333-4444-555555555555",
+            "run_nonce": "1" * 32,
+            "nvidia_smi_binary": trusted_binary(),
+        }
+        pre_run_gpu_path = run_dir / "pre_run_gpu.json"
+        write_json(pre_run_gpu_path, pre_run_gpu)
+
         environment = {
             **self.manifest["fixed_protocol"],
             **method["expected_environment"],
@@ -125,12 +176,15 @@ class RunFactory:
             "gpu_uuid": GPU_UUID,
             "gpu_name": GPU_NAME,
             "gpu": GPU_NAME,
+            "cuda_visible_devices": "0",
             "engine_load_seconds": 12.5,
             "expected_measurement_records": 3,
             "expected_warmup_records": 1,
             "run_id": run_dir.name,
+            "pre_run_gpu_sha256": sha256(pre_run_gpu_path),
             "evidence_file_sha256": {
                 "checkpoint_manifest.json": sha256(checkpoint_path),
+                "pre_run_gpu.json": sha256(pre_run_gpu_path),
             },
         }
         write_json(run_dir / "environment.json", environment)
@@ -278,6 +332,123 @@ class EvalCsvTests(unittest.TestCase):
         run_dir = self.factory.make("dense", contention=True)
         with self.assertRaises(EVAL.EvaluationError):
             EVAL.validate_run(self.method("dense"), run_dir, self.manifest["fixed_protocol"])
+
+    def test_pre_run_untrusted_nvidia_smi_binary_is_rejected(self):
+        run_dir = self.factory.make("dense")
+        path = run_dir / "pre_run_gpu.json"
+        payload = json.loads(path.read_text())
+        payload["nvidia_smi_binary"]["sha256"] = "0" * 64
+        write_json(path, payload)
+        with self.assertRaisesRegex(EVAL.EvaluationError, "nvidia-smi"):
+            EVAL.validate_run(
+                self.method("dense"),
+                run_dir,
+                self.manifest["fixed_protocol"],
+            )
+
+    def test_sample_nvidia_smi_binary_must_equal_pre_run_evidence(self):
+        run_dir = self.factory.make("dense")
+        records = [
+            json.loads(line)
+            for line in (run_dir / "timings.jsonl").read_text().splitlines()
+        ]
+        records[0]["gpu_process_monitor"]["samples"][1][
+            "nvidia_smi_binary"
+        ]["inode"] += 1
+        (run_dir / "timings.jsonl").write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(EVAL.EvaluationError, "nvidia-smi"):
+            EVAL.validate_run(
+                self.method("dense"),
+                run_dir,
+                self.manifest["fixed_protocol"],
+            )
+
+    def test_pre_run_requires_canonical_fields_and_unambiguous_cvd(self):
+        for label, mutate in (
+            (
+                "missing-run-nonce",
+                lambda payload: payload.pop("run_nonce"),
+            ),
+            (
+                "missing-timestamp",
+                lambda payload: payload.pop("sampled_at_monotonic_seconds"),
+            ),
+            (
+                "bad-schema",
+                lambda payload: payload.__setitem__("schema_version", 0),
+            ),
+            (
+                "bad-check-type",
+                lambda payload: payload.__setitem__("check_type", "old"),
+            ),
+            (
+                "ambiguous-cvd",
+                lambda payload: payload.__setitem__(
+                    "cuda_visible_devices", "1,0"
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                run_dir = self.factory.make("dense")
+                path = run_dir / "pre_run_gpu.json"
+                payload = json.loads(path.read_text())
+                mutate(payload)
+                write_json(path, payload)
+                if label == "ambiguous-cvd":
+                    environment_path = run_dir / "environment.json"
+                    environment = json.loads(environment_path.read_text())
+                    environment["cuda_visible_devices"] = "1,0"
+                    write_json(environment_path, environment)
+                with self.assertRaises(EVAL.EvaluationError):
+                    EVAL.validate_run(
+                        self.method("dense"),
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+
+    def test_bool_forged_gpu_monitor_integers_are_rejected(self):
+        mutations = (
+            ("process-count", ("samples", 0, "process_count")),
+            ("device-index", ("samples", 0, "device_index")),
+            ("host-pid", ("samples", 0, "processes", 0, "host_pid")),
+            (
+                "used-memory",
+                ("samples", 0, "processes", 0, "used_memory_mib"),
+            ),
+            ("min-count", ("min_process_count",)),
+            ("max-count", ("max_process_count",)),
+            ("unavailable-count", ("unavailable_sample_count",)),
+        )
+        for label, path_parts in mutations:
+            with self.subTest(label=label):
+                run_dir = self.factory.make("dense")
+                timing_path = run_dir / "timings.jsonl"
+                records = [
+                    json.loads(line)
+                    for line in timing_path.read_text().splitlines()
+                ]
+                target = records[0]["gpu_process_monitor"]
+                for part in path_parts[:-1]:
+                    target = target[part]
+                target[path_parts[-1]] = (
+                    False if "unavailable" in label or "device" in label else True
+                )
+                timing_path.write_text(
+                    "".join(
+                        json.dumps(record, sort_keys=True) + "\n"
+                        for record in records
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(EVAL.EvaluationError):
+                    EVAL.validate_run(
+                        self.method("dense"),
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
 
     def test_measurement_count_must_be_exactly_three(self):
         run_dir = self.factory.make("dense")

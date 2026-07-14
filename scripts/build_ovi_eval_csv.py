@@ -16,11 +16,21 @@ import json
 import math
 import re
 import statistics
+import sys
 from pathlib import Path
 from typing import Any, Iterable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from ovi.gpu_process_monitor import (
+    trusted_nvidia_smi_metadata_errors,
+    validate_pre_run_gpu_report,
+)
+
+
 DEFAULT_MANIFEST = REPO_ROOT / "configs" / "ovi_eval_matrix.json"
 REQUIRED_METHOD_IDS = (
     "dense",
@@ -81,6 +91,10 @@ CSV_FIELDS = (
 
 class EvaluationError(ValueError):
     """Raised when evidence cannot safely enter the comparison table."""
+
+
+def _is_json_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _fail(context: str, message: str) -> None:
@@ -182,7 +196,8 @@ def load_manifest(path: Path = DEFAULT_MANIFEST) -> dict[str, Any]:
     manifest = _read_json(path, "evaluation manifest")
     _require(isinstance(manifest, dict), "evaluation manifest", "root must be an object")
     _require(
-        manifest.get("schema_version") == 1,
+        _is_json_int(manifest.get("schema_version"))
+        and manifest.get("schema_version") == 1,
         "evaluation manifest",
         "unsupported schema_version",
     )
@@ -312,17 +327,27 @@ def _checkpoint_fingerprint(
 
 
 def _validate_gpu_monitor(
-    monitor: Any, environment: dict[str, Any], context: str
+    monitor: Any,
+    environment: dict[str, Any],
+    expected_nvidia_smi_binary: dict[str, Any],
+    context: str,
 ) -> None:
     _require(isinstance(monitor, dict), context, "gpu_process_monitor must be an object")
     required_true = (
         "identity_consistent",
+        "nvidia_smi_binary_fixed_valid",
+        "nvidia_smi_binary_consistent",
         "single_distinct_host_pid",
         "exact_singleton_process_per_sample",
         "valid_for_benchmark",
     )
     for field in required_true:
         _require(monitor.get(field) is True, context, f"GPU monitor {field} must be true")
+    _require(
+        monitor.get("sample_validation_errors") == [],
+        context,
+        "GPU monitor samples contain validation errors",
+    )
     _require(
         monitor.get("contention_detected") is False,
         context,
@@ -333,20 +358,52 @@ def _validate_gpu_monitor(
         context,
         "GPU monitor lost the benchmark process",
     )
-    _require(monitor.get("unavailable_sample_count") == 0, context, "GPU samples were unavailable")
+    _require(
+        _is_json_int(monitor.get("unavailable_sample_count"))
+        and monitor.get("unavailable_sample_count") == 0,
+        context,
+        "GPU samples were unavailable",
+    )
+    _require(
+        monitor.get("nvidia_smi_binary") == expected_nvidia_smi_binary,
+        context,
+        "GPU monitor nvidia-smi binary differs from pre-run evidence",
+    )
+    _require(
+        monitor.get("nvidia_smi_binary_validation_errors") == [],
+        context,
+        "GPU monitor reports nvidia-smi binary validation errors",
+    )
     sample_count = monitor.get("sample_count")
     _require(
-        isinstance(sample_count, int) and sample_count >= 2,
+        _is_json_int(sample_count) and sample_count >= 2,
         context,
         "GPU monitor requires at least entry and exit samples",
     )
     _require(
-        monitor.get("available_sample_count") == sample_count,
+        _is_json_int(monitor.get("available_sample_count"))
+        and monitor.get("available_sample_count") == sample_count,
         context,
         "not all GPU samples were available",
     )
-    _require(monitor.get("min_process_count") == 1, context, "GPU sample process count was not one")
-    _require(monitor.get("max_process_count") == 1, context, "GPU sample process count was not one")
+    _require(
+        _is_json_int(monitor.get("min_process_count"))
+        and monitor.get("min_process_count") == 1,
+        context,
+        "GPU sample process count was not one",
+    )
+    _require(
+        _is_json_int(monitor.get("max_process_count"))
+        and monitor.get("max_process_count") == 1,
+        context,
+        "GPU sample process count was not one",
+    )
+    _require(
+        _is_json_int(monitor.get("device_index"))
+        and monitor.get("device_index") == 0,
+        context,
+        "GPU monitor physical device index must be integer zero",
+    )
     _require(
         monitor.get("device_uuid") == environment.get("gpu_uuid"),
         context,
@@ -361,7 +418,7 @@ def _validate_gpu_monitor(
     _require(
         isinstance(distinct_pids, list)
         and len(distinct_pids) == 1
-        and isinstance(distinct_pids[0], int)
+        and _is_json_int(distinct_pids[0])
         and distinct_pids[0] > 0,
         context,
         "GPU monitor must record exactly one positive host PID",
@@ -376,18 +433,46 @@ def _validate_gpu_monitor(
         sample_context = f"{context} sample[{sample_index}]"
         _require(isinstance(sample, dict), sample_context, "sample must be an object")
         _require(sample.get("available") is True, sample_context, "sample is unavailable")
-        _require(sample.get("process_count") == 1, sample_context, "sample must contain one process")
-        _require(sample.get("device_index") == 0, sample_context, "physical GPU index must be zero")
+        _require(
+            _is_json_int(sample.get("process_count"))
+            and sample.get("process_count") == 1,
+            sample_context,
+            "sample must contain one process",
+        )
+        _require(
+            _is_json_int(sample.get("device_index"))
+            and sample.get("device_index") == 0,
+            sample_context,
+            "physical GPU index must be zero",
+        )
         _require(sample.get("device_uuid") == environment.get("gpu_uuid"), sample_context, "GPU UUID differs")
         _require(sample.get("device_name") == environment.get("gpu_name"), sample_context, "GPU name differs")
+        sample_binary_errors = trusted_nvidia_smi_metadata_errors(
+            sample.get("nvidia_smi_binary")
+        )
+        _require(
+            not sample_binary_errors,
+            sample_context,
+            "nvidia-smi binary fixed metadata is invalid: "
+            + "; ".join(sample_binary_errors),
+        )
+        _require(
+            sample.get("nvidia_smi_binary") == expected_nvidia_smi_binary,
+            sample_context,
+            "nvidia-smi binary metadata differs from pre-run evidence",
+        )
         processes = sample.get("processes")
         _require(
             isinstance(processes, list)
             and len(processes) == 1
             and isinstance(processes[0], dict)
-            and processes[0].get("host_pid") == distinct_pids[0],
+            and _is_json_int(processes[0].get("host_pid"))
+            and processes[0].get("host_pid") == distinct_pids[0]
+            and _is_json_int(processes[0].get("used_memory_mib"))
+            and processes[0].get("used_memory_mib") > 0,
             sample_context,
-            "sample process evidence differs from the stable benchmark PID",
+            "sample process evidence differs from the stable benchmark PID "
+            "or has invalid used memory",
         )
 
 
@@ -422,14 +507,17 @@ def validate_run(
     verification_path = run_dir / "verification.json"
     timings_path = run_dir / "timings.jsonl"
     checkpoint_path = run_dir / "checkpoint_manifest.json"
+    pre_run_gpu_path = run_dir / "pre_run_gpu.json"
     environment = _read_json(environment_path, context)
     verification = _read_json(verification_path, context)
     timings = _read_jsonl(timings_path, context)
     checkpoint_manifest = _read_json(checkpoint_path, context)
+    pre_run_gpu = _read_json(pre_run_gpu_path, context)
     for name, payload in (
         ("environment.json", environment),
         ("verification.json", verification),
         ("checkpoint_manifest.json", checkpoint_manifest),
+        ("pre_run_gpu.json", pre_run_gpu),
     ):
         _require(isinstance(payload, dict), context, f"{name} must contain an object")
 
@@ -464,7 +552,43 @@ def validate_run(
     _require(environment.get("benchmark_eligible") is True, context, "benchmark_eligible must be true")
     _require(environment.get("debug_forward") is False, context, "debug_forward must be false")
     _require(environment.get("pre_run_gpu_valid") is True, context, "pre-run GPU evidence is not valid")
-    _require(environment.get("gpu_physical_index") == 0, context, "physical GPU index must be zero")
+    _require(
+        _is_json_int(environment.get("gpu_physical_index"))
+        and environment.get("gpu_physical_index") == 0,
+        context,
+        "physical GPU index must be integer zero",
+    )
+    pre_run_errors = validate_pre_run_gpu_report(
+        pre_run_gpu,
+        cuda_visible_devices=pre_run_gpu.get("cuda_visible_devices"),
+    )
+    _require(
+        not pre_run_errors,
+        context,
+        "pre-run GPU evidence is invalid: " + "; ".join(pre_run_errors),
+    )
+    _require(
+        pre_run_gpu.get("device_uuid") == environment.get("gpu_uuid")
+        and pre_run_gpu.get("device_name") == environment.get("gpu_name"),
+        context,
+        "pre-run GPU identity differs from environment",
+    )
+    _require(
+        pre_run_gpu.get("cuda_visible_devices")
+        == environment.get("cuda_visible_devices"),
+        context,
+        "pre-run CUDA_VISIBLE_DEVICES differs from environment",
+    )
+    expected_nvidia_smi_binary = pre_run_gpu.get("nvidia_smi_binary")
+    pre_run_binary_errors = trusted_nvidia_smi_metadata_errors(
+        expected_nvidia_smi_binary
+    )
+    _require(
+        not pre_run_binary_errors,
+        context,
+        "pre-run nvidia-smi binary fixed metadata is invalid: "
+        + "; ".join(pre_run_binary_errors),
+    )
     _require(
         environment.get("run_id") == run_dir.name,
         context,
@@ -496,12 +620,19 @@ def validate_run(
     _require(len(timings) == MEASUREMENT_COUNT, context, "timings.jsonl must contain exactly three measurements")
 
     checkpoint_manifest_sha256 = _sha256(checkpoint_path)
+    pre_run_gpu_sha256 = _sha256(pre_run_gpu_path)
     evidence_hashes = environment.get("evidence_file_sha256")
     _require(isinstance(evidence_hashes, dict), context, "environment evidence hashes are missing")
     _require(
         evidence_hashes.get("checkpoint_manifest.json") == checkpoint_manifest_sha256,
         context,
         "checkpoint manifest hash differs from environment evidence",
+    )
+    _require(
+        evidence_hashes.get("pre_run_gpu.json") == pre_run_gpu_sha256
+        and environment.get("pre_run_gpu_sha256") == pre_run_gpu_sha256,
+        context,
+        "pre-run GPU hash differs from environment evidence",
     )
     checkpoint_fingerprint = _checkpoint_fingerprint(checkpoint_manifest, context)
 
@@ -632,7 +763,12 @@ def validate_run(
             "generated_audio_shape",
         )
 
-        _validate_gpu_monitor(record.get("gpu_process_monitor"), environment, record_context)
+        _validate_gpu_monitor(
+            record.get("gpu_process_monitor"),
+            environment,
+            expected_nvidia_smi_binary,
+            record_context,
+        )
 
         output_path_value = record.get("output_path")
         output_hash = record.get("output_sha256")

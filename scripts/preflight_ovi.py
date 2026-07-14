@@ -292,7 +292,11 @@ def main(output_path=None, attention_method="dense"):
                 "install_cuda_kernel_launched": False,
                 "preflight_cuda_microtest_required": True,
             }
-            microtest = run_microtest(device_index=0)
+            microtest = run_microtest(
+                device_index=0,
+                pre_run_gpu=pre_run_gpu,
+                pre_run_gpu_path=pre_run_path,
+            )
             if microtest.get("device_uuid") != pre_run_gpu.get("device_uuid"):
                 raise RuntimeError(
                     "Radial FlashInfer microtest GPU UUID differs from pre-run "
@@ -300,6 +304,11 @@ def main(output_path=None, attention_method="dense"):
                 )
             report["radialattn_microtest"] = microtest
         except Exception as exc:
+            pmon_failure_evidence = getattr(exc, "pmon_evidence", None)
+            if isinstance(pmon_failure_evidence, dict):
+                report["radialattn_pmon_failure_evidence"] = (
+                    pmon_failure_evidence
+                )
             report["errors"].append(
                 f"official Radial Attention dependency check failed: {exc!r}"
             )

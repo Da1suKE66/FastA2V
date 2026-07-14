@@ -7,9 +7,12 @@ is copied into FastA2V.
 """
 
 import hashlib
+from datetime import datetime, timezone
 import math
 from pathlib import Path
 import re
+
+from ovi.gpu_process_monitor import trusted_nvidia_smi_metadata_errors
 
 
 RADIAL_REPOSITORY = "https://github.com/mit-han-lab/radial-attention.git"
@@ -70,6 +73,18 @@ RADIAL_CUDA_HOME = "/usr/local/cuda-12.1"
 RADIAL_LDD_EXECUTABLE = "/usr/bin/ldd"
 RADIAL_FORBIDDEN_LOADER_PREFIXES = ("LD_",)
 RADIAL_FORBIDDEN_LOADER_VARIABLES = ("GLIBC_TUNABLES",)
+RADIAL_GPU_PROCESS_BINDING_SCHEMA_VERSION = 1
+RADIAL_GPU_IDLE_GUARD_MAX_AGE_SECONDS = 600.0
+RADIAL_GPU_PROCESS_BINDING_METHODS = (
+    "direct_nspid",
+    "snapshot_bound_singleton_after_idle_guard",
+)
+RADIAL_GPU_PROCESS_CLAIM_SCOPE = (
+    "snapshot_bound_not_continuous_exclusivity"
+)
+RADIAL_QKV_STORAGE_BYTES = (
+    3 * RADIAL_SEQUENCE * RADIAL_HEADS * RADIAL_HEAD_DIM * 2
+)
 
 RADIAL_PROFILE_AUDITS = {
     "aggressive": {
@@ -599,7 +614,1054 @@ def radial_receipt_evidence_errors(
     return errors
 
 
-def radial_microtest_evidence_errors(microtest, expected_gpu_uuid=None):
+def parse_nvidia_smi_pmon_output(raw_stdout):
+    """Parse auditable ``nvidia-smi pmon`` text using its dynamic header.
+
+    Idle ``-`` rows are retained rather than silently discarded.  The caller
+    can therefore distinguish a direct-compute observation from a sample that
+    did not expose any process.
+    """
+
+    errors = []
+    rows = []
+    header_columns = None
+    if not isinstance(raw_stdout, str):
+        return {
+            "header_columns": None,
+            "rows": [],
+            "errors": ["pmon raw stdout must be text"],
+        }
+    for line_number, raw_line in enumerate(raw_stdout.splitlines(), start=1):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            candidate = stripped[1:].strip().lower().split()
+            if {"gpu", "pid", "type", "command"}.issubset(candidate):
+                if len(candidate) != len(set(candidate)):
+                    errors.append(
+                        f"pmon header line {line_number} has duplicate columns"
+                    )
+                elif candidate[-1] != "command":
+                    errors.append(
+                        "pmon command column must be last for lossless parsing"
+                    )
+                elif header_columns is None:
+                    header_columns = candidate
+                elif candidate != header_columns:
+                    errors.append("pmon header changed within one capture")
+            continue
+        if header_columns is None:
+            errors.append(
+                f"pmon data line {line_number} appeared before a valid header"
+            )
+            continue
+        fields = stripped.split(maxsplit=len(header_columns) - 1)
+        if len(fields) != len(header_columns):
+            errors.append(
+                f"pmon data line {line_number} has {len(fields)} fields; "
+                f"expected {len(header_columns)}"
+            )
+            continue
+        columns = dict(zip(header_columns, fields))
+        try:
+            gpu_index = int(columns["gpu"])
+        except (KeyError, ValueError):
+            errors.append(
+                f"pmon data line {line_number} has an invalid GPU index"
+            )
+            continue
+        pid_text = columns.get("pid")
+        if pid_text == "-":
+            host_pid = None
+        else:
+            try:
+                host_pid = int(pid_text)
+            except (TypeError, ValueError):
+                errors.append(
+                    f"pmon data line {line_number} has an invalid PID"
+                )
+                continue
+        process_type = columns.get("type")
+        if process_type == "-":
+            process_type = None
+        source_date = columns.get("date")
+        source_time = columns.get("time")
+        source_timestamp = None
+        if (source_date is None) != (source_time is None):
+            errors.append(
+                f"pmon data line {line_number} has incomplete source time"
+            )
+            continue
+        if source_date is not None:
+            try:
+                source_timestamp = datetime.strptime(
+                    f"{source_date} {source_time}",
+                    "%Y%m%d %H:%M:%S",
+                ).replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                errors.append(
+                    f"pmon data line {line_number} has invalid source time"
+                )
+                continue
+        rows.append(
+            {
+                "line_number": line_number,
+                "gpu_index": gpu_index,
+                "host_pid": host_pid,
+                "process_type": process_type,
+                "command": columns.get("command", ""),
+                "source_date": source_date,
+                "source_time": source_time,
+                "source_timestamp_unix_seconds": source_timestamp,
+                "columns": columns,
+            }
+        )
+    if header_columns is None:
+        errors.append("pmon output lacks a valid gpu/pid/type/command header")
+    return {
+        "header_columns": header_columns,
+        "rows": rows,
+        "errors": errors,
+    }
+
+
+def _finite_number(value, *, nonnegative=False):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and (not nonnegative or float(value) >= 0.0)
+    )
+
+
+def _positive_integer(value):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+    )
+
+
+def _gpu_snapshot_errors(
+    sample,
+    expected_identity,
+    expected_nvidia_smi_binary,
+    context,
+):
+    errors = []
+    if not isinstance(sample, dict):
+        return [f"{context} must be a JSON object"]
+    required_fields = {
+        "available",
+        "error",
+        "device_index",
+        "device_uuid",
+        "device_name",
+        "processes",
+        "process_count",
+        "sampled_at_unix_seconds",
+        "sampled_at_monotonic_seconds",
+        "query_started_at_unix_seconds",
+        "query_finished_at_unix_seconds",
+        "query_started_at_monotonic_seconds",
+        "query_finished_at_monotonic_seconds",
+        "boot_id",
+        "nvidia_smi_binary",
+    }
+    missing_fields = sorted(required_fields - set(sample))
+    if missing_fields:
+        errors.append(f"{context} is missing fields: {missing_fields}")
+    if sample.get("available") is not True or sample.get("error") is not None:
+        errors.append(f"{context} GPU query is unavailable")
+    identity = (
+        sample.get("device_index"),
+        sample.get("device_uuid"),
+        sample.get("device_name"),
+        sample.get("boot_id"),
+    )
+    if identity != expected_identity:
+        errors.append(f"{context} GPU identity or boot ID drifted")
+    if sample.get("nvidia_smi_binary") != expected_nvidia_smi_binary:
+        errors.append(f"{context} trusted nvidia-smi binary drifted")
+    errors.extend(
+        f"{context}: {error}"
+        for error in trusted_nvidia_smi_metadata_errors(
+            sample.get("nvidia_smi_binary")
+        )
+    )
+    processes = sample.get("processes")
+    count = sample.get("process_count")
+    if (
+        not isinstance(processes, list)
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count != len(processes)
+        or count not in (0, 1)
+    ):
+        errors.append(f"{context} process list/count is invalid")
+        processes = []
+    for process in processes:
+        if (
+            not isinstance(process, dict)
+            or not _positive_integer(process.get("host_pid"))
+            or not _positive_integer(process.get("used_memory_mib"))
+            or not isinstance(process.get("process_name"), str)
+            or not process.get("process_name", "").strip()
+        ):
+            errors.append(f"{context} process details are invalid")
+    for suffix in ("unix_seconds", "monotonic_seconds"):
+        started = sample.get(f"query_started_at_{suffix}")
+        sampled = sample.get(f"sampled_at_{suffix}")
+        finished = sample.get(f"query_finished_at_{suffix}")
+        if not all(
+            _finite_number(value, nonnegative=True)
+            for value in (started, sampled, finished)
+        ) or not float(started) <= float(sampled) <= float(finished):
+            errors.append(f"{context} {suffix} query timestamps are invalid")
+    return errors
+
+
+def _pmon_evidence_errors(
+    pmon,
+    *,
+    expected_host_pid,
+    expected_nvidia_smi_binary,
+    immediate_finished_monotonic,
+    cuda_touch_started_monotonic,
+    context_live_finished_monotonic,
+    backend_started_wall,
+    backend_started_monotonic,
+    backend_returned_wall,
+    backend_returned_monotonic,
+    sync_finished_monotonic,
+):
+    errors = []
+    if not isinstance(pmon, dict):
+        return ["Radial GPU binding pmon evidence is missing"], []
+    raw_stdout = pmon.get("raw_stdout")
+    parsed = parse_nvidia_smi_pmon_output(raw_stdout)
+    errors.extend(
+        f"Radial pmon raw parse: {error}" for error in parsed["errors"]
+    )
+    if pmon.get("header_columns") != parsed["header_columns"]:
+        errors.append("Radial pmon stored header differs from raw stdout")
+    if pmon.get("rows") != parsed["rows"]:
+        errors.append("Radial pmon stored rows differ from raw stdout")
+    expected_command = [
+        "/usr/bin/nvidia-smi",
+        "pmon",
+        "-i",
+        "0",
+        "-s",
+        "um",
+        "-d",
+        "1",
+        "-o",
+        "DT",
+    ]
+    if pmon.get("command") != expected_command:
+        errors.append("Radial pmon command differs from fixed continuous query")
+    if pmon.get("locale") != {"LC_ALL": "C", "LANG": "C", "TZ": "UTC"}:
+        errors.append("Radial pmon locale/time zone is not fixed to C/UTC")
+    if pmon.get("nvidia_smi_binary") != expected_nvidia_smi_binary:
+        errors.append("Radial pmon trusted nvidia-smi metadata drifted")
+    errors.extend(
+        f"Radial pmon: {error}"
+        for error in trusted_nvidia_smi_metadata_errors(
+            pmon.get("nvidia_smi_binary")
+        )
+    )
+    if pmon.get("expected_host_pid") != expected_host_pid:
+        errors.append("Radial pmon expected host PID is not cross-bound")
+    if (
+        pmon.get("status") != "ok"
+        or not isinstance(raw_stdout, str)
+        or not isinstance(pmon.get("raw_stderr"), str)
+        or not _positive_integer(pmon.get("process_pid"))
+        or not isinstance(pmon.get("resolved_executable"), str)
+        or not Path(pmon.get("resolved_executable", "")).is_absolute()
+        or pmon.get("resolved_executable") != "/usr/bin/nvidia-smi"
+        or not isinstance(pmon.get("exit_code"), int)
+        or isinstance(pmon.get("exit_code"), bool)
+        or pmon.get("exit_code") not in (0, -15)
+        or pmon.get("termination_method") != "terminate"
+        or pmon.get("timed_out") is not False
+        or pmon.get("parser_errors") != []
+        or pmon.get("errors") != []
+    ):
+        errors.append("Radial pmon process completion evidence is invalid")
+    stdout_bytes = raw_stdout.encode("utf-8") if isinstance(raw_stdout, str) else b""
+    raw_stderr = pmon.get("raw_stderr")
+    stderr_bytes = (
+        raw_stderr.encode("utf-8") if isinstance(raw_stderr, str) else b""
+    )
+    if (
+        pmon.get("raw_stdout_bytes") != len(stdout_bytes)
+        or pmon.get("raw_stdout_sha256")
+        != hashlib.sha256(stdout_bytes).hexdigest()
+        or pmon.get("raw_stderr_bytes") != len(stderr_bytes)
+        or pmon.get("raw_stderr_sha256")
+        != hashlib.sha256(stderr_bytes).hexdigest()
+    ):
+        errors.append("Radial pmon raw stream fingerprints are invalid")
+    stderr_records = pmon.get("stderr_line_records")
+    if not isinstance(stderr_records, list):
+        errors.append("Radial pmon stderr line records are missing")
+        stderr_records = []
+    elif "".join(
+        record.get("raw_line", "") if isinstance(record, dict) else ""
+        for record in stderr_records
+    ) != raw_stderr:
+        errors.append("Radial pmon stderr records do not reconstruct raw stderr")
+    if raw_stderr:
+        errors.append("Radial pmon emitted stderr during the audited window")
+    line_records = pmon.get("stdout_line_records")
+    if not isinstance(line_records, list) or not line_records:
+        errors.append("Radial pmon stdout line records are missing")
+        line_records = []
+    elif "".join(
+        record.get("raw_line", "") if isinstance(record, dict) else ""
+        for record in line_records
+    ) != raw_stdout:
+        errors.append("Radial pmon line records do not reconstruct raw stdout")
+    rows_by_line = {row["line_number"]: row for row in parsed["rows"]}
+    previous_wall = None
+    previous_monotonic = None
+    for index, record in enumerate(line_records):
+        wall = (
+            record.get("received_at_unix_seconds")
+            if isinstance(record, dict)
+            else None
+        )
+        monotonic = (
+            record.get("received_at_monotonic_seconds")
+            if isinstance(record, dict)
+            else None
+        )
+        if (
+            not isinstance(record, dict)
+            or record.get("line_index") != index
+            or not isinstance(record.get("raw_line"), str)
+            or record.get("parsed_row") != rows_by_line.get(index + 1)
+            or not _finite_number(wall, nonnegative=True)
+            or not _finite_number(monotonic, nonnegative=True)
+            or (previous_wall is not None and float(wall) < previous_wall)
+            or (
+                previous_monotonic is not None
+                and float(monotonic) < previous_monotonic
+            )
+        ):
+            errors.append("Radial pmon stdout line record is invalid")
+            break
+        previous_wall = float(wall)
+        previous_monotonic = float(monotonic)
+    lifecycle_fields = (
+        "spawn_started_at",
+        "process_started_at",
+        "header_ready_at",
+        "idle_baseline_ready_at",
+        "host_pid_bound_at",
+        "backend_window_started_at",
+        "window_compute_ready_at",
+        "stop_requested_at",
+        "process_exited_at",
+    )
+    lifecycle_values = {}
+    for suffix in ("unix_seconds", "monotonic_seconds"):
+        values = []
+        for field in lifecycle_fields:
+            value = pmon.get(f"{field}_{suffix}")
+            lifecycle_values[(field, suffix)] = value
+            values.append(value)
+        if not all(_finite_number(value, nonnegative=True) for value in values):
+            errors.append(f"Radial pmon {suffix} lifecycle timestamps are invalid")
+        elif values != sorted(values):
+            errors.append(f"Radial pmon {suffix} lifecycle order is invalid")
+    pmon_started = lifecycle_values.get(
+        ("process_started_at", "monotonic_seconds")
+    )
+    pmon_spawn_started = lifecycle_values.get(
+        ("spawn_started_at", "monotonic_seconds")
+    )
+    idle_ready = lifecycle_values.get(
+        ("idle_baseline_ready_at", "monotonic_seconds")
+    )
+    host_pid_bound = lifecycle_values.get(
+        ("host_pid_bound_at", "monotonic_seconds")
+    )
+    backend_window_started = lifecycle_values.get(
+        ("backend_window_started_at", "monotonic_seconds")
+    )
+    window_compute_ready = lifecycle_values.get(
+        ("window_compute_ready_at", "monotonic_seconds")
+    )
+    stop_requested = lifecycle_values.get(
+        ("stop_requested_at", "monotonic_seconds")
+    )
+    if not all(
+        _finite_number(value, nonnegative=True)
+        for value in (
+            pmon_started,
+            pmon_spawn_started,
+            immediate_finished_monotonic,
+            cuda_touch_started_monotonic,
+            context_live_finished_monotonic,
+            idle_ready,
+            host_pid_bound,
+            backend_window_started,
+            backend_started_monotonic,
+            backend_returned_monotonic,
+            window_compute_ready,
+            sync_finished_monotonic,
+            stop_requested,
+        )
+    ) or not (
+        float(immediate_finished_monotonic) <= float(pmon_spawn_started)
+        <= float(pmon_started) <= float(idle_ready)
+        <= float(cuda_touch_started_monotonic)
+        <= float(context_live_finished_monotonic)
+        <= float(host_pid_bound)
+        <= float(backend_window_started)
+        == float(backend_started_monotonic)
+        <= float(window_compute_ready)
+        <= float(backend_returned_monotonic)
+        <= float(sync_finished_monotonic)
+        <= float(stop_requested)
+    ):
+        errors.append("Radial pmon does not span exact backend through final sync")
+    rows = parsed["rows"]
+    if not rows:
+        errors.append("Radial pmon raw output contains no process rows")
+    previous_source_time = None
+    for row in rows:
+        source_time = row.get("source_timestamp_unix_seconds")
+        line_number = row.get("line_number")
+        record = (
+            line_records[line_number - 1]
+            if isinstance(line_number, int)
+            and 0 < line_number <= len(line_records)
+            else None
+        )
+        received_wall = (
+            record.get("received_at_unix_seconds")
+            if isinstance(record, dict)
+            else None
+        )
+        if (
+            not _finite_number(source_time, nonnegative=True)
+            or not _finite_number(received_wall, nonnegative=True)
+            or float(source_time) > float(received_wall) + 1.0
+            or float(received_wall) - float(source_time) > 5.0
+            or (
+                previous_source_time is not None
+                and float(source_time) < previous_source_time
+            )
+        ):
+            errors.append("Radial pmon source timestamp is invalid or delayed")
+        elif previous_source_time is None or float(source_time) >= previous_source_time:
+            previous_source_time = float(source_time)
+        command = str(row.get("command", "")).lower()
+        idle_row = row.get("host_pid") is None
+        if idle_row:
+            valid_row = (
+                row.get("gpu_index") == 0
+                and row.get("process_type") is None
+                and row.get("command") == "-"
+            )
+        else:
+            valid_row = (
+                row.get("gpu_index") == 0
+                and row.get("host_pid") == expected_host_pid
+                and row.get("process_type") == "C"
+                and bool(row.get("command"))
+                and "mps" not in command
+            )
+        if not valid_row:
+            errors.append(
+                "Radial pmon row is neither idle nor the stable direct C client"
+            )
+            break
+    baseline_line = pmon.get("idle_baseline_line_number")
+    baseline_row = next(
+        (
+            row
+            for row in rows
+            if row.get("line_number") == baseline_line
+        ),
+        None,
+    )
+    if (
+        not _positive_integer(baseline_line)
+        or not isinstance(baseline_row, dict)
+        or baseline_row.get("gpu_index") != 0
+        or baseline_row.get("host_pid") is not None
+        or baseline_row.get("process_type") is not None
+        or baseline_row.get("command") != "-"
+    ):
+        errors.append("Radial pmon idle baseline row is invalid")
+    if isinstance(baseline_line, int) and any(
+        row.get("host_pid") is not None
+        and isinstance(row.get("line_number"), int)
+        and row["line_number"] <= baseline_line
+        for row in rows
+    ):
+        errors.append("Radial pmon observed a process before the idle baseline")
+    window_start_line = pmon.get("backend_window_start_line_number")
+    window_compute_line = pmon.get("window_compute_line_number")
+    matching_rows = [
+        row
+        for row in rows
+        if isinstance(window_start_line, int)
+        and row.get("line_number", 0) > window_start_line
+        and row.get("gpu_index") == 0
+        and row.get("host_pid") == expected_host_pid
+        and row.get("process_type") == "C"
+    ]
+    selected_window_row = next(
+        (
+            row
+            for row in matching_rows
+            if row.get("line_number") == window_compute_line
+        ),
+        None,
+    )
+    selected_window_record = (
+        line_records[window_compute_line - 1]
+        if isinstance(window_compute_line, int)
+        and 0 < window_compute_line <= len(line_records)
+        else None
+    )
+    selected_source_time = (
+        selected_window_row.get("source_timestamp_unix_seconds")
+        if isinstance(selected_window_row, dict)
+        else None
+    )
+    if (
+        not isinstance(window_start_line, int)
+        or isinstance(window_start_line, bool)
+        or not isinstance(baseline_line, int)
+        or window_start_line < baseline_line
+        or window_start_line > len(line_records)
+        or not isinstance(selected_window_row, dict)
+        or not isinstance(selected_window_record, dict)
+    ):
+        errors.append("Radial pmon backend-window C line binding is invalid")
+    if not all(
+        _finite_number(value, nonnegative=True)
+        for value in (
+            selected_source_time,
+            backend_started_wall,
+            backend_returned_wall,
+        )
+    ) or not (
+        float(backend_started_wall) < float(selected_source_time)
+        <= float(backend_returned_wall)
+    ):
+        errors.append(
+            "Radial pmon source-DT sample is not strictly inside the backend window"
+        )
+    header_records = [
+        record
+        for record in line_records
+        if isinstance(record, dict)
+        and isinstance(record.get("raw_line"), str)
+        and record["raw_line"].lstrip().startswith("#")
+        and {
+            "gpu",
+            "pid",
+            "type",
+            "command",
+        }.issubset(record["raw_line"].lstrip("# ").lower().split())
+    ]
+    baseline_record = (
+        line_records[baseline_line - 1]
+        if isinstance(baseline_line, int)
+        and 0 < baseline_line <= len(line_records)
+        else None
+    )
+    if (
+        not header_records
+        or not isinstance(baseline_record, dict)
+        or not isinstance(selected_window_record, dict)
+    ):
+        errors.append("Radial pmon ready events lack matching raw line records")
+    else:
+        lifecycle_record_pairs = (
+            ("header_ready_at", header_records[0]),
+            ("idle_baseline_ready_at", baseline_record),
+            ("window_compute_ready_at", selected_window_record),
+        )
+        for event_name, record in lifecycle_record_pairs:
+            for suffix in ("unix_seconds", "monotonic_seconds"):
+                if pmon.get(f"{event_name}_{suffix}") != record.get(
+                    f"received_at_{suffix}"
+                ):
+                    errors.append(
+                        "Radial pmon lifecycle event differs from its raw line"
+                    )
+                    break
+    return errors, rows
+
+
+def radial_gpu_process_binding_errors(
+    binding,
+    *,
+    expected_pre_run_gpu=None,
+    expected_pre_run_gpu_sha256=None,
+    expected_pre_run_gpu_path=None,
+    expected_python_executable=None,
+):
+    """Independently validate the fail-closed Radial GPU snapshot binding."""
+
+    if not isinstance(binding, dict):
+        return ["Radial GPU process binding must be a JSON object"]
+    errors = []
+    if binding.get("schema_version") != RADIAL_GPU_PROCESS_BINDING_SCHEMA_VERSION:
+        errors.append("Radial GPU process binding schema is unsupported")
+    method = binding.get("binding_method")
+    if method not in RADIAL_GPU_PROCESS_BINDING_METHODS:
+        errors.append("Radial GPU process binding method is invalid")
+    if binding.get("claim_scope") != RADIAL_GPU_PROCESS_CLAIM_SCOPE:
+        errors.append("Radial GPU process binding claim scope is invalid")
+
+    pre_run_gpu = binding.get("pre_run_gpu")
+    if not isinstance(pre_run_gpu, dict):
+        errors.append("Radial GPU binding lacks pre-run GPU evidence")
+        pre_run_gpu = {}
+    if expected_pre_run_gpu is not None and pre_run_gpu != expected_pre_run_gpu:
+        errors.append("Radial GPU binding pre-run evidence differs from run evidence")
+    pre_sha = binding.get("pre_run_gpu_sha256")
+    if (
+        not isinstance(pre_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", pre_sha) is None
+    ):
+        errors.append("Radial GPU binding pre-run SHA256 is invalid")
+    if (
+        expected_pre_run_gpu_sha256 is not None
+        and pre_sha != expected_pre_run_gpu_sha256
+    ):
+        errors.append("Radial GPU binding pre-run SHA256 differs from exact file bytes")
+    pre_path = binding.get("pre_run_gpu_path")
+    if not isinstance(pre_path, str) or not Path(pre_path).is_absolute():
+        errors.append("Radial GPU binding pre-run path is not absolute")
+    if expected_pre_run_gpu_path is not None and pre_path != expected_pre_run_gpu_path:
+        errors.append("Radial GPU binding pre-run path differs from verified file")
+
+    device_uuid = pre_run_gpu.get("device_uuid")
+    device_name = pre_run_gpu.get("device_name")
+    boot_id = pre_run_gpu.get("boot_id")
+    nvidia_smi_binary = pre_run_gpu.get("nvidia_smi_binary")
+    expected_identity = (0, device_uuid, device_name, boot_id)
+    errors.extend(
+        f"Radial pre-run GPU evidence: {error}"
+        for error in trusted_nvidia_smi_metadata_errors(nvidia_smi_binary)
+    )
+    if (
+        pre_run_gpu.get("schema_version") != 1
+        or pre_run_gpu.get("check_type") != "pre_run_idle"
+        or pre_run_gpu.get("physical_device_index") != 0
+        or pre_run_gpu.get("device_index") != 0
+        or pre_run_gpu.get("available") is not True
+        or pre_run_gpu.get("error") is not None
+        or pre_run_gpu.get("processes") != []
+        or pre_run_gpu.get("process_count") != 0
+        or pre_run_gpu.get("idle") is not True
+        or pre_run_gpu.get("valid_for_run") is not True
+        or pre_run_gpu.get("errors") != []
+    ):
+        errors.append("Radial GPU binding pre-run idle evidence is invalid")
+    boot_pattern = (
+        r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+    )
+    if (
+        not isinstance(device_uuid, str)
+        or not device_uuid.startswith("GPU-")
+        or not isinstance(device_name, str)
+        or not device_name
+        or not isinstance(boot_id, str)
+        or re.fullmatch(boot_pattern, boot_id) is None
+        or not isinstance(pre_run_gpu.get("run_nonce"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", pre_run_gpu.get("run_nonce", ""))
+        is None
+    ):
+        errors.append("Radial GPU binding pre-run identity/nonce is invalid")
+    if (
+        binding.get("current_cuda_device_uuid") != device_uuid
+        or binding.get("current_cuda_device_name") != device_name
+        or binding.get("current_cuda_device_index") != 0
+        or binding.get("cuda_visible_devices") != device_uuid
+        or pre_run_gpu.get("cuda_visible_devices") != device_uuid
+    ):
+        errors.append("Radial GPU binding CUDA identity is not cross-bound")
+
+    python_executable = binding.get("python_executable")
+    resolved_executable = binding.get("python_executable_resolved")
+    if (
+        not isinstance(python_executable, str)
+        or not Path(python_executable).is_absolute()
+        or not isinstance(resolved_executable, str)
+        or not Path(resolved_executable).is_absolute()
+    ):
+        errors.append("Radial GPU binding Python executable evidence is invalid")
+    if (
+        expected_python_executable is not None
+        and python_executable != expected_python_executable
+    ):
+        errors.append("Radial GPU binding Python executable differs from preflight")
+
+    phase_fields = (
+        "microtest_started_at",
+        "cuda_touch_started_at",
+        "setup_cuda_synchronize_started_at",
+        "setup_cuda_synchronized_at",
+        "exact_backend_started_at",
+        "exact_backend_returned_at",
+        "cuda_synchronize_started_at",
+        "cuda_synchronized_at",
+    )
+    phase_times = {}
+    for suffix in ("unix_seconds", "monotonic_seconds"):
+        values = []
+        for field in phase_fields:
+            value = binding.get(f"{field}_{suffix}")
+            phase_times[(field, suffix)] = value
+            values.append(value)
+        if not all(_finite_number(value, nonnegative=True) for value in values):
+            errors.append(f"Radial GPU binding {suffix} phase timestamps are invalid")
+        elif values != sorted(values):
+            errors.append(f"Radial GPU binding {suffix} phase order is invalid")
+    pre_wall = pre_run_gpu.get("sampled_at_unix_seconds")
+    pre_mono = pre_run_gpu.get("sampled_at_monotonic_seconds")
+    micro_wall = phase_times.get(("microtest_started_at", "unix_seconds"))
+    micro_mono = phase_times.get(("microtest_started_at", "monotonic_seconds"))
+    if not all(
+        _finite_number(value, nonnegative=True)
+        for value in (pre_wall, pre_mono, micro_wall, micro_mono)
+    ):
+        errors.append("Radial GPU binding pre-run timestamps are invalid")
+    elif not (
+        float(pre_wall) <= float(micro_wall)
+        and float(pre_mono) <= float(micro_mono)
+        and float(micro_wall) - float(pre_wall)
+        <= RADIAL_GPU_IDLE_GUARD_MAX_AGE_SECONDS
+    ):
+        errors.append("Radial GPU binding pre-run guard is stale, future, or rebooted")
+
+    immediate = binding.get("immediate_pre_cuda_sample")
+    context_live = binding.get("context_live_sample")
+    interval_samples = binding.get("interval_samples")
+    post_samples = binding.get("post_cuda_samples")
+    if (
+        binding.get("interval_seconds") != 0.1
+        or not isinstance(interval_samples, list)
+        or len(interval_samples) < 2
+    ):
+        errors.append("Radial GPU binding interval samples are missing")
+        interval_samples = []
+    if not isinstance(post_samples, list) or len(post_samples) != 2:
+        errors.append("Radial GPU binding requires exactly two post-CUDA samples")
+        post_samples = []
+    labelled_samples = [
+        ("immediate pre-CUDA sample", immediate),
+        ("context-live sample", context_live),
+        *[
+            (f"interval sample {index}", sample)
+            for index, sample in enumerate(interval_samples)
+        ],
+        *[
+            (f"post-CUDA sample {index}", sample)
+            for index, sample in enumerate(post_samples)
+        ],
+    ]
+    for context, sample in labelled_samples:
+        errors.extend(
+            _gpu_snapshot_errors(
+                sample,
+                expected_identity,
+                nvidia_smi_binary,
+                context,
+            )
+        )
+    if isinstance(immediate, dict) and (
+        immediate.get("process_count") != 0 or immediate.get("processes") != []
+    ):
+        errors.append("Radial immediate pre-CUDA sample is not idle")
+    for context, sample in [
+        ("context-live", context_live),
+        *[
+            (f"post-CUDA {index}", sample)
+            for index, sample in enumerate(post_samples)
+        ],
+    ]:
+        if not isinstance(sample, dict) or sample.get("process_count") != 1:
+            errors.append(f"Radial {context} sample is not a singleton")
+
+    immediate_finished = (
+        immediate.get("query_finished_at_monotonic_seconds")
+        if isinstance(immediate, dict)
+        else None
+    )
+    touch_mono = phase_times.get(("cuda_touch_started_at", "monotonic_seconds"))
+    context_finished = (
+        context_live.get("query_finished_at_monotonic_seconds")
+        if isinstance(context_live, dict)
+        else None
+    )
+    backend_started = phase_times.get(
+        ("exact_backend_started_at", "monotonic_seconds")
+    )
+    sync_finished = phase_times.get(
+        ("cuda_synchronized_at", "monotonic_seconds")
+    )
+    post_starts = [
+        sample.get("query_started_at_monotonic_seconds")
+        for sample in post_samples
+        if isinstance(sample, dict)
+    ]
+    post_finishes = [
+        sample.get("query_finished_at_monotonic_seconds")
+        for sample in post_samples
+        if isinstance(sample, dict)
+    ]
+    ordered_phase_samples = (
+        immediate_finished,
+        touch_mono,
+        phase_times.get(
+            ("setup_cuda_synchronize_started_at", "monotonic_seconds")
+        ),
+        phase_times.get(
+            ("setup_cuda_synchronized_at", "monotonic_seconds")
+        ),
+        (
+            context_live.get("query_started_at_monotonic_seconds")
+            if isinstance(context_live, dict)
+            else None
+        ),
+        context_finished,
+        backend_started,
+        sync_finished,
+        *post_starts,
+        *post_finishes,
+    )
+    if len(post_starts) != 2 or len(post_finishes) != 2 or not all(
+        _finite_number(value, nonnegative=True)
+        for value in ordered_phase_samples
+    ):
+        errors.append("Radial GPU sample/phase timestamps are invalid")
+    elif not (
+        float(immediate_finished) <= float(touch_mono)
+        <= float(
+            phase_times[(
+                "setup_cuda_synchronize_started_at",
+                "monotonic_seconds",
+            )]
+        )
+        <= float(
+            phase_times[("setup_cuda_synchronized_at", "monotonic_seconds")]
+        )
+        <= float(context_live["query_started_at_monotonic_seconds"])
+        <= float(context_finished) <= float(backend_started)
+        <= float(sync_finished) <= float(post_starts[0])
+        <= float(post_finishes[0]) <= float(post_starts[1])
+        <= float(post_finishes[1])
+        and float(post_starts[1]) - float(post_finishes[0]) >= 0.1
+    ):
+        errors.append("Radial GPU sample/phase timestamp binding is invalid")
+    if len(post_samples) == 2 and isinstance(post_samples[-1], dict):
+        final_wall = post_samples[-1].get("query_finished_at_unix_seconds")
+        if not all(
+            _finite_number(value, nonnegative=True)
+            for value in (pre_wall, final_wall)
+        ) or not (
+            float(pre_wall) <= float(final_wall)
+            and float(final_wall) - float(pre_wall)
+            <= RADIAL_GPU_IDLE_GUARD_MAX_AGE_SECONDS
+        ):
+            errors.append("Radial GPU binding final snapshot exceeds guard age")
+
+    all_samples = [
+        sample
+        for _, sample in labelled_samples
+        if isinstance(sample, dict)
+        and _finite_number(
+            sample.get("query_finished_at_monotonic_seconds"),
+            nonnegative=True,
+        )
+    ]
+    ordered_samples = sorted(
+        all_samples,
+        key=lambda sample: float(sample["query_finished_at_monotonic_seconds"]),
+    )
+    positive_seen = False
+    positive_processes = []
+    for sample in ordered_samples:
+        if sample.get("process_count") == 1:
+            positive_seen = True
+            processes = sample.get("processes")
+            if isinstance(processes, list) and len(processes) == 1:
+                positive_processes.append(processes[0])
+        elif positive_seen and sample.get("process_count") == 0:
+            errors.append("Radial GPU process disappeared after first live snapshot")
+            break
+    if _finite_number(context_finished, nonnegative=True):
+        for sample in all_samples:
+            started = sample.get("query_started_at_monotonic_seconds")
+            if (
+                _finite_number(started, nonnegative=True)
+                and float(started) >= float(context_finished)
+                and sample.get("process_count") != 1
+            ):
+                errors.append("Radial live-phase GPU sample is not a singleton")
+                break
+    positive_identities = {
+        (
+            process.get("host_pid") if isinstance(process, dict) else None,
+            process.get("process_name", "").strip()
+            if isinstance(process, dict)
+            else "",
+        )
+        for process in positive_processes
+    }
+    if len(positive_identities) != 1:
+        errors.append("Radial GPU singleton PID/process name is not stable")
+        host_pid = None
+        process_name = ""
+    else:
+        host_pid, process_name = next(iter(positive_identities))
+    normalized_name = process_name.lower()
+    if (
+        process_name
+        and normalized_name != "[not found]"
+        and "python" not in normalized_name
+    ) or "mps" in normalized_name:
+        errors.append("Radial GPU process name is not an allowed direct client")
+
+    container_pid = binding.get("container_pid")
+    recorded_host_pid = binding.get("nvidia_smi_host_pid")
+    if (
+        not _positive_integer(container_pid)
+        or not _positive_integer(recorded_host_pid)
+        or recorded_host_pid != host_pid
+    ):
+        errors.append("Radial GPU binding PID evidence is invalid")
+    qkv_bytes = binding.get("qkv_storage_bytes")
+    allocator_bytes = binding.get("allocator_memory_bytes")
+    reserved_bytes = binding.get("reserved_memory_bytes")
+    if qkv_bytes != RADIAL_QKV_STORAGE_BYTES:
+        errors.append("Radial GPU binding QKV storage size differs from fixed shape")
+    if (
+        not _positive_integer(allocator_bytes)
+        or not _positive_integer(reserved_bytes)
+        or not _positive_integer(qkv_bytes)
+        or allocator_bytes < qkv_bytes
+        or reserved_bytes < allocator_bytes
+    ):
+        errors.append("Radial GPU allocator/reserve evidence is invalid")
+    if len(post_samples) == 2 and isinstance(post_samples[-1], dict):
+        final_processes = post_samples[-1].get("processes")
+        final_used_mib = (
+            final_processes[0].get("used_memory_mib")
+            if isinstance(final_processes, list)
+            and len(final_processes) == 1
+            and isinstance(final_processes[0], dict)
+            else None
+        )
+        if (
+            not _positive_integer(final_used_mib)
+            or not _positive_integer(reserved_bytes)
+            or final_used_mib * 1024 * 1024 + 1024 * 1024 < reserved_bytes
+        ):
+            errors.append("Radial nvidia-smi memory does not cover CUDA reserve")
+
+    mps = binding.get("mps")
+    if not isinstance(mps, dict):
+        errors.append("Radial GPU binding MPS evidence is missing")
+        mps = {}
+    if mps.get("cuda_mps_environment_variables") != []:
+        errors.append("Radial GPU binding has CUDA MPS environment variables")
+    pmon_errors, pmon_rows = _pmon_evidence_errors(
+        mps.get("pmon"),
+        expected_host_pid=host_pid,
+        expected_nvidia_smi_binary=nvidia_smi_binary,
+        immediate_finished_monotonic=immediate_finished,
+        cuda_touch_started_monotonic=touch_mono,
+        context_live_finished_monotonic=context_finished,
+        backend_started_wall=phase_times.get(
+            ("exact_backend_started_at", "unix_seconds")
+        ),
+        backend_started_monotonic=backend_started,
+        backend_returned_wall=phase_times.get(
+            ("exact_backend_returned_at", "unix_seconds")
+        ),
+        backend_returned_monotonic=phase_times.get(
+            ("exact_backend_returned_at", "monotonic_seconds")
+        ),
+        sync_finished_monotonic=sync_finished,
+    )
+    errors.extend(pmon_errors)
+    recomputed_mps = bool(
+        any(
+            row.get("host_pid") is not None
+            and (
+                row.get("process_type") != "C"
+                or "mps" in str(row.get("command", "")).lower()
+            )
+            for row in pmon_rows
+        )
+        or "mps" in normalized_name
+    )
+    if mps.get("mps_process_detected") is not recomputed_mps:
+        errors.append("Radial MPS conclusion differs from raw process evidence")
+    if recomputed_mps:
+        errors.append("Radial GPU binding detected MPS")
+
+    nspid = binding.get("nspid")
+    proc_visibility = binding.get("host_pid_proc_visibility")
+    chain = nspid.get("chain") if isinstance(nspid, dict) else None
+    if (
+        not isinstance(proc_visibility, dict)
+        or proc_visibility.get("status") not in ("visible", "not_visible")
+        or proc_visibility.get("error") is not None
+    ):
+        errors.append("Radial host PID proc visibility evidence is invalid")
+    if (
+        not isinstance(nspid, dict)
+        or nspid.get("status") != "ok"
+        or nspid.get("error") is not None
+        or not isinstance(chain, list)
+        or not chain
+        or any(not _positive_integer(pid) for pid in chain)
+        or chain[-1] != container_pid
+    ):
+        errors.append("Radial NSpid evidence is unavailable or malformed")
+    if method == "direct_nspid":
+        if not isinstance(chain, list) or len(chain) < 2 or chain[0] != host_pid:
+            errors.append("Radial direct NSpid binding lacks the outer host PID")
+    elif method == "snapshot_bound_singleton_after_idle_guard":
+        if (
+            chain != [container_pid]
+            or host_pid in (chain or [])
+            or proc_visibility != {"status": "not_visible", "error": None}
+        ):
+            errors.append("Radial snapshot binding lacks strict namespace evidence")
+    if binding.get("exact_kernel_completed") is not True:
+        errors.append("Radial exact backend completion is not proven")
+    if not _positive_integer(binding.get("exact_backend_call_count")):
+        errors.append("Radial exact backend call count is invalid")
+    if binding.get("cuda_synchronize_completed") is not True:
+        errors.append("Radial final CUDA synchronization is not proven")
+    return errors
+
+
+def radial_microtest_evidence_errors(
+    microtest,
+    expected_gpu_uuid=None,
+    expected_pre_run_gpu=None,
+    expected_pre_run_gpu_sha256=None,
+    expected_pre_run_gpu_path=None,
+    expected_python_executable=None,
+):
     """Validate a real exact-shape FlashInfer launch performed by preflight."""
 
     if not isinstance(microtest, dict):
@@ -611,6 +1673,7 @@ def radial_microtest_evidence_errors(microtest, expected_gpu_uuid=None):
         "physical_device_index": 0,
         "logical_cuda_device_index": 0,
         "gpu_process_count": 1,
+        "cuda_synchronized": True,
         "compute_capability": [8, 0],
         "torch": RADIAL_EXPECTED_TORCH,
         "torch_cuda": RADIAL_EXPECTED_TORCH_CUDA,
@@ -623,10 +1686,6 @@ def radial_microtest_evidence_errors(microtest, expected_gpu_uuid=None):
         "prefix_sequence": RADIAL_PREFIX_SEQUENCE,
         "tail_sequence": RADIAL_TAIL_SEQUENCE,
         "tail_strategy": "dense_lse_merge_no_padding",
-        "calls": 1,
-        "plan_cache_entries": 1,
-        "plan_cache_misses": 1,
-        "plan_cache_hits": 0,
         "mask_audit": RADIAL_PROFILE_AUDITS["conservative"],
         "finite": True,
     }
@@ -636,6 +1695,20 @@ def radial_microtest_evidence_errors(microtest, expected_gpu_uuid=None):
                 f"Radial microtest {field}={microtest.get(field)!r} != "
                 f"{expected_value!r}"
             )
+    call_count = microtest.get("exact_backend_call_count")
+    binding = microtest.get("gpu_process_binding")
+    if (
+        not _positive_integer(call_count)
+        or not isinstance(binding, dict)
+        or binding.get("exact_backend_call_count") != call_count
+        or microtest.get("calls") != call_count
+        or microtest.get("plan_cache_entries") != 1
+        or microtest.get("plan_cache_misses") != 1
+        or microtest.get("plan_cache_hits") != call_count - 1
+    ):
+        errors.append(
+            "Radial repeated backend calls/plan-cache metrics are not cross-bound"
+        )
     before_cuda = microtest.get("runtime_dependencies_before_cuda")
     after_cuda = microtest.get("runtime_dependencies_after_cuda")
     if before_cuda != after_cuda:
@@ -668,43 +1741,109 @@ def radial_microtest_evidence_errors(microtest, expected_gpu_uuid=None):
         errors.append(
             "Radial microtest CUDA_VISIBLE_DEVICES does not equal physical GPU UUID"
         )
-    host_pid = microtest.get("host_pid")
+    pre_run_gpu = microtest.get("pre_run_gpu")
+    if not isinstance(pre_run_gpu, dict):
+        errors.append("Radial microtest lacks pre-run idle GPU evidence")
+        pre_run_gpu = {}
+    expected_pre_run_fields = {
+        "schema_version": 1,
+        "check_type": "pre_run_idle",
+        "physical_device_index": 0,
+        "cuda_visible_devices": device_uuid,
+        "available": True,
+        "error": None,
+        "device_index": 0,
+        "device_uuid": device_uuid,
+        "device_name": microtest.get("device"),
+        "processes": [],
+        "process_count": 0,
+        "idle": True,
+        "valid_for_run": True,
+        "errors": [],
+    }
+    for field, expected_value in expected_pre_run_fields.items():
+        if pre_run_gpu.get(field) != expected_value:
+            errors.append(
+                f"Radial microtest pre-run {field}="
+                f"{pre_run_gpu.get(field)!r} != {expected_value!r}"
+            )
     if (
-        not isinstance(host_pid, int)
-        or isinstance(host_pid, bool)
-        or host_pid <= 0
-    ):
-        errors.append("Radial microtest host_pid is missing or invalid")
-    python_pid = microtest.get("python_pid")
-    pid_chain = microtest.get("pid_namespace_chain")
-    if (
-        not isinstance(python_pid, int)
-        or isinstance(python_pid, bool)
-        or python_pid <= 0
-        or not isinstance(pid_chain, list)
-        or not pid_chain
-        or any(
-            not isinstance(pid, int)
-            or isinstance(pid, bool)
-            or pid <= 0
-            for pid in pid_chain
-        )
-        or pid_chain[-1] != python_pid
-        or host_pid not in pid_chain
-    ):
-        errors.append("Radial microtest PID namespace evidence is invalid")
-    processes = microtest.get("gpu_processes")
-    if (
-        not isinstance(processes, list)
-        or len(processes) != 1
-        or not isinstance(processes[0], dict)
-        or processes[0].get("host_pid") != host_pid
-        or not isinstance(processes[0].get("used_memory_mib"), int)
-        or isinstance(processes[0].get("used_memory_mib"), bool)
-        or processes[0]["used_memory_mib"] < 0
+        expected_pre_run_gpu is not None
+        and pre_run_gpu != expected_pre_run_gpu
     ):
         errors.append(
-            "Radial microtest GPU process evidence is not the current unique PID"
+            "Radial microtest pre-run GPU evidence differs from run evidence"
+        )
+    errors.extend(
+        radial_gpu_process_binding_errors(
+            binding,
+            expected_pre_run_gpu=expected_pre_run_gpu,
+            expected_pre_run_gpu_sha256=expected_pre_run_gpu_sha256,
+            expected_pre_run_gpu_path=expected_pre_run_gpu_path,
+            expected_python_executable=expected_python_executable,
+        )
+    )
+    if isinstance(binding, dict):
+        cross_bound_fields = {
+            "host_pid": binding.get("nvidia_smi_host_pid"),
+            "python_pid": binding.get("container_pid"),
+            "pid_namespace_chain": (
+                binding.get("nspid", {}).get("chain")
+                if isinstance(binding.get("nspid"), dict)
+                else None
+            ),
+            "pid_binding_method": binding.get("binding_method"),
+            "pre_run_gpu": binding.get("pre_run_gpu"),
+            "pre_run_gpu_sha256": binding.get("pre_run_gpu_sha256"),
+            "post_cuda_sampled_at_unix_seconds": (
+                binding.get("post_cuda_samples", [{}])[-1].get(
+                    "sampled_at_unix_seconds"
+                )
+                if isinstance(binding.get("post_cuda_samples"), list)
+                and binding.get("post_cuda_samples")
+                and isinstance(binding.get("post_cuda_samples")[-1], dict)
+                else None
+            ),
+            "gpu_process_count": (
+                binding.get("post_cuda_samples", [{}])[-1].get(
+                    "process_count"
+                )
+                if isinstance(binding.get("post_cuda_samples"), list)
+                and binding.get("post_cuda_samples")
+                and isinstance(binding.get("post_cuda_samples")[-1], dict)
+                else None
+            ),
+            "gpu_processes": (
+                binding.get("post_cuda_samples", [{}])[-1].get("processes")
+                if isinstance(binding.get("post_cuda_samples"), list)
+                and binding.get("post_cuda_samples")
+                and isinstance(binding.get("post_cuda_samples")[-1], dict)
+                else None
+            ),
+        }
+        for field, expected_value in cross_bound_fields.items():
+            if microtest.get(field) != expected_value:
+                errors.append(
+                    f"Radial microtest {field} differs from GPU process binding"
+                )
+        expected_visible = binding.get("binding_method") == "direct_nspid"
+        if microtest.get("host_pid_namespace_visible") is not expected_visible:
+            errors.append(
+                "Radial microtest host PID visibility differs from binding method"
+            )
+    pre_run_sample = pre_run_gpu.get("sampled_at_unix_seconds")
+    post_cuda_sample = microtest.get("post_cuda_sampled_at_unix_seconds")
+    if (
+        not isinstance(pre_run_sample, (int, float))
+        or isinstance(pre_run_sample, bool)
+        or not math.isfinite(float(pre_run_sample))
+        or not isinstance(post_cuda_sample, (int, float))
+        or isinstance(post_cuda_sample, bool)
+        or not math.isfinite(float(post_cuda_sample))
+        or float(post_cuda_sample) <= float(pre_run_sample)
+    ):
+        errors.append(
+            "Radial microtest post-CUDA GPU sample does not follow idle evidence"
         )
     for field, require_positive in (
         ("output_abs_mean", True),
