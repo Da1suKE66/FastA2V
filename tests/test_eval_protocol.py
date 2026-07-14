@@ -89,7 +89,7 @@ RUN_KIND_CONFIGS = {
     ),
 }
 
-DEV6_RUN_KINDS = {
+FORMAL8_RUN_KINDS = {
     "dense_baseline",
     "cfg_cache_benchmark",
     "block_cache_benchmark",
@@ -178,6 +178,7 @@ class ImmutableEvalProtocolTests(unittest.TestCase):
         for filename, expected_count in (
             ("ovi_smoke.csv", 1),
             ("ovi_dev6.csv", 6),
+            ("ovi_formal8.csv", 8),
         ):
             with (REPO_ROOT / "prompts" / filename).open(
                 newline="", encoding="utf-8"
@@ -191,22 +192,28 @@ class ImmutableEvalProtocolTests(unittest.TestCase):
             prompt_sets[filename] = (
                 expected_count,
                 prompt_sequence_sha256(prompts),
+                prompts,
             )
+
+        self.assertEqual(
+            prompt_sets["ovi_formal8.csv"][2][:6],
+            prompt_sets["ovi_dev6.csv"][2],
+        )
 
         for run_kind, protocol in RUN_KIND_PROTOCOLS.items():
             with self.subTest(run_kind=run_kind):
                 filename = (
-                    "ovi_dev6.csv"
-                    if run_kind in DEV6_RUN_KINDS
+                    "ovi_formal8.csv"
+                    if run_kind in FORMAL8_RUN_KINDS
                     else "ovi_smoke.csv"
                 )
-                expected_count, expected_hash = prompt_sets[filename]
+                expected_count, expected_hash, _prompts = prompt_sets[filename]
                 self.assertEqual(protocol["prompt_count"], expected_count)
                 self.assertEqual(protocol["prompts_sha256"], expected_hash)
 
-    def test_formal_configs_use_dev6_and_smoke_configs_stay_single_prompt(self):
+    def test_formal_configs_use_formal8_and_smoke_configs_stay_single_prompt(self):
         self.assertEqual(
-            DEV6_RUN_KINDS,
+            FORMAL8_RUN_KINDS,
             {
                 run_kind
                 for run_kind, protocol in RUN_KIND_PROTOCOLS.items()
@@ -217,8 +224,8 @@ class ImmutableEvalProtocolTests(unittest.TestCase):
             if run_kind == "official_reference":
                 continue
             expected_prompt_file = (
-                "ovi_dev6.csv"
-                if run_kind in DEV6_RUN_KINDS
+                "ovi_formal8.csv"
+                if run_kind in FORMAL8_RUN_KINDS
                 else "ovi_smoke.csv"
             )
             source = (REPO_ROOT / "configs" / filename).read_text(
@@ -238,10 +245,18 @@ class ImmutableEvalProtocolTests(unittest.TestCase):
                     * protocol["prompt_count"]
                     * protocol["each_example_n_times"],
                 )
-                expected_count = 6 if run_kind in DEV6_RUN_KINDS else 1
+                expected_count = 8 if run_kind in FORMAL8_RUN_KINDS else 1
+                expected_samples = 3 if run_kind in FORMAL8_RUN_KINDS else 1
+                expected_records = 72 if run_kind in FORMAL8_RUN_KINDS else 1
                 self.assertEqual(protocol["prompt_count"], expected_count)
+                self.assertEqual(
+                    protocol["each_example_n_times"], expected_samples
+                )
+                self.assertEqual(
+                    protocol["expected_measurement_records"], expected_records
+                )
 
-    def test_evaluation_matrix_uses_dev6_and_current_method_statuses(self):
+    def test_evaluation_matrix_uses_formal8_and_a_to_f_method_order(self):
         matrix = json.loads(
             (REPO_ROOT / "configs" / "ovi_eval_matrix.json").read_text(
                 encoding="utf-8"
@@ -249,8 +264,31 @@ class ImmutableEvalProtocolTests(unittest.TestCase):
         )
         fixed = matrix["fixed_protocol"]
         formal = RUN_KIND_PROTOCOLS["dense_baseline"]
+        self.assertEqual(
+            matrix["matrix_id"],
+            "ovi_720x720_5s_a100_bf16_formal8x3_v2",
+        )
         self.assertEqual(fixed["prompt_count"], formal["prompt_count"])
         self.assertEqual(fixed["prompts_sha256"], formal["prompts_sha256"])
+        self.assertEqual(
+            fixed["each_example_n_times"], formal["each_example_n_times"]
+        )
+        formal_methods = matrix["methods"][:6]
+        self.assertEqual(
+            [method["method_id"] for method in formal_methods],
+            [
+                "dense",
+                "dense_cfg_cache",
+                "sparge_topk75",
+                "sparge_topk50",
+                "radial_conservative",
+                "radial_aggressive",
+            ],
+        )
+        self.assertEqual(
+            [method["formal_slot"] for method in formal_methods],
+            list("ABCDEF"),
+        )
         methods = {method["method_id"]: method for method in matrix["methods"]}
         for method_id in ("radial_conservative", "radial_aggressive"):
             self.assertEqual(methods[method_id]["implementation_status"], "ready")

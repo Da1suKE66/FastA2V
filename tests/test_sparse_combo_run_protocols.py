@@ -78,10 +78,11 @@ class SparseComboProtocolTests(unittest.TestCase):
                 protocol = materialize_run_protocol(run_kind)
                 self.assertEqual(run_protocol_errors(protocol), [])
                 self.assertEqual(protocol["sample_steps"], 50)
-                self.assertEqual(protocol["prompt_count"], 6)
+                self.assertEqual(protocol["prompt_count"], 8)
+                self.assertEqual(protocol["each_example_n_times"], 3)
                 self.assertEqual(protocol["warmup_runs"], 1)
                 self.assertEqual(protocol["measurement_runs"], 3)
-                self.assertEqual(protocol["expected_measurement_records"], 18)
+                self.assertEqual(protocol["expected_measurement_records"], 72)
                 self.assertIs(protocol["benchmark_eligible"], True)
                 self.assertIs(protocol["debug_forward"], False)
                 self.assertEqual(
@@ -127,7 +128,9 @@ class SparseComboProtocolTests(unittest.TestCase):
                         continue
                     self.assertIn(field, config)
                     self.assertEqual(config[field], expected)
-                self.assertIn("text_prompt: prompts/ovi_dev6.csv", path.read_text())
+                self.assertIn(
+                    "text_prompt: prompts/ovi_formal8.csv", path.read_text()
+                )
                 output_line = next(
                     line
                     for line in path.read_text().splitlines()

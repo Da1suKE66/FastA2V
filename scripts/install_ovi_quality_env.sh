@@ -155,13 +155,18 @@ else
   EVAL_QUALITY_URL_POLICY="${QUALITY_URL_POLICY}" \
   EVAL_WHEELHOUSE="${WHEELHOUSE}" \
   EVAL_PINNED_REQUIREMENTS="${PINNED_REQUIREMENTS}" \
+  EVAL_PIP_PYTHON="${EVAL_ENV}/bin/python" \
+  EVAL_PIP_CACHE_DIR="${PIP_CACHE_DIR}" \
+  EVAL_PIP_NETWORK_TIMEOUT_SECONDS="${PIP_NETWORK_TIMEOUT_SECONDS}" \
+  EVAL_PIP_NETWORK_RETRIES="${PIP_NETWORK_RETRIES}" \
   "${PYTHON_BOOTSTRAP}" -I -S -B - <<'PY'
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 from urllib.parse import unquote, urlparse
-import urllib.request
 
 
 def load_url_policy(path):
@@ -190,9 +195,15 @@ if protocol.get("trusted_lock_status") != "pinned" or not isinstance(packages, l
 wheelhouse = Path(os.environ["EVAL_WHEELHOUSE"])
 wheelhouse.mkdir(parents=True, exist_ok=False)
 requirements = []
+archive_records = []
 for package in packages:
     url = package["archive_url"]
     expected_hash = package["archive_sha256"]
+    if re.fullmatch(r"[0-9a-f]{64}", str(expected_hash)) is None:
+        raise SystemExit(
+            f"pinned dependency hash is not a full lowercase SHA256: "
+            f"{package.get('distribution')}: {expected_hash!r}"
+        )
     try:
         url_policy["validate_dependency_archive_url"](
             url,
@@ -207,14 +218,58 @@ for package in packages:
     if not filename.endswith(".whl"):
         raise SystemExit(f"pinned dependency is not a wheel: {filename}")
     wheel = wheelhouse / filename
-    temporary = wheel.with_suffix(wheel.suffix + ".part")
-    urllib.request.urlretrieve(url, temporary)
-    if sha256(temporary) != expected_hash:
-        raise SystemExit(f"pinned archive hash mismatch: {package['distribution']}")
-    temporary.replace(wheel)
+    archive_records.append((package["distribution"], url, expected_hash, wheel))
     requirements.append(
         f"{package['distribution']}=={package['version']} --hash=sha256:{expected_hash}"
     )
+try:
+    url_policy["validate_exact_wheelhouse"](wheelhouse, ())
+except ValueError as exc:
+    raise SystemExit(f"fresh pinned wheelhouse is not empty: {exc}") from exc
+download_command = [
+    os.environ["EVAL_PIP_PYTHON"],
+    "-I",
+    "-B",
+    "-m",
+    "pip",
+    "--isolated",
+    "download",
+    "--disable-pip-version-check",
+    "--no-input",
+    "--cache-dir",
+    os.environ["EVAL_PIP_CACHE_DIR"],
+    "--timeout",
+    os.environ["EVAL_PIP_NETWORK_TIMEOUT_SECONDS"],
+    "--retries",
+    os.environ["EVAL_PIP_NETWORK_RETRIES"],
+    "--no-deps",
+    "--only-binary=:all:",
+    "--no-index",
+    "--dest",
+    str(wheelhouse),
+    *[
+        f"{archive_url}#sha256={archive_hash}"
+        for _distribution, archive_url, archive_hash, _wheel in archive_records
+    ],
+]
+download_environment = os.environ.copy()
+download_environment["PIP_CONFIG_FILE"] = os.devnull
+subprocess.run(
+    download_command,
+    check=True,
+    env=download_environment,
+    stdin=subprocess.DEVNULL,
+)
+expected_wheels = [record[3] for record in archive_records]
+try:
+    url_policy["validate_exact_wheelhouse"](wheelhouse, expected_wheels)
+except ValueError as exc:
+    raise SystemExit(
+        f"materialized pinned wheelhouse differs from the reviewed lock: {exc}"
+    ) from exc
+for distribution, _url, expected_hash, wheel in archive_records:
+    if sha256(wheel) != expected_hash:
+        raise SystemExit(f"pinned archive hash mismatch: {distribution}")
 Path(os.environ["EVAL_PINNED_REQUIREMENTS"]).write_text(
     "\n".join(requirements) + "\n",
     encoding="utf-8",
@@ -469,7 +524,10 @@ else:
         "--dest",
         str(wheelhouse),
         *[
-            archive_receipts[distribution]["archive_url"]
+            (
+                f"{archive_receipts[distribution]['archive_url']}"
+                f"#sha256={archive_receipts[distribution]['archive_sha256']}"
+            )
             for distribution in sorted(archive_receipts)
         ],
     ]

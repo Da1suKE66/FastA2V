@@ -16,7 +16,8 @@ The first reproducible baseline is fixed to:
 - BF16, single A100 GPU, `sp_size=1`, no CPU offload
 - UniPC, shift `5.0`, 50 denoising steps
 - video guidance `4.0`, audio guidance `3.0`, SLG layer `11`
-- seed `103` and `prompts/ovi_smoke.csv`
+- formal prompt set `prompts/ovi_formal8.csv`, with base seed `103` and three
+  samples per prompt (`103`, `104`, and `105`)
 - dense video and audio attention
 
 `720x720_5s` is the official checkpoint/model name. Ovi's official helper
@@ -25,10 +26,13 @@ frame to an actual `704 x 704` output (`round(720 / 32) * 32`). FastA2V records
 both requested and actual dimensions and uses the actual dimensions in artifact
 filenames; it does not relabel a 704-pixel artifact as literal 720 pixels.
 
-The formal baseline performs one full warm-up generation in the same process,
-excludes it from measurements, then records three repeated measurements with
-the same prompt, seed, shape, and loaded engine. Every invocation receives a
-unique run directory so failed reruns cannot leave old videos looking current.
+The six-prompt, one-seed `prompts/ovi_dev6.csv` matrix is development evidence
+only. The formal baseline uses eight prompts and three seeds, performs one full
+warm-up generation in the same process, excludes it from measurements, then
+records three repeated measurements for every prompt/seed identity. That is
+`3 measurements x 8 prompts x 3 seeds = 72` measured artifacts per method.
+Every invocation receives a unique run directory so failed reruns cannot leave
+old videos looking current.
 The official unmodified source is also kept as a detached worktree at the same
 base commit. `scripts/run_ovi_official_reference.sh` runs the matching 20-step
 smoke configuration, after which `scripts/compare_media.py` performs decoded

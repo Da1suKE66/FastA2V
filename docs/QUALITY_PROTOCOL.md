@@ -71,16 +71,19 @@ pip's version check. Every pip invocation fixes the HTTPS read timeout at 300
 seconds and the connection retry budget at 10 so a slow official archive host
 can be tolerated without changing the fixed resolver inputs. The dual
 isolation above remains the source boundary. Bootstrap uses only its explicitly
-written indexes; pinned mode remains `--no-index` and can read only its retained
-wheelhouse.
+written indexes. Pinned materialization adds no index and may fetch only the
+reviewed hash-qualified direct URLs; the subsequent install reads only its
+fresh retained wheelhouse.
 
 After bootstrap installation, the exact archive URLs already recorded in the
 three pip reports are materialized into the retained wheelhouse by isolated pip
 with `--no-index --no-deps`. This second pass reuses the fixed pip cache, allows
-bounded HTTP range resumption, requires the wheelhouse filename set to match the
-reports exactly, rejects every non-regular or symlink top-level entry, and
-verifies every full archive SHA256 again. It does not run a second dependency
-resolution and cannot add an index or an unreported wheel.
+bounded HTTP range resumption, and passes each report hash to pip as a direct
+URL SHA256 fragment so bytes are authenticated before wheel metadata parsing.
+It requires the wheelhouse filename set to match the reports exactly, rejects
+every non-regular or symlink top-level entry, and verifies every full archive
+SHA256 again. It does not run a second dependency resolution and cannot add an
+index or an unreported wheel.
 
 The canonical CPU resolver entry remains
 `https://download.pytorch.org/whl/cpu`, while PyTorch currently serves wheel
@@ -117,9 +120,10 @@ environment from the reviewed lock:
 QUALITY_INSTALL_MODE=pinned bash scripts/install_ovi_quality_env.sh
 ```
 
-Pinned mode downloads only the exact reviewed URLs, verifies every full hash,
-and asks pip to install the retained wheels with `--no-index --no-deps` and a
-hash-required requirements file. The comparator then checks the exact installed
+Pinned mode materializes only the exact reviewed direct URLs with isolated pip,
+the same fixed cache, `--no-index`, and `--no-deps`; it verifies every full
+hash, then asks pip to install the retained wheels with a hash-required
+requirements file. The comparator then checks the exact installed
 distribution set, every retained wheel and `RECORD`, all files in
 site-packages (including rejection of `.pyc`, unowned files, and symlinks), the
 fixed direct module paths/versions, and both weights before and after scoring.
@@ -147,13 +151,15 @@ explicitly:
   --output-dir /cache/liluchen/FastA2V/runs/quality/EXACT_COMPARISON_ID
 ```
 
-No output is written until all three pair computations and post-metric hashes
-succeed. The directory then contains:
+No output is written until every formal identity pair and all post-metric
+hashes succeed. For the fixed formal8 protocol this means 72 pairs. The
+directory then contains 72 identity sidecars plus one median:
 
 ```text
-measurement_0.quality.json
-measurement_1.quality.json
-measurement_2.quality.json
+measurement_00_prompt_000_sample_000.quality.json
+measurement_00_prompt_000_sample_001.quality.json
+...
+measurement_02_prompt_007_sample_002.quality.json
 median.quality.json
 ```
 
@@ -163,21 +169,21 @@ pre-import audit, and Python bytecode is neither read from nor written to the
 fixed environment. Each pair sidecar binds both artifacts and both run identities, including
 commit, checkpoint hashes, prompt, seed, shapes, steps, acceleration environment,
 `environment.json`, dependency receipt, evaluator commit/matrix/script hashes,
-and absolute FFmpeg/FFprobe paths and hashes. All six MP4s, their metrics
-sidecars, both run evidence sets, evaluator sources, tools, dependencies, and
+and absolute FFmpeg/FFprobe paths and hashes. Every paired MP4, its metrics
+sidecar, both run evidence sets, evaluator sources, tools, dependencies, and
 weights are checked again after all metrics and immediately before the
 exclusive atomic sidecar write. `median.quality.json` records each pair-sidecar
-hash and the median of the three objective metrics. Exact-match PSNR is
+hash and the metric medians over all 72 identities. Exact-match PSNR is
 represented explicitly as the string `"inf"`; JSON NaN and numeric placeholders
 are rejected.
 
 ## Manual synchronization review
 
 `eval/manual_sync_reviews.csv` is deliberately header-only. A human reviewer
-may copy it, add either zero rows or all three measurement rows, and enter
+may copy it, add either zero rows or all 72 formal identity rows, and enter
 `pass`, `fail`, or `uncertain`. The reviewer, UTC timestamp, and rating are
 mandatory human-authored fields. Every row must contain the exact Dense and
-candidate artifact SHA256 for its measurement.
+candidate artifact SHA256 for its measurement/prompt/seed identity.
 
 Validate the completed CSV against the persisted median sidecar:
 

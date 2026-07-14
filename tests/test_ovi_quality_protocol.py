@@ -984,29 +984,31 @@ class QualityProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(QUALITY.QualityError, "refusing to overwrite"):
             QUALITY.write_quality_sidecars(report, output_dir)
 
-    def test_six_prompt_sidecars_and_manual_rows_bind_all_eighteen_identities(self):
+    def test_formal8_seed3_sidecars_and_manual_rows_bind_all_72_identities(self):
         dense = self.make_run(
             "dense",
-            "dense-six-loop",
-            fixture_prompt_count=6,
+            "dense-formal8-loop",
+            fixture_prompt_count=8,
+            fixture_sample_count=3,
         )
         candidate = self.make_run(
             "dense_cfg_cache",
-            "candidate-six-loop",
-            fixture_prompt_count=6,
+            "candidate-formal8-loop",
+            fixture_prompt_count=8,
+            fixture_sample_count=3,
         )
         report = self.build(dense=dense, candidate=candidate)
         median_path = QUALITY.write_quality_sidecars(
             report,
-            self.root / "quality-six-loop",
+            self.root / "quality-formal8-loop",
         )
         median = json.loads(median_path.read_text(encoding="utf-8"))
-        self.assertEqual(median["pair_count"], 18)
-        self.assertEqual(len(median["pairs"]), 18)
+        self.assertEqual(median["pair_count"], 72)
+        self.assertEqual(len(median["pairs"]), 72)
         bindings = QUALITY._expected_manual_bindings_from_report(median)
-        self.assertEqual(len(bindings), 18)
+        self.assertEqual(len(bindings), 72)
 
-        manual = self.root / "manual-six-loop.csv"
+        manual = self.root / "manual-formal8-loop.csv"
         with manual.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=QUALITY.MANUAL_FIELDS)
             writer.writeheader()
@@ -1030,7 +1032,7 @@ class QualityProtocolTests(unittest.TestCase):
             self.protocol["manual_reviews"],
         )
         self.assertEqual(status["status"], "complete")
-        self.assertEqual(status["row_count"], 18)
+        self.assertEqual(status["row_count"], 72)
 
     def test_quality_evidence_rejects_symlinked_warmup_snapshot(self):
         dense = self.make_run("dense", "dense-warmup-symlink")
@@ -1330,7 +1332,7 @@ class QualityProtocolTests(unittest.TestCase):
         ):
             QUALITY._expected_manual_bindings_from_report(median)
 
-    def test_installer_has_bootstrap_and_offline_pinned_paths(self):
+    def test_installer_has_bootstrap_and_isolated_pinned_materialization_paths(self):
         source = (REPO_ROOT / "scripts" / "install_ovi_quality_env.sh").read_text(
             encoding="utf-8"
         )
@@ -1358,8 +1360,8 @@ class QualityProtocolTests(unittest.TestCase):
             source.count('--retries "${PIP_NETWORK_RETRIES}"'),
             4,
         )
-        self.assertEqual(source.count("--disable-pip-version-check"), 5)
-        self.assertEqual(source.count("--no-input"), 5)
+        self.assertEqual(source.count("--disable-pip-version-check"), 6)
+        self.assertEqual(source.count("--no-input"), 6)
         self.assertNotIn("-m pip install", source)
         self.assertNotIn("export PIP_CACHE_DIR", source)
         self.assertIn('download_environment["PIP_CONFIG_FILE"] = os.devnull', source)
@@ -1368,6 +1370,21 @@ class QualityProtocolTests(unittest.TestCase):
         self.assertIn('"--no-deps",\n        "--only-binary=:all:",\n        "--no-index",', source)
         self.assertIn("materialized wheelhouse differs from the exact pip reports", source)
         self.assertIn("materialized wheel hash differs from pip report", source)
+        self.assertIn(
+            "materialized pinned wheelhouse differs from the reviewed lock",
+            source,
+        )
+        self.assertIn(
+            "pinned dependency hash is not a full lowercase SHA256",
+            source,
+        )
+        self.assertIn('os.environ["EVAL_PIP_PYTHON"]', source)
+        self.assertEqual(source.count("#sha256={"), 2)
+        pinned_wheel_block = source.split(
+            'else\n  EVAL_PROTOCOL_CONFIG="${PROTOCOL_CONFIG}"',
+            1,
+        )[1].split("\nfi\n\nmkdir -p", 1)[0]
+        self.assertNotIn("urllib.request", pinned_wheel_block)
         self.assertNotIn(
             'archive_url.startswith("https://download.pytorch.org/")',
             source,

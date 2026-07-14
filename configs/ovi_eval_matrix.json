@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "matrix_id": "ovi_720x720_5s_a100_bf16_v1",
-  "description": "Audited FastA2V Ovi performance and quality comparison matrix.",
+  "matrix_id": "ovi_720x720_5s_a100_bf16_formal8x3_v2",
+  "description": "Audited FastA2V Ovi formal 8-prompt by 3-seed performance and quality comparison matrix.",
   "comparison_contract": {
     "allow_latest_run_discovery": false,
     "explicit_method_run_mapping_required": true,
@@ -42,15 +42,16 @@
     "seed": 103,
     "warmup_runs": 1,
     "measurement_runs": 3,
-    "each_example_n_times": 1,
-    "prompt_count": 6,
-    "prompts_sha256": "2b85656756511645007ec619ae692359ed0ca157f7188d73fd273bb000bba534",
+    "each_example_n_times": 3,
+    "prompt_count": 8,
+    "prompts_sha256": "d98397111b1ab060a61d588f4ca388c5c929430a59ac6ab49b7c2e247bb6be91",
     "benchmark_eligible": true,
     "debug_forward": false
   },
   "methods": [
     {
       "method_id": "dense",
+      "formal_slot": "A",
       "label": "Dense",
       "required": true,
       "implementation_status": "ready",
@@ -63,6 +64,7 @@
     },
     {
       "method_id": "dense_cfg_cache",
+      "formal_slot": "B",
       "label": "Dense + CFG cache",
       "required": true,
       "implementation_status": "ready",
@@ -74,22 +76,8 @@
       }
     },
     {
-      "method_id": "sparge_topk50",
-      "label": "SpargeAttn topk=0.50",
-      "required": true,
-      "implementation_status": "ready",
-      "expected_environment": {
-        "run_kind": "sparge_baseline",
-        "attention_method": "sparge",
-        "sparge_topk": 0.5,
-        "sparge_pvthreshd": 50.0,
-        "sparge_smooth_k": true,
-        "use_cfg_cache": false,
-        "use_block_cache": false
-      }
-    },
-    {
       "method_id": "sparge_topk75",
+      "formal_slot": "C",
       "label": "SpargeAttn topk=0.75",
       "required": true,
       "implementation_status": "ready",
@@ -104,7 +92,24 @@
       }
     },
     {
+      "method_id": "sparge_topk50",
+      "formal_slot": "D",
+      "label": "SpargeAttn topk=0.50",
+      "required": true,
+      "implementation_status": "ready",
+      "expected_environment": {
+        "run_kind": "sparge_baseline",
+        "attention_method": "sparge",
+        "sparge_topk": 0.5,
+        "sparge_pvthreshd": 50.0,
+        "sparge_smooth_k": true,
+        "use_cfg_cache": false,
+        "use_block_cache": false
+      }
+    },
+    {
       "method_id": "radial_conservative",
+      "formal_slot": "E",
       "label": "Radial conservative",
       "required": true,
       "implementation_status": "ready",
@@ -118,6 +123,7 @@
     },
     {
       "method_id": "radial_aggressive",
+      "formal_slot": "F",
       "label": "Radial aggressive",
       "required": true,
       "implementation_status": "ready",

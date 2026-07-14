@@ -70,8 +70,8 @@ DEFAULT_MANIFEST = REPO_ROOT / "configs" / "ovi_eval_matrix.json"
 REQUIRED_METHOD_IDS = (
     "dense",
     "dense_cfg_cache",
-    "sparge_topk50",
     "sparge_topk75",
+    "sparge_topk50",
     "radial_conservative",
     "radial_aggressive",
     "best_sparse_cfg",

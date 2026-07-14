@@ -389,6 +389,12 @@ class RadialRunProtocolTests(unittest.TestCase):
                 source = (REPO_ROOT / "configs" / filename).read_text()
                 for line in (*common, *expected_lines):
                     self.assertIn(line, source)
+                if "_smoke" in filename:
+                    self.assertIn("text_prompt: prompts/ovi_smoke.csv", source)
+                    self.assertIn("each_example_n_times: 1", source)
+                else:
+                    self.assertIn("text_prompt: prompts/ovi_formal8.csv", source)
+                    self.assertIn("each_example_n_times: 3", source)
 
     def test_runners_have_unique_parents_and_copy_all_source_evidence(self):
         names = (

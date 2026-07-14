@@ -238,7 +238,7 @@ class RunFactory:
 
         timings = []
         reports = []
-        with (REPO_ROOT / "prompts" / "ovi_dev6.csv").open(
+        with (REPO_ROOT / "prompts" / "ovi_formal8.csv").open(
             "r", encoding="utf-8", newline=""
         ) as handle:
             prompt_values = [row["text_prompt"] for row in csv.DictReader(handle)]
@@ -1240,7 +1240,7 @@ class EvalCsvTests(unittest.TestCase):
             run_dir,
             self.manifest["fixed_protocol"],
         )
-        self.assertEqual(summary["artifact_count"], 18)
+        self.assertEqual(summary["artifact_count"], 72)
         self.assertEqual(summary["preflight_sha256"], sha256(run_dir / "preflight.json"))
 
     def test_sparge_csv_rejects_missing_originals(self):
@@ -2497,8 +2497,8 @@ class EvalCsvTests(unittest.TestCase):
         self.assertEqual(by_id["dense_cfg_cache"]["denoise_speedup_vs_dense"], 2.0)
         self.assertEqual(by_id["dense_cfg_cache"]["total_speedup_vs_dense"], 2.0)
         self.assertEqual(by_id["dense"]["measurement_count"], 3)
-        self.assertEqual(by_id["dense"]["artifact_count"], 18)
-        self.assertEqual(by_id["dense"]["prompt_count"], 6)
+        self.assertEqual(by_id["dense"]["artifact_count"], 72)
+        self.assertEqual(by_id["dense"]["prompt_count"], 8)
         self.assertEqual(
             by_id["dense"]["prompt_set_sha256"],
             self.manifest["fixed_protocol"]["prompts_sha256"],

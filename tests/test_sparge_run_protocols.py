@@ -77,6 +77,12 @@ class SpargeRunProtocolTests(unittest.TestCase):
                 )
                 for line in (*common, *mode_lines):
                     self.assertIn(line, source)
+                if "_smoke" in filename:
+                    self.assertIn("text_prompt: prompts/ovi_smoke.csv", source)
+                    self.assertIn("each_example_n_times: 1", source)
+                else:
+                    self.assertIn("text_prompt: prompts/ovi_formal8.csv", source)
+                    self.assertIn("each_example_n_times: 3", source)
 
     def test_topk75_runners_cannot_share_topk50_run_parent(self):
         runner_pairs = (

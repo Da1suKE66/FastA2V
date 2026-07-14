@@ -19,8 +19,8 @@ fp8: false
 qint8: false
 cpu_offload: false
 seed: 103
-text_prompt: prompts/ovi_dev6.csv
-each_example_n_times: 1
+text_prompt: prompts/ovi_formal8.csv
+each_example_n_times: 3
 warmup_runs: 1
 measurement_runs: 3
 run_kind: "sparge_topk50_block_cache_benchmark"
