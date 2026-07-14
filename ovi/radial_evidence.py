@@ -104,10 +104,12 @@ RADIAL_GPU_QUERY_MIN_BACKEND_SAMPLES = 2
 RADIAL_PMON_SAMPLE_INTERVAL_SECONDS = 1.0
 # ``nvidia-smi pmon -d 1 -o DT`` has been observed to emit rows roughly one
 # second apart while its coarse source clock skips one label (for example
-# 05:29:45 -> 05:29:47).  Treat delivery time as the continuity clock and keep
-# the source clock as a bounded, monotonic cross-check.
+# 05:29:45 -> 05:29:47).  The independent producer timestamp and the Python
+# reader receipt must both remain bounded.  Allow one full extra sampling
+# interval for reader scheduling jitter while the audited CUDA extension holds
+# the calling thread; larger gaps still fail closed.
 RADIAL_PMON_MAX_SOURCE_GAP_SECONDS = 2.0 * RADIAL_PMON_SAMPLE_INTERVAL_SECONDS
-RADIAL_PMON_MAX_RECEIPT_GAP_SECONDS = 1.5 * RADIAL_PMON_SAMPLE_INTERVAL_SECONDS
+RADIAL_PMON_MAX_RECEIPT_GAP_SECONDS = 2.0 * RADIAL_PMON_SAMPLE_INTERVAL_SECONDS
 RADIAL_QKV_STORAGE_BYTES = (
     3 * RADIAL_SEQUENCE * RADIAL_HEADS * RADIAL_HEAD_DIM * 2
 )

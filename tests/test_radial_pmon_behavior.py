@@ -201,6 +201,44 @@ class ContinuousPmonBehaviorTests(unittest.TestCase):
         self.assertEqual(evidence["status"], "ok", evidence["errors"])
         self.assertEqual(evidence["observation_mode"], "direct_c_observed")
 
+    def test_sub_two_second_reader_jitter_preserves_bounded_coverage(self):
+        monitor = self.make_monitor()
+        self.prepare_window(monitor)
+        received_at = 102.1 + 1.99
+        self.record(
+            monitor,
+            pmon_line(103.0, host_pid=self.host_pid, process_type="C"),
+            received_at,
+        )
+        self.assertTrue(monitor.window_compute_seen())
+        monitor.wait_for_final_sync_coverage(102.5, 102.5)
+        self.stop(monitor, received_at + 0.1)
+
+        evidence = monitor.evidence()
+        self.assertEqual(evidence["status"], "ok", evidence["errors"])
+        self.assertEqual(evidence["observation_mode"], "direct_c_observed")
+
+    def test_reader_gap_over_two_seconds_still_fails_closed(self):
+        monitor = self.make_monitor()
+        self.prepare_window(monitor)
+        received_at = 102.1 + 2.01
+        self.record(
+            monitor,
+            pmon_line(103.0, host_pid=self.host_pid, process_type="C"),
+            received_at,
+        )
+        self.stop(monitor, received_at + 0.1)
+
+        evidence = monitor.evidence()
+        self.assertEqual(evidence["status"], "failed")
+        self.assertTrue(
+            any(
+                "continuous receipt coverage" in error
+                for error in evidence["errors"]
+            ),
+            evidence["errors"],
+        )
+
     def test_stdout_eof_while_process_runs_is_an_interruption(self):
         monitor = self.make_monitor()
         monitor._read_stream("stdout", io.StringIO(self.header))
