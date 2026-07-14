@@ -1,4 +1,5 @@
 import importlib.util
+import copy
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -6,9 +7,16 @@ import unittest
 from unittest import mock
 
 from ovi.gpu_process_monitor import (
+    GPU_PROCESS_MONITOR_SCHEMA_VERSION,
+    GPU_QUERY_CADENCE_TOLERANCE_SECONDS,
     TRUSTED_NVIDIA_SMI_BYTES,
     TRUSTED_NVIDIA_SMI_PATH,
     TRUSTED_NVIDIA_SMI_SHA256,
+    build_pre_run_gpu_report,
+    gpu_compute_snapshot_observation_span_seconds,
+    gpu_compute_snapshot_maximum_gap_seconds,
+    gpu_compute_snapshot_sequence_errors,
+    query_gpu_compute_processes,
 )
 
 
@@ -25,6 +33,7 @@ with mock.patch.dict(sys.modules, {"numpy": SimpleNamespace()}):
 GPU_UUID = "GPU-11111111-2222-3333-4444-555555555555"
 GPU_NAME = "NVIDIA A100-SXM4-80GB"
 IDENTITY = (0, GPU_UUID, GPU_NAME)
+BOOT_ID = "11111111-2222-3333-4444-555555555555"
 
 
 def trusted_binary():
@@ -42,20 +51,37 @@ def trusted_binary():
 
 
 def raw_sample(count=1, uuid=GPU_UUID):
-    return {
-        "available": True,
-        "error": None,
-        "device_index": 0,
-        "device_uuid": uuid,
-        "device_name": GPU_NAME,
-        "process_count": count,
-        "processes": [
-            {"host_pid": 700 + index, "used_memory_mib": 1000}
-            for index in range(count)
-        ],
-        "sampled_at_unix_seconds": 0.0,
-        "nvidia_smi_binary": trusted_binary(),
-    }
+    process_output = "".join(
+        f"{700 + index}, 1000\n" for index in range(count)
+    )
+    outputs = iter((f"0, {uuid}, {GPU_NAME}\n", process_output))
+    snapshot = query_gpu_compute_processes(
+        0,
+        command_fn=lambda _command: next(outputs),
+        binary_metadata_fn=trusted_binary,
+    )
+    snapshot["boot_id"] = BOOT_ID
+    return snapshot
+
+
+def shift_snapshot_times(snapshot, delta):
+    shifted = copy.deepcopy(snapshot)
+    receipt = shifted["query_receipt"]
+    for clock in ("unix", "monotonic"):
+        for prefix in ("sampled_at", "query_started_at", "query_finished_at"):
+            field = f"{prefix}_{clock}_seconds"
+            if field in shifted:
+                shifted[field] += delta
+        for prefix in ("query_started_at", "query_finished_at"):
+            receipt[f"{prefix}_{clock}_seconds"] += delta
+        for command in receipt["commands"]:
+            for prefix in ("started_at", "finished_at"):
+                command[f"{prefix}_{clock}_seconds"] += delta
+    return shifted
+
+
+def pre_run_report():
+    return build_pre_run_gpu_report(raw_sample(0), cuda_visible_devices="0")
 
 
 def monitor(samples):
@@ -68,16 +94,32 @@ def monitor(samples):
         }
     )
     singleton = all(count == 1 for count in counts)
+    sequence_errors = gpu_compute_snapshot_sequence_errors(samples, 6.0)
     return {
+        "schema_version": GPU_PROCESS_MONITOR_SCHEMA_VERSION,
         "device_index": 0,
         "device_uuid": GPU_UUID,
         "device_name": GPU_NAME,
         "identity_consistent": True,
+        "boot_id": BOOT_ID,
+        "boot_id_consistent": True,
         "nvidia_smi_binary": trusted_binary(),
         "nvidia_smi_binary_fixed_valid": True,
         "nvidia_smi_binary_consistent": True,
         "nvidia_smi_binary_validation_errors": [],
         "sample_validation_errors": [],
+        "snapshot_validation_errors": [],
+        "sample_sequence_validation_errors": (
+            sequence_errors
+        ),
+        "observation_span_seconds": (
+            gpu_compute_snapshot_observation_span_seconds(samples)
+        ),
+        "interval_seconds": 5.0,
+        "cadence_tolerance_seconds": GPU_QUERY_CADENCE_TOLERANCE_SECONDS,
+        "maximum_sample_gap_seconds": (
+            gpu_compute_snapshot_maximum_gap_seconds(samples)
+        ),
         "sample_count": len(samples),
         "available_sample_count": len(samples),
         "unavailable_sample_count": 0,
@@ -88,7 +130,7 @@ def monitor(samples):
         "exact_singleton_process_per_sample": singleton,
         "contention_detected": any(count > 1 for count in counts),
         "no_process_detected": any(count == 0 for count in counts),
-        "valid_for_benchmark": singleton,
+        "valid_for_benchmark": singleton and not sequence_errors,
         "collection_errors": [],
         "samples": samples,
     }
@@ -101,11 +143,31 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
             monitor([raw_sample(), raw_sample()]),
             IDENTITY,
             trusted_binary(),
+            BOOT_ID,
+            5.0,
+            1e-12,
             True,
             "measurement[0]",
             errors,
         )
         self.assertEqual(errors, [])
+
+    def test_candidate_rejects_legacy_monitor_schema(self):
+        evidence = monitor([raw_sample(), raw_sample()])
+        evidence["schema_version"] = 1
+        errors = []
+        VERIFIER.validate_gpu_monitor(
+            evidence,
+            IDENTITY,
+            trusted_binary(),
+            BOOT_ID,
+            5.0,
+            1e-12,
+            True,
+            "measurement[0]",
+            errors,
+        )
+        self.assertTrue(any("schema" in error for error in errors))
 
     def test_candidate_rejects_zero_process_sample(self):
         errors = []
@@ -113,6 +175,9 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
             monitor([raw_sample(), raw_sample(0)]),
             IDENTITY,
             trusted_binary(),
+            BOOT_ID,
+            5.0,
+            1e-12,
             True,
             "measurement[0]",
             errors,
@@ -126,6 +191,9 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
             evidence,
             IDENTITY,
             trusted_binary(),
+            BOOT_ID,
+            5.0,
+            1e-12,
             True,
             "warmup[0]",
             errors,
@@ -140,6 +208,9 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
             evidence,
             IDENTITY,
             trusted_binary(),
+            BOOT_ID,
+            5.0,
+            1e-12,
             True,
             "measurement[0]",
             errors,
@@ -148,29 +219,62 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
             any("exactly match pre-run" in error for error in errors)
         )
 
+    def test_monitor_raw_receipt_tampering_is_rejected(self):
+        evidence = monitor([raw_sample(), raw_sample()])
+        evidence["samples"][1]["query_receipt"]["commands"][1][
+            "raw_stdout"
+        ] = "forged\n"
+        errors = []
+        VERIFIER.validate_gpu_monitor(
+            evidence,
+            IDENTITY,
+            trusted_binary(),
+            BOOT_ID,
+            5.0,
+            1e-12,
+            True,
+            "measurement[0]",
+            errors,
+        )
+        self.assertTrue(any("raw_stdout" in error for error in errors))
+
+    def test_monitor_boot_drift_is_rejected(self):
+        second = raw_sample()
+        second["boot_id"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        evidence = monitor([raw_sample(), second])
+        errors = []
+        VERIFIER.validate_gpu_monitor(
+            evidence,
+            IDENTITY,
+            trusted_binary(),
+            BOOT_ID,
+            5.0,
+            1e-12,
+            True,
+            "measurement[0]",
+            errors,
+        )
+        self.assertTrue(any("boot" in error.lower() for error in errors))
+
+    def test_duplicate_snapshot_receipt_cannot_count_as_two_samples(self):
+        snapshot = raw_sample()
+        evidence = monitor([snapshot, snapshot])
+        errors = []
+        VERIFIER.validate_gpu_monitor(
+            evidence,
+            IDENTITY,
+            trusted_binary(),
+            BOOT_ID,
+            5.0,
+            1e-12,
+            True,
+            "measurement[0]",
+            errors,
+        )
+        self.assertTrue(any("sequence" in error for error in errors))
+
     def test_environment_is_bound_to_idle_pre_run_identity(self):
-        report = {
-            "schema_version": 1,
-            "check_type": "pre_run_idle",
-            "physical_device_index": 0,
-            "available": True,
-            "error": None,
-            "device_index": 0,
-            "device_uuid": GPU_UUID,
-            "device_name": GPU_NAME,
-            "processes": [],
-            "process_count": 0,
-            "idle": True,
-            "valid_for_run": True,
-            "errors": [],
-            "cuda_visible_devices": "0",
-            "nvidia_smi_binary": trusted_binary(),
-            "checked_at_utc": "2026-07-14T00:00:00+00:00",
-            "sampled_at_unix_seconds": 1.0,
-            "sampled_at_monotonic_seconds": 1.0,
-            "boot_id": "11111111-2222-3333-4444-555555555555",
-            "run_nonce": "1" * 32,
-        }
+        report = pre_run_report()
         environment = {
             "gpu_physical_index": 0,
             "gpu_uuid": GPU_UUID,
@@ -185,28 +289,7 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
     def test_pre_run_untrusted_binary_is_rejected(self):
-        report = {
-            "schema_version": 1,
-            "check_type": "pre_run_idle",
-            "physical_device_index": 0,
-            "available": True,
-            "error": None,
-            "device_index": 0,
-            "device_uuid": GPU_UUID,
-            "device_name": GPU_NAME,
-            "processes": [],
-            "process_count": 0,
-            "idle": True,
-            "valid_for_run": True,
-            "errors": [],
-            "cuda_visible_devices": "0",
-            "nvidia_smi_binary": trusted_binary(),
-            "checked_at_utc": "2026-07-14T00:00:00+00:00",
-            "sampled_at_unix_seconds": 1.0,
-            "sampled_at_monotonic_seconds": 1.0,
-            "boot_id": "11111111-2222-3333-4444-555555555555",
-            "run_nonce": "1" * 32,
-        }
+        report = pre_run_report()
         report["nvidia_smi_binary"]["sha256"] = "0" * 64
         environment = {
             "gpu_physical_index": 0,
@@ -221,28 +304,7 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
         self.assertTrue(any("nvidia-smi sha256" in error for error in errors))
 
     def test_pre_run_requires_canonical_fields_and_mapping(self):
-        base = {
-            "schema_version": 1,
-            "check_type": "pre_run_idle",
-            "physical_device_index": 0,
-            "available": True,
-            "error": None,
-            "device_index": 0,
-            "device_uuid": GPU_UUID,
-            "device_name": GPU_NAME,
-            "processes": [],
-            "process_count": 0,
-            "idle": True,
-            "valid_for_run": True,
-            "errors": [],
-            "cuda_visible_devices": "0",
-            "nvidia_smi_binary": trusted_binary(),
-            "checked_at_utc": "2026-07-14T00:00:00+00:00",
-            "sampled_at_unix_seconds": 1.0,
-            "sampled_at_monotonic_seconds": 1.0,
-            "boot_id": "11111111-2222-3333-4444-555555555555",
-            "run_nonce": "1" * 32,
-        }
+        base = pre_run_report()
         environment = {
             "gpu_physical_index": 0,
             "gpu_uuid": GPU_UUID,
@@ -256,13 +318,22 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
             "checked_at_utc",
             "sampled_at_unix_seconds",
             "sampled_at_monotonic_seconds",
+            "query_started_at_unix_seconds",
+            "query_finished_at_unix_seconds",
+            "query_started_at_monotonic_seconds",
+            "query_finished_at_monotonic_seconds",
             "boot_id",
             "run_nonce",
+            "query_receipt",
         ):
             report = dict(base)
             del report[field]
             mutations.append((f"missing-{field}", report, environment))
-        for field, value in (("schema_version", 0), ("check_type", "old")):
+        for field, value in (
+            ("schema_version", 0),
+            ("schema_version", 1),
+            ("check_type", "old"),
+        ):
             report = dict(base)
             report[field] = value
             mutations.append((field, report, environment))
@@ -280,6 +351,30 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
                     errors,
                 )
                 self.assertTrue(errors)
+
+    def test_consumer_recomputes_and_rejects_large_cadence_gap(self):
+        samples = [
+            raw_sample(),
+            shift_snapshot_times(raw_sample(), 100.0),
+        ]
+        evidence = monitor(samples)
+        evidence["sample_sequence_validation_errors"] = []
+        evidence["valid_for_benchmark"] = True
+        errors = []
+        VERIFIER.validate_gpu_monitor(
+            evidence,
+            IDENTITY,
+            trusted_binary(),
+            BOOT_ID,
+            5.0,
+            1e-12,
+            True,
+            "measurement[0]",
+            errors,
+        )
+        self.assertTrue(
+            any("sequence" in error or "cadence" in error for error in errors)
+        )
 
     def test_bool_forged_monitor_integer_fields_are_rejected(self):
         mutations = (
@@ -300,6 +395,9 @@ class GpuEvidenceVerifierTests(unittest.TestCase):
                     evidence,
                     IDENTITY,
                     trusted_binary(),
+                    BOOT_ID,
+                    5.0,
+                    1e-12,
                     True,
                     "measurement[0]",
                     errors,

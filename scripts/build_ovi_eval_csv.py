@@ -14,7 +14,9 @@ import csv
 import hashlib
 import json
 import math
+import os
 import re
+import stat
 import statistics
 import sys
 from pathlib import Path
@@ -26,8 +28,31 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from ovi.gpu_process_monitor import (
+    GPU_PROCESS_MONITOR_SCHEMA_VERSION,
+    GPU_QUERY_CADENCE_TOLERANCE_SECONDS,
+    gpu_compute_snapshot_maximum_gap_seconds,
+    gpu_compute_snapshot_observation_span_seconds,
+    gpu_compute_snapshot_sequence_errors,
+    gpu_compute_snapshot_errors,
     trusted_nvidia_smi_metadata_errors,
     validate_pre_run_gpu_report,
+)
+from ovi.radial_evidence import (
+    FLASHINFER_VERSION,
+    RADIAL_BLOCK_SIZE,
+    RADIAL_COMMIT,
+    RADIAL_EMPTY_ROWS,
+    RADIAL_GRID,
+    RADIAL_MASK_API,
+    RADIAL_MODEL_TYPE,
+    RADIAL_PREFIX_SEQUENCE,
+    RADIAL_PROFILE_AUDITS,
+    RADIAL_REPOSITORY,
+    RADIAL_SEQUENCE,
+    RADIAL_TAIL_SEQUENCE,
+    flashinfer_manifest_evidence_errors,
+    radial_microtest_evidence_errors,
+    radial_receipt_evidence_errors,
 )
 
 
@@ -46,6 +71,29 @@ MEASUREMENT_COUNT = 3
 GIB = 1024 ** 3
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 HEX_GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+RADIAL_OPTIONAL_IMPORT_LIB64 = (
+    "/cache/liluchen/FastA2V/envs/ovi/lib/python3.11/lib64"
+)
+RADIAL_INSTALL_RECEIPT_PATH = (
+    "/cache/liluchen/FastA2V/radialattn-install.json"
+)
+REQUIRED_PREFLIGHT_PACKAGES = (
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "flash-attn",
+    "transformers",
+    "diffusers",
+    "omegaconf",
+)
+REQUIRED_PREFLIGHT_CHECKPOINTS = (
+    "Ovi/model.safetensors",
+    "Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth",
+    "Wan2.2-TI2V-5B/Wan2.2_VAE.pth",
+    "MMAudio/ext_weights/best_netG.pt",
+    "MMAudio/ext_weights/v1-16.pth",
+    "Wan2.2-TI2V-5B/google/umt5-xxl/spiece.model",
+)
 
 CSV_FIELDS = (
     "method_id",
@@ -58,12 +106,19 @@ CSV_FIELDS = (
     "run_dir",
     "run_id",
     "verification_sha256",
+    "preflight_sha256",
     "timings_sha256",
     "git_commit",
     "checkpoint_manifest_sha256",
     "checkpoint_fingerprint_sha256",
     "gpu_uuid",
     "gpu_name",
+    "radial_evidence_mode",
+    "radial_pmon_status",
+    "radial_pid_association",
+    "radial_claim_scope",
+    "radial_host_pid_ownership",
+    "radial_mps_status",
     "prompt_sha256",
     "prompt",
     "seed",
@@ -93,8 +148,67 @@ class EvaluationError(ValueError):
     """Raised when evidence cannot safely enter the comparison table."""
 
 
+class _StableFileSnapshot:
+    """One no-follow regular-file read, plus identity for final revalidation."""
+
+    __slots__ = (
+        "path",
+        "data",
+        "sha256",
+        "device",
+        "inode",
+        "size",
+        "mtime_ns",
+        "ctime_ns",
+    )
+
+    def __init__(self, path: Path, data: bytes, metadata: os.stat_result):
+        self.path = Path(path)
+        self.data = data
+        self.sha256 = hashlib.sha256(data).hexdigest()
+        self.device = metadata.st_dev
+        self.inode = metadata.st_ino
+        self.size = metadata.st_size
+        self.mtime_ns = metadata.st_mtime_ns
+        self.ctime_ns = metadata.st_ctime_ns
+
+
 def _is_json_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _strict_json_equal(actual: Any, expected: Any) -> bool:
+    """Compare persisted JSON without Python bool/int equivalence."""
+
+    if expected is None or isinstance(expected, (bool, str)):
+        return type(actual) is type(expected) and actual == expected
+    if isinstance(expected, int):
+        return _is_json_int(actual) and actual == expected
+    if isinstance(expected, float):
+        return (
+            isinstance(actual, (int, float))
+            and not isinstance(actual, bool)
+            and float(actual) == expected
+        )
+    if isinstance(expected, list):
+        return (
+            isinstance(actual, list)
+            and len(actual) == len(expected)
+            and all(
+                _strict_json_equal(actual_value, expected_value)
+                for actual_value, expected_value in zip(actual, expected)
+            )
+        )
+    if isinstance(expected, dict):
+        return (
+            isinstance(actual, dict)
+            and set(actual) == set(expected)
+            and all(
+                _strict_json_equal(actual[key], expected_value)
+                for key, expected_value in expected.items()
+            )
+        )
+    return type(actual) is type(expected) and actual == expected
 
 
 def _fail(context: str, message: str) -> None:
@@ -104,6 +218,129 @@ def _fail(context: str, message: str) -> None:
 def _require(condition: bool, context: str, message: str) -> None:
     if not condition:
         _fail(context, message)
+
+
+def _snapshot_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _stable_file_snapshot(path: Path, context: str) -> _StableFileSnapshot:
+    """Read one immutable-by-evidence byte snapshot without following symlinks.
+
+    The descriptor and directory entry are checked before and after the read.
+    ``validate_run`` checks the same identity again before returning, closing
+    the old parse-then-reopen-for-hash gap and detecting replacement while a
+    table row is being assembled.
+    """
+
+    path = Path(path)
+    try:
+        initial_entry = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        _fail(context, f"cannot stat evidence file {path}: {exc}")
+    if stat.S_ISLNK(initial_entry.st_mode):
+        _fail(context, f"evidence file must not be a symlink: {path}")
+    if not stat.S_ISREG(initial_entry.st_mode):
+        _fail(context, f"evidence file must be a regular file: {path}")
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        _fail(context, f"cannot open no-follow evidence file {path}: {exc}")
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            _fail(context, f"opened evidence is not a regular file: {path}")
+        if _snapshot_identity(before) != _snapshot_identity(initial_entry):
+            _fail(context, f"evidence file changed before read: {path}")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+
+    if _snapshot_identity(after) != _snapshot_identity(before):
+        _fail(context, f"evidence file changed while being read: {path}")
+    if len(data) != after.st_size:
+        _fail(context, f"evidence byte count changed while being read: {path}")
+    try:
+        final_entry = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        _fail(context, f"cannot re-stat evidence file {path}: {exc}")
+    if (
+        not stat.S_ISREG(final_entry.st_mode)
+        or _snapshot_identity(final_entry) != _snapshot_identity(after)
+    ):
+        _fail(context, f"evidence file was replaced while being read: {path}")
+    return _StableFileSnapshot(path, data, after)
+
+
+def _revalidate_snapshot(snapshot: _StableFileSnapshot, context: str) -> None:
+    try:
+        current = os.stat(snapshot.path, follow_symlinks=False)
+    except OSError as exc:
+        _fail(context, f"cannot revalidate evidence file {snapshot.path}: {exc}")
+    expected = (
+        snapshot.device,
+        snapshot.inode,
+        snapshot.size,
+        snapshot.mtime_ns,
+        snapshot.ctime_ns,
+    )
+    if not stat.S_ISREG(current.st_mode) or _snapshot_identity(current) != expected:
+        _fail(
+            context,
+            f"evidence file changed after its stable byte snapshot: {snapshot.path}",
+        )
+
+
+def _snapshot_json(
+    path: Path,
+    context: str,
+) -> tuple[_StableFileSnapshot, Any]:
+    snapshot = _stable_file_snapshot(path, context)
+    try:
+        payload = json.loads(snapshot.data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        _fail(context, f"cannot decode valid JSON from {path}: {exc}")
+    return snapshot, payload
+
+
+def _snapshot_jsonl(
+    path: Path,
+    context: str,
+) -> tuple[_StableFileSnapshot, list[dict[str, Any]]]:
+    snapshot = _stable_file_snapshot(path, context)
+    try:
+        lines = snapshot.data.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        _fail(context, f"cannot decode UTF-8 JSONL from {path}: {exc}")
+    records = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            _fail(context, f"blank JSONL record at {path}:{line_number}")
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            _fail(context, f"invalid JSON at {path}:{line_number}: {exc}")
+        if not isinstance(record, dict):
+            _fail(context, f"record at {path}:{line_number} is not an object")
+        records.append(record)
+    return snapshot, records
 
 
 def _read_json(path: Path, context: str) -> Any:
@@ -131,17 +368,6 @@ def _read_jsonl(path: Path, context: str) -> list[dict[str, Any]]:
             _fail(context, f"record at {path}:{line_number} is not an object")
         records.append(record)
     return records
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError as exc:
-        raise EvaluationError(f"cannot hash {path}: {exc}") from exc
-    return digest.hexdigest()
 
 
 def _finite_number(
@@ -330,9 +556,19 @@ def _validate_gpu_monitor(
     monitor: Any,
     environment: dict[str, Any],
     expected_nvidia_smi_binary: dict[str, Any],
+    expected_boot_id: str,
+    expected_interval_seconds: float,
+    minimum_coverage_seconds: float,
     context: str,
 ) -> None:
     _require(isinstance(monitor, dict), context, "gpu_process_monitor must be an object")
+    _require(
+        _is_json_int(monitor.get("schema_version"))
+        and monitor.get("schema_version")
+        == GPU_PROCESS_MONITOR_SCHEMA_VERSION,
+        context,
+        "unsupported GPU process monitor evidence schema",
+    )
     required_true = (
         "identity_consistent",
         "nvidia_smi_binary_fixed_valid",
@@ -347,6 +583,27 @@ def _validate_gpu_monitor(
         monitor.get("sample_validation_errors") == [],
         context,
         "GPU monitor samples contain validation errors",
+    )
+    _require(
+        monitor.get("snapshot_validation_errors") == [],
+        context,
+        "GPU monitor raw snapshots contain validation errors",
+    )
+    interval_seconds = monitor.get("interval_seconds")
+    _require(
+        not isinstance(interval_seconds, bool)
+        and isinstance(interval_seconds, (int, float))
+        and math.isfinite(float(interval_seconds))
+        and float(interval_seconds) > 0.0
+        and interval_seconds == expected_interval_seconds,
+        context,
+        "GPU monitor interval differs from environment",
+    )
+    _require(
+        monitor.get("boot_id_consistent") is True
+        and monitor.get("boot_id") == expected_boot_id,
+        context,
+        "GPU monitor boot ID differs from pre-run evidence",
     )
     _require(
         monitor.get("contention_detected") is False,
@@ -429,6 +686,49 @@ def _validate_gpu_monitor(
         context,
         "raw GPU samples are incomplete",
     )
+    maximum_gap_limit = (
+        float(expected_interval_seconds)
+        + GPU_QUERY_CADENCE_TOLERANCE_SECONDS
+        if not isinstance(expected_interval_seconds, bool)
+        and isinstance(expected_interval_seconds, (int, float))
+        and math.isfinite(float(expected_interval_seconds))
+        else None
+    )
+    sequence_errors = gpu_compute_snapshot_sequence_errors(
+        samples,
+        maximum_gap_limit,
+    )
+    _require(
+        not sequence_errors
+        and monitor.get("sample_sequence_validation_errors") == [],
+        context,
+        "GPU snapshot sequence is duplicated, overlapping, or reversed",
+    )
+    observation_span_seconds = (
+        gpu_compute_snapshot_observation_span_seconds(samples)
+    )
+    maximum_sample_gap_seconds = (
+        gpu_compute_snapshot_maximum_gap_seconds(samples)
+    )
+    _require(
+        monitor.get("cadence_tolerance_seconds")
+        == GPU_QUERY_CADENCE_TOLERANCE_SECONDS
+        and monitor.get("maximum_sample_gap_seconds")
+        == maximum_sample_gap_seconds,
+        context,
+        "GPU monitor cadence summary differs from raw samples",
+    )
+    _require(
+        monitor.get("observation_span_seconds") == observation_span_seconds
+        and not isinstance(minimum_coverage_seconds, bool)
+        and isinstance(minimum_coverage_seconds, (int, float))
+        and math.isfinite(float(minimum_coverage_seconds))
+        and float(minimum_coverage_seconds) > 0.0
+        and observation_span_seconds is not None
+        and observation_span_seconds >= float(minimum_coverage_seconds),
+        context,
+        "GPU observation span does not cover total generation time",
+    )
     for sample_index, sample in enumerate(samples):
         sample_context = f"{context} sample[{sample_index}]"
         _require(isinstance(sample, dict), sample_context, "sample must be an object")
@@ -447,6 +747,18 @@ def _validate_gpu_monitor(
         )
         _require(sample.get("device_uuid") == environment.get("gpu_uuid"), sample_context, "GPU UUID differs")
         _require(sample.get("device_name") == environment.get("gpu_name"), sample_context, "GPU name differs")
+        _require(
+            sample.get("boot_id") == expected_boot_id,
+            sample_context,
+            "boot ID differs from pre-run evidence",
+        )
+        sample_snapshot_errors = gpu_compute_snapshot_errors(sample)
+        _require(
+            not sample_snapshot_errors,
+            sample_context,
+            "raw GPU snapshot is invalid: "
+            + "; ".join(sample_snapshot_errors),
+        )
         sample_binary_errors = trusted_nvidia_smi_metadata_errors(
             sample.get("nvidia_smi_binary")
         )
@@ -488,6 +800,481 @@ def _shape(value: Any, context: str, field: str, *, length: int | None = None) -
     return tuple(value)
 
 
+def _expected_radial_runtime_dependencies(receipt: Any) -> dict[str, Any] | None:
+    if not isinstance(receipt, dict):
+        return None
+    inventory = receipt.get("runtime_loaded_dependencies")
+    if not isinstance(inventory, dict) or not inventory:
+        return None
+    mapped_paths = set()
+    for fingerprints in inventory.values():
+        if not isinstance(fingerprints, list) or not fingerprints:
+            return None
+        for metadata in fingerprints:
+            if not isinstance(metadata, dict):
+                return None
+            path = metadata.get("path")
+            if not isinstance(path, str) or not path:
+                return None
+            mapped_paths.add(path)
+    canonical = json.dumps(
+        inventory,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        "status": "ok",
+        "aliases": len(inventory),
+        "mapped_files": len(mapped_paths),
+        "inventory_sha256": hashlib.sha256(canonical).hexdigest(),
+    }
+
+
+def _radial_runtime_dependency_errors(
+    evidence: Any,
+    expected: Any,
+    context: str,
+) -> list[str]:
+    errors = []
+    expected_fields = {
+        "status",
+        "aliases",
+        "mapped_files",
+        "inventory_sha256",
+    }
+    if not isinstance(evidence, dict):
+        return [f"{context}: runtime dependency evidence is missing"]
+    if set(evidence) != expected_fields:
+        errors.append(f"{context}: runtime dependency fields are invalid")
+    if expected is None:
+        errors.append(f"{context}: copied receipt has no runtime inventory")
+    elif not _strict_json_equal(evidence, expected):
+        errors.append(
+            f"{context}: runtime dependency evidence differs from copied receipt"
+        )
+    return errors
+
+
+def _radial_optional_import_loader_errors(
+    evidence: Any,
+    expected_runtime: Any,
+    context: str,
+) -> list[str]:
+    errors = []
+    if not isinstance(evidence, dict):
+        return [f"{context}: optional-import loader evidence is missing"]
+    if set(evidence) != {
+        "status",
+        "restored",
+        "removed_prepend_paths",
+        "runtime_dependencies",
+    }:
+        errors.append(f"{context}: optional-import loader fields are invalid")
+    if evidence.get("status") != "ok" or evidence.get("restored") is not True:
+        errors.append(f"{context}: audited loader environment was not restored")
+    errors.extend(
+        _radial_runtime_dependency_errors(
+            evidence.get("runtime_dependencies"),
+            expected_runtime,
+            f"{context}.runtime_dependencies",
+        )
+    )
+    removed = evidence.get("removed_prepend_paths")
+    if not isinstance(removed, list) or len(removed) != 1:
+        errors.append(
+            f"{context}: expected exactly one OpenCV loader prepend path"
+        )
+    elif (
+        not isinstance(removed[0], str)
+        or not removed[0]
+        or str(Path(removed[0]).resolve())
+        != str(Path(RADIAL_OPTIONAL_IMPORT_LIB64).resolve())
+    ):
+        errors.append(
+            f"{context}: removed loader prepend path is not the fixed env lib64"
+        )
+    return errors
+
+
+def _radial_loader_bootstrap_errors(
+    evidence: Any,
+    expected_runtime: Any,
+) -> list[str]:
+    context = "environment Radial loader bootstrap"
+    if not isinstance(evidence, dict):
+        return [f"{context}: evidence is missing"]
+    errors = []
+    if set(evidence) != {
+        "status",
+        "receipt_path",
+        "before_optional_imports",
+        "after_optional_imports",
+    }:
+        errors.append(f"{context}: fields are invalid")
+    if evidence.get("status") != "ok":
+        errors.append(f"{context}: status is not ok")
+    if evidence.get("receipt_path") != RADIAL_INSTALL_RECEIPT_PATH:
+        errors.append(f"{context}: receipt path is not the fixed audited path")
+    errors.extend(
+        _radial_runtime_dependency_errors(
+            evidence.get("before_optional_imports"),
+            expected_runtime,
+            f"{context}.before_optional_imports",
+        )
+    )
+    errors.extend(
+        _radial_optional_import_loader_errors(
+            evidence.get("after_optional_imports"),
+            expected_runtime,
+            f"{context}.after_optional_imports",
+        )
+    )
+    return errors
+
+
+def _radial_dispatcher_errors(
+    dispatcher: Any,
+    environment: dict[str, Any],
+    copied_receipt: Any,
+    context: str,
+) -> list[str]:
+    """Revalidate each formal Radial measurement's live dispatcher receipt."""
+
+    if not isinstance(dispatcher, dict):
+        return [f"{context}: video_self_attention_dispatcher is missing"]
+    errors = []
+    calls = dispatcher.get("calls_total")
+    expected_calls = dispatcher.get("expected_calls")
+    if not _is_json_int(calls) or calls <= 0:
+        errors.append(f"{context}: dispatcher calls_total must be positive")
+    if not _is_json_int(expected_calls) or expected_calls <= 0:
+        errors.append(f"{context}: dispatcher expected_calls must be positive")
+    if calls != expected_calls:
+        errors.append(f"{context}: dispatcher calls do not match expected_calls")
+    expected_top = {
+        "configured_method": "radial",
+        "active_method": "radial",
+        "backend_ready": True,
+        "fallback_allowed": False,
+        "fallback_used": False,
+        "fallback_count": 0,
+        "fallback_reason": None,
+        "calls_match_expected": True,
+        "calls_by_method": {
+            "dense": 0,
+            "sparge": 0,
+            "radial": calls,
+            "svg": 0,
+        },
+        "errors_by_method": {
+            "dense": 0,
+            "sparge": 0,
+            "radial": 0,
+            "svg": 0,
+        },
+        "expected_calls_without_block_cache": expected_calls,
+    }
+    for field, expected in expected_top.items():
+        if not _strict_json_equal(dispatcher.get(field), expected):
+            errors.append(f"{context}: dispatcher {field} differs from fixed evidence")
+
+    details = dispatcher.get("backend_details")
+    if not isinstance(details, dict):
+        errors.append(f"{context}: Radial backend_details is missing")
+        return errors
+    expected_provenance = {
+        "backend": "official_radial_attention_flashinfer",
+        "repository": RADIAL_REPOSITORY,
+        "pinned_commit": RADIAL_COMMIT,
+        "mask_api": RADIAL_MASK_API,
+        "model_type": RADIAL_MODEL_TYPE,
+        "block_size": RADIAL_BLOCK_SIZE,
+        "sequence": RADIAL_SEQUENCE,
+        "prefix_sequence": RADIAL_PREFIX_SEQUENCE,
+        "tail_sequence": RADIAL_TAIL_SEQUENCE,
+        "tail_strategy": "dense_lse_merge_no_padding",
+        "empty_row_policy": "dense_row",
+        "empty_rows": list(RADIAL_EMPTY_ROWS),
+        "fallback_allowed": False,
+        "last_shape": [1, RADIAL_SEQUENCE, 24, 128],
+        "last_grid": list(RADIAL_GRID),
+        "last_dtype": "torch.bfloat16",
+        "last_device": "cuda:0",
+        "plan_cache_entries": 1,
+    }
+    for field, expected in expected_provenance.items():
+        if not _strict_json_equal(details.get(field), expected):
+            errors.append(
+                f"{context}: Radial backend {field} differs from fixed evidence"
+            )
+    backend_calls = details.get("calls")
+    if not _is_json_int(backend_calls) or backend_calls != calls:
+        errors.append(f"{context}: Radial backend calls differ from dispatcher")
+    hits = details.get("plan_cache_hits")
+    misses = details.get("plan_cache_misses")
+    if (
+        not _is_json_int(hits)
+        or hits < 0
+        or not _is_json_int(misses)
+        or misses not in (0, 1)
+        or not _is_json_int(calls)
+        or hits + misses != calls
+    ):
+        errors.append(f"{context}: Radial plan-cache counters are invalid")
+
+    profile = environment.get("radial_profile")
+    expected_audit = RADIAL_PROFILE_AUDITS.get(profile)
+    expected_settings = {
+        "profile": profile,
+        "decay_factor": environment.get("radial_decay_factor"),
+        "model_type": environment.get("radial_model_type"),
+        "block_size": environment.get("radial_block_size"),
+    }
+    for field, expected in expected_settings.items():
+        if expected is None or not _strict_json_equal(details.get(field), expected):
+            errors.append(
+                f"{context}: Radial setting {field} differs from environment"
+            )
+    if expected_audit is None or not _strict_json_equal(
+        details.get("last_mask_audit"), expected_audit
+    ):
+        errors.append(f"{context}: Radial mask audit differs from fixed profile")
+
+    expected_runtime = _expected_radial_runtime_dependencies(copied_receipt)
+    expected_receipt_summary = {
+        "path": RADIAL_INSTALL_RECEIPT_PATH,
+        "commit": (
+            copied_receipt.get("commit")
+            if isinstance(copied_receipt, dict)
+            else None
+        ),
+        "derived_module_sha256": (
+            copied_receipt.get("derived_module", {}).get("sha256")
+            if isinstance(copied_receipt, dict)
+            and isinstance(copied_receipt.get("derived_module"), dict)
+            else None
+        ),
+        "flashinfer_version": (
+            copied_receipt.get("flashinfer_version")
+            if isinstance(copied_receipt, dict)
+            else None
+        ),
+        "runtime_dependencies": expected_runtime,
+    }
+    receipt_summary = details.get("install_receipt")
+    if not _strict_json_equal(receipt_summary, expected_receipt_summary):
+        errors.append(
+            f"{context}: Radial receipt summary differs from copied originals"
+        )
+    if not _strict_json_equal(
+        details.get("runtime_dependencies_after_first_cuda"),
+        expected_runtime,
+    ):
+        errors.append(
+            f"{context}: Radial runtime inventory after first CUDA differs"
+        )
+    return errors
+
+
+def _radial_preflight_static_errors(
+    preflight: Any,
+    pre_run_gpu: dict[str, Any],
+    checkpoint_manifest: dict[str, Any],
+    copied_receipt: Any,
+    copied_flashinfer_manifest: Any,
+    copied_artifacts: dict[str, _StableFileSnapshot],
+    flashinfer_manifest_snapshot: _StableFileSnapshot,
+) -> list[str]:
+    """Revalidate Radial preflight originals instead of trusting verification.json."""
+
+    errors = []
+    if not isinstance(preflight, dict):
+        return ["preflight.json must contain an object"]
+    if preflight.get("errors") != []:
+        errors.append("preflight errors must be an explicit empty list")
+    if preflight.get("attention_method") != "radial":
+        errors.append("preflight attention_method must be radial")
+    python_executable = preflight.get("python_executable")
+    if not isinstance(python_executable, str) or not Path(
+        python_executable
+    ).is_absolute():
+        errors.append("preflight python_executable must be an absolute path")
+    if preflight.get("cuda_available") is not True:
+        errors.append("preflight did not confirm CUDA availability")
+    if preflight.get("gpu") != pre_run_gpu.get("device_name"):
+        errors.append("preflight CUDA device name differs from pre-run evidence")
+    if preflight.get("compute_capability") != [8, 0]:
+        errors.append("preflight compute_capability must be exactly [8, 0]")
+    for executable in ("ffmpeg", "ffprobe"):
+        value = preflight.get(executable)
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            errors.append(f"preflight {executable} path is invalid")
+    packages = preflight.get("packages")
+    if not isinstance(packages, dict):
+        errors.append("preflight package inventory is missing")
+    else:
+        for package in REQUIRED_PREFLIGHT_PACKAGES:
+            version = packages.get(package)
+            if not isinstance(version, str) or not version:
+                errors.append(
+                    f"preflight package inventory lacks version for {package}"
+                )
+    checkpoints = preflight.get("checkpoints")
+    manifest_files = checkpoint_manifest.get("files")
+    if not isinstance(checkpoints, dict) or set(checkpoints) != set(
+        REQUIRED_PREFLIGHT_CHECKPOINTS
+    ):
+        errors.append("preflight checkpoint inventory is not the fixed six paths")
+    elif not isinstance(manifest_files, dict):
+        errors.append("checkpoint manifest file inventory is missing")
+    else:
+        for relative_path in REQUIRED_PREFLIGHT_CHECKPOINTS:
+            metadata = checkpoints.get(relative_path)
+            manifest_metadata = manifest_files.get(relative_path)
+            if (
+                not isinstance(metadata, dict)
+                or set(metadata) != {"exists", "bytes"}
+                or metadata.get("exists") is not True
+                or not _is_json_int(metadata.get("bytes"))
+                or metadata.get("bytes") <= 0
+                or not isinstance(manifest_metadata, dict)
+                or metadata.get("bytes") != manifest_metadata.get("bytes")
+            ):
+                errors.append(
+                    "preflight checkpoint inventory differs from checkpoint "
+                    f"manifest for {relative_path}"
+                )
+    if preflight.get("checkpoint_manifest") != (
+        "/cache/liluchen/FastA2V/checkpoint_manifest.json"
+    ):
+        errors.append("preflight checkpoint manifest path is not fixed")
+    flash_attn_microtest = preflight.get("flash_attn_microtest")
+    expected_flash_attn = {
+        "status": "ok",
+        "device": pre_run_gpu.get("device_name"),
+        "compute_capability": [8, 0],
+        "torch": "2.6.0+cu124",
+        "torch_cuda": "12.4",
+        "torch_cxx11_abi": False,
+        "dtype": "torch.bfloat16",
+        "shape": [1, 128, 24, 128],
+    }
+    if not isinstance(flash_attn_microtest, dict):
+        errors.append("preflight FlashAttention microtest evidence is invalid")
+    else:
+        for field, expected in expected_flash_attn.items():
+            if not _strict_json_equal(flash_attn_microtest.get(field), expected):
+                errors.append(
+                    f"preflight FlashAttention microtest {field} is invalid"
+                )
+        difference = flash_attn_microtest.get("max_abs_difference")
+        if (
+            isinstance(difference, bool)
+            or not isinstance(difference, (int, float))
+            or not math.isfinite(float(difference))
+            or float(difference) < 0.0
+            or float(difference) > 0.1
+        ):
+            errors.append(
+                "preflight FlashAttention max_abs_difference is invalid"
+            )
+
+    errors.extend(
+        f"copied Radial receipt: {error}"
+        for error in radial_receipt_evidence_errors(copied_receipt)
+    )
+    expected_runtime = _expected_radial_runtime_dependencies(copied_receipt)
+
+    if isinstance(copied_receipt, dict):
+        for field, snapshot in copied_artifacts.items():
+            metadata = copied_receipt.get(field)
+            if not isinstance(metadata, dict):
+                errors.append(f"copied Radial receipt lacks {field}")
+            elif (
+                snapshot.size != metadata.get("bytes")
+                or snapshot.sha256 != metadata.get("sha256")
+            ):
+                errors.append(
+                    f"copied Radial {field} differs from install receipt"
+                )
+    if isinstance(copied_receipt, dict):
+        manifest_fingerprint = copied_receipt.get("flashinfer_manifest")
+        if not isinstance(manifest_fingerprint, dict):
+            errors.append("copied Radial receipt lacks flashinfer_manifest")
+        elif (
+            flashinfer_manifest_snapshot.size != manifest_fingerprint.get("bytes")
+            or flashinfer_manifest_snapshot.sha256
+            != manifest_fingerprint.get("sha256")
+        ):
+            errors.append("copied FlashInfer manifest differs from install receipt")
+    errors.extend(
+        f"copied FlashInfer manifest: {error}"
+        for error in flashinfer_manifest_evidence_errors(
+            copied_flashinfer_manifest,
+            copied_receipt,
+        )
+    )
+
+    radial = preflight.get("radialattn")
+    if not isinstance(radial, dict):
+        errors.append("preflight is missing radialattn static evidence")
+    else:
+        expected_radial = {
+            "pinned_commit": RADIAL_COMMIT,
+            "mask_api": RADIAL_MASK_API,
+            "source_files_verified": True,
+            "flashinfer_files_verified": True,
+            "flashinfer_manifest_verified": True,
+            "runtime_loader_environment_verified": True,
+            "cpu_mask_audits_verified": True,
+            "flashinfer_version": FLASHINFER_VERSION,
+            "flashinfer_apis": {
+                "BlockSparseAttentionWrapper": True,
+                "single_prefill_with_kv_cache": True,
+                "merge_state": True,
+            },
+            "derived_mask_api_callable": True,
+            "install_cuda_kernel_launched": False,
+            "preflight_cuda_microtest_required": True,
+        }
+        for field, expected in expected_radial.items():
+            if not _strict_json_equal(radial.get(field), expected):
+                errors.append(
+                    f"preflight radialattn {field} differs from fixed evidence"
+                )
+        if not _strict_json_equal(
+            radial.get("install_receipt_contents"), copied_receipt
+        ):
+            errors.append("preflight radialattn receipt differs from copied receipt")
+        errors.extend(
+            _radial_runtime_dependency_errors(
+                radial.get("runtime_dependencies_before_optional_imports"),
+                expected_runtime,
+                "preflight Radial before optional imports",
+            )
+        )
+        errors.extend(
+            _radial_optional_import_loader_errors(
+                radial.get("optional_import_loader_evidence"),
+                expected_runtime,
+                "preflight Radial optional imports",
+            )
+        )
+
+    microtest = preflight.get("radialattn_microtest")
+    if isinstance(microtest, dict):
+        for phase in ("before_cuda", "after_cuda"):
+            errors.extend(
+                _radial_runtime_dependency_errors(
+                    microtest.get(f"runtime_dependencies_{phase}"),
+                    expected_runtime,
+                    f"Radial preflight microtest {phase}",
+                )
+            )
+    return errors
+
+
 def validate_run(
     method: dict[str, Any],
     run_dir: Path,
@@ -508,17 +1295,66 @@ def validate_run(
     timings_path = run_dir / "timings.jsonl"
     checkpoint_path = run_dir / "checkpoint_manifest.json"
     pre_run_gpu_path = run_dir / "pre_run_gpu.json"
-    environment = _read_json(environment_path, context)
-    verification = _read_json(verification_path, context)
-    timings = _read_jsonl(timings_path, context)
-    checkpoint_manifest = _read_json(checkpoint_path, context)
-    pre_run_gpu = _read_json(pre_run_gpu_path, context)
-    for name, payload in (
+    preflight_path = run_dir / "preflight.json"
+    stable_snapshots: list[_StableFileSnapshot] = []
+    environment_snapshot, environment = _snapshot_json(environment_path, context)
+    verification_snapshot, verification = _snapshot_json(verification_path, context)
+    timings_snapshot, timings = _snapshot_jsonl(timings_path, context)
+    checkpoint_snapshot, checkpoint_manifest = _snapshot_json(
+        checkpoint_path, context
+    )
+    pre_run_snapshot, pre_run_gpu = _snapshot_json(pre_run_gpu_path, context)
+    stable_snapshots.extend(
+        (
+            environment_snapshot,
+            verification_snapshot,
+            timings_snapshot,
+            checkpoint_snapshot,
+            pre_run_snapshot,
+        )
+    )
+    preflight_snapshot = None
+    copied_receipt_snapshot = None
+    copied_receipt = None
+    flashinfer_manifest_snapshot = None
+    copied_flashinfer_manifest = None
+    copied_artifact_snapshots: dict[str, _StableFileSnapshot] = {}
+    if isinstance(environment, dict) and environment.get("attention_method") == "radial":
+        preflight_snapshot, preflight = _snapshot_json(preflight_path, context)
+        copied_receipt_snapshot, copied_receipt = _snapshot_json(
+            run_dir / "radialattn-install.json", context
+        )
+        flashinfer_manifest_snapshot, copied_flashinfer_manifest = _snapshot_json(
+            run_dir / "radial-flashinfer-manifest.json", context
+        )
+        for field, filename in (
+            ("source_module", "radial-attention-source.py"),
+            ("derived_module", "radial-attention-derived.py"),
+            ("optional_imports_patch", "radial-attention-optional-imports.patch"),
+        ):
+            copied_artifact_snapshots[field] = _stable_file_snapshot(
+                run_dir / filename,
+                context,
+            )
+        stable_snapshots.extend(
+            (
+                preflight_snapshot,
+                copied_receipt_snapshot,
+                flashinfer_manifest_snapshot,
+                *copied_artifact_snapshots.values(),
+            )
+        )
+    else:
+        preflight = None
+    required_payloads = [
         ("environment.json", environment),
         ("verification.json", verification),
         ("checkpoint_manifest.json", checkpoint_manifest),
         ("pre_run_gpu.json", pre_run_gpu),
-    ):
+    ]
+    if environment.get("attention_method") == "radial":
+        required_payloads.append(("preflight.json", preflight))
+    for name, payload in required_payloads:
         _require(isinstance(payload, dict), context, f"{name} must contain an object")
 
     _require(verification.get("status") == "ok", context, "verification status is not ok")
@@ -619,8 +1455,13 @@ def validate_run(
     )
     _require(len(timings) == MEASUREMENT_COUNT, context, "timings.jsonl must contain exactly three measurements")
 
-    checkpoint_manifest_sha256 = _sha256(checkpoint_path)
-    pre_run_gpu_sha256 = _sha256(pre_run_gpu_path)
+    checkpoint_manifest_sha256 = checkpoint_snapshot.sha256
+    pre_run_gpu_sha256 = pre_run_snapshot.sha256
+    preflight_sha256 = (
+        preflight_snapshot.sha256
+        if environment.get("attention_method") == "radial"
+        else ""
+    )
     evidence_hashes = environment.get("evidence_file_sha256")
     _require(isinstance(evidence_hashes, dict), context, "environment evidence hashes are missing")
     _require(
@@ -634,6 +1475,104 @@ def validate_run(
         context,
         "pre-run GPU hash differs from environment evidence",
     )
+    radial_summary = {
+        "radial_evidence_mode": "",
+        "radial_pmon_status": "",
+        "radial_pid_association": "",
+        "radial_claim_scope": "",
+        "radial_host_pid_ownership": "",
+        "radial_mps_status": "",
+    }
+    if environment.get("attention_method") == "radial":
+        radial_original_snapshots = {
+            "radialattn-install.json": copied_receipt_snapshot,
+            "radial-flashinfer-manifest.json": flashinfer_manifest_snapshot,
+            "radial-attention-source.py": copied_artifact_snapshots.get(
+                "source_module"
+            ),
+            "radial-attention-derived.py": copied_artifact_snapshots.get(
+                "derived_module"
+            ),
+            "radial-attention-optional-imports.patch": (
+                copied_artifact_snapshots.get("optional_imports_patch")
+            ),
+        }
+        for filename, snapshot in radial_original_snapshots.items():
+            _require(
+                isinstance(snapshot, _StableFileSnapshot)
+                and evidence_hashes.get(filename) == snapshot.sha256,
+                context,
+                f"{filename} hash differs from environment evidence",
+            )
+        _require(
+            evidence_hashes.get("preflight.json") == preflight_sha256,
+            context,
+            "preflight hash differs from environment evidence",
+        )
+        radial_static_errors = _radial_preflight_static_errors(
+            preflight,
+            pre_run_gpu,
+            checkpoint_manifest,
+            copied_receipt,
+            copied_flashinfer_manifest,
+            copied_artifact_snapshots,
+            flashinfer_manifest_snapshot,
+        )
+        _require(
+            not radial_static_errors,
+            context,
+            "Radial preflight static evidence is invalid: "
+            + "; ".join(radial_static_errors),
+        )
+        loader_errors = _radial_loader_bootstrap_errors(
+            environment.get("radial_loader_bootstrap"),
+            _expected_radial_runtime_dependencies(copied_receipt),
+        )
+        _require(
+            not loader_errors,
+            context,
+            "Radial inference loader bootstrap is invalid: "
+            + "; ".join(loader_errors),
+        )
+        radial_microtest = preflight.get("radialattn_microtest")
+        radial_errors = radial_microtest_evidence_errors(
+            radial_microtest,
+            expected_gpu_uuid=pre_run_gpu.get("device_uuid"),
+            expected_pre_run_gpu=pre_run_gpu,
+            expected_pre_run_gpu_sha256=pre_run_gpu_sha256,
+            expected_pre_run_gpu_path=str(pre_run_gpu_path.resolve()),
+            expected_python_executable=preflight.get("python_executable"),
+        )
+        _require(
+            not radial_errors,
+            context,
+            "Radial preflight microtest is invalid: "
+            + "; ".join(radial_errors),
+        )
+        binding = radial_microtest.get("gpu_process_binding")
+        _require(
+            isinstance(binding, dict),
+            context,
+            "Radial GPU process binding is missing",
+        )
+        pmon = (
+            binding.get("mps", {}).get("pmon")
+            if isinstance(binding.get("mps"), dict)
+            else None
+        )
+        _require(
+            isinstance(pmon, dict),
+            context,
+            "Radial pmon evidence is missing",
+        )
+        radial_summary = {
+            "radial_evidence_mode": binding.get("pmon_observation_mode"),
+            "radial_pmon_status": pmon.get("status"),
+            "radial_pid_association": binding.get("binding_method"),
+            "radial_claim_scope": binding.get("claim_scope"),
+            "radial_host_pid_ownership": binding.get("host_pid_ownership"),
+            "radial_mps_status": binding.get("mps", {}).get("mps_status"),
+        }
     checkpoint_fingerprint = _checkpoint_fingerprint(checkpoint_manifest, context)
 
     requested_shape = _shape(
@@ -682,7 +1621,8 @@ def validate_run(
         _require(report.get("errors") == [], report_context, "artifact report contains errors")
         report_path_value = report.get("path")
         _require(isinstance(report_path_value, str) and report_path_value, report_context, "artifact path is missing")
-        report_path = Path(report_path_value).resolve()
+        report_path = Path(report_path_value)
+        _require(report_path.is_absolute(), report_context, "artifact path must be absolute")
         _require(report_path.parent == run_dir, report_context, "artifact is outside the selected run directory")
         report_hash = report.get("sha256")
         _require(
@@ -718,6 +1658,19 @@ def validate_run(
                 _values_equal(record.get(field), environment.get(field)),
                 record_context,
                 f"{field} differs from environment",
+            )
+        if environment.get("attention_method") == "radial":
+            dispatcher_errors = _radial_dispatcher_errors(
+                record.get("video_self_attention_dispatcher"),
+                environment,
+                copied_receipt,
+                record_context,
+            )
+            _require(
+                not dispatcher_errors,
+                record_context,
+                "Radial dispatcher evidence is invalid: "
+                + "; ".join(dispatcher_errors),
             )
 
         denoise = _finite_number(record, "denoise_seconds", record_context, positive=True)
@@ -767,6 +1720,9 @@ def validate_run(
             record.get("gpu_process_monitor"),
             environment,
             expected_nvidia_smi_binary,
+            pre_run_gpu.get("boot_id"),
+            environment.get("gpu_process_monitor_interval_seconds"),
+            total,
             record_context,
         )
 
@@ -778,12 +1734,16 @@ def validate_run(
             record_context,
             "output_sha256 is invalid",
         )
-        output_path = Path(output_path_value).resolve()
+        output_path = Path(output_path_value)
+        _require(output_path.is_absolute(), record_context, "output artifact path must be absolute")
         _require(output_path.parent == run_dir, record_context, "output artifact is outside the selected run directory")
         _require(output_path not in timing_paths, record_context, "output artifact path is duplicated")
-        _require(output_path.is_file(), record_context, f"output artifact is missing: {output_path}")
         metrics_path = output_path.with_suffix(".metrics.json")
-        metrics_sidecar = _read_json(metrics_path, record_context)
+        output_snapshot = _stable_file_snapshot(output_path, record_context)
+        metrics_snapshot, metrics_sidecar = _snapshot_json(
+            metrics_path, record_context
+        )
+        stable_snapshots.extend((output_snapshot, metrics_snapshot))
         _require(
             isinstance(metrics_sidecar, dict),
             record_context,
@@ -794,7 +1754,7 @@ def validate_run(
             record_context,
             "timings.jsonl record differs from its metrics sidecar",
         )
-        actual_hash = _sha256(output_path)
+        actual_hash = output_snapshot.sha256
         _require(actual_hash == output_hash, record_context, "output artifact SHA256 differs from timing record")
         _require(
             verified_by_path.get(output_path) == actual_hash,
@@ -814,7 +1774,7 @@ def validate_run(
         generated_audio_shapes.add(generated_audio_shape)
         timing_paths.add(output_path)
         artifact_hashes.append(actual_hash)
-        metrics_sidecar_hashes.append(_sha256(metrics_path))
+        metrics_sidecar_hashes.append(metrics_snapshot.sha256)
 
     _require(timing_paths == set(verified_by_path), context, "timing artifacts differ from verified artifacts")
     _require(len(prompts) == 1, context, "measurements do not use exactly one prompt")
@@ -845,16 +1805,18 @@ def validate_run(
         "generated_audio_shape": generated_audio_shape,
         "sample_steps": environment.get("sample_steps"),
     }
-    return {
+    summary = {
         "run_dir": str(run_dir),
         "run_id": environment.get("run_id"),
-        "verification_sha256": _sha256(verification_path),
-        "timings_sha256": _sha256(timings_path),
+        "verification_sha256": verification_snapshot.sha256,
+        "preflight_sha256": preflight_sha256,
+        "timings_sha256": timings_snapshot.sha256,
         "git_commit": git_commit,
         "checkpoint_manifest_sha256": checkpoint_manifest_sha256,
         "checkpoint_fingerprint_sha256": checkpoint_fingerprint,
         "gpu_uuid": environment.get("gpu_uuid"),
         "gpu_name": environment.get("gpu_name"),
+        **radial_summary,
         "prompt_sha256": prompt_sha256,
         "prompt": prompt,
         "seed": seed,
@@ -883,6 +1845,9 @@ def validate_run(
         "engine_load_seconds": engine_load_seconds,
         "comparison_values": comparison_values,
     }
+    for snapshot in stable_snapshots:
+        _revalidate_snapshot(snapshot, context)
+    return summary
 
 
 def _pending_row(method: dict[str, Any], reason: str) -> dict[str, Any]:

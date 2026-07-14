@@ -8,11 +8,18 @@ is copied into FastA2V.
 
 import hashlib
 from datetime import datetime, timezone
+import json
 import math
 from pathlib import Path
 import re
 
-from ovi.gpu_process_monitor import trusted_nvidia_smi_metadata_errors
+from ovi.gpu_process_monitor import (
+    GPU_EVIDENCE_SCHEMA_VERSION,
+    gpu_compute_snapshot_errors,
+    gpu_compute_snapshot_sequence_errors,
+    trusted_nvidia_smi_metadata_errors,
+    validate_pre_run_gpu_report,
+)
 
 
 RADIAL_REPOSITORY = "https://github.com/mit-han-lab/radial-attention.git"
@@ -73,15 +80,29 @@ RADIAL_CUDA_HOME = "/usr/local/cuda-12.1"
 RADIAL_LDD_EXECUTABLE = "/usr/bin/ldd"
 RADIAL_FORBIDDEN_LOADER_PREFIXES = ("LD_",)
 RADIAL_FORBIDDEN_LOADER_VARIABLES = ("GLIBC_TUNABLES",)
-RADIAL_GPU_PROCESS_BINDING_SCHEMA_VERSION = 1
+RADIAL_GPU_PROCESS_BINDING_SCHEMA_VERSION = 2
 RADIAL_GPU_IDLE_GUARD_MAX_AGE_SECONDS = 600.0
 RADIAL_GPU_PROCESS_BINDING_METHODS = (
     "direct_nspid",
-    "snapshot_bound_singleton_after_idle_guard",
+    "sampled_temporal_association_after_idle_guard",
 )
-RADIAL_GPU_PROCESS_CLAIM_SCOPE = (
-    "snapshot_bound_not_continuous_exclusivity"
+RADIAL_GPU_PROCESS_CLAIM_SCOPES = {
+    "direct_nspid": "snapshot_bound_not_continuous_exclusivity",
+    "sampled_temporal_association_after_idle_guard": (
+        "sampled_temporal_association_not_pid_ownership_or_"
+        "continuous_exclusivity"
+    ),
+}
+RADIAL_PMON_OBSERVATION_MODES = (
+    "direct_c_observed",
+    "pmon_reported_all_idle_during_audited_window",
 )
+RADIAL_GPU_QUERY_INTERVAL_SECONDS = 0.1
+RADIAL_GPU_QUERY_MAX_GAP_SECONDS = 1.0
+RADIAL_GPU_QUERY_MAX_DURATION_SECONDS = 1.0
+RADIAL_GPU_QUERY_MIN_BACKEND_SAMPLES = 2
+RADIAL_PMON_SAMPLE_INTERVAL_SECONDS = 1.0
+RADIAL_PMON_MAX_RECEIPT_GAP_SECONDS = 2.0
 RADIAL_QKV_STORAGE_BYTES = (
     3 * RADIAL_SEQUENCE * RADIAL_HEADS * RADIAL_HEAD_DIM * 2
 )
@@ -393,7 +414,7 @@ def radial_receipt_evidence_errors(
         "grid": list(RADIAL_GRID),
     }
     for field, expected_value in expected.items():
-        if receipt.get(field) != expected_value:
+        if not _exact_json_value(receipt.get(field), expected_value):
             errors.append(
                 f"receipt {field}={receipt.get(field)!r} != {expected_value!r}"
             )
@@ -743,6 +764,40 @@ def _positive_integer(value):
     )
 
 
+def _json_integer(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _exact_json_value(value, expected):
+    """Compare canonical JSON values without bool/int aliasing."""
+
+    if isinstance(expected, bool):
+        return isinstance(value, bool) and value is expected
+    if isinstance(expected, int):
+        return _json_integer(value) and value == expected
+    if isinstance(expected, float):
+        return _finite_number(value) and float(value) == expected
+    if isinstance(expected, list):
+        return (
+            isinstance(value, list)
+            and len(value) == len(expected)
+            and all(
+                _exact_json_value(item, expected_item)
+                for item, expected_item in zip(value, expected)
+            )
+        )
+    if isinstance(expected, dict):
+        return (
+            isinstance(value, dict)
+            and set(value) == set(expected)
+            and all(
+                _exact_json_value(value[field], expected_value)
+                for field, expected_value in expected.items()
+            )
+        )
+    return value == expected
+
+
 def _gpu_snapshot_errors(
     sample,
     expected_identity,
@@ -768,10 +823,15 @@ def _gpu_snapshot_errors(
         "query_finished_at_monotonic_seconds",
         "boot_id",
         "nvidia_smi_binary",
+        "query_receipt",
     }
     missing_fields = sorted(required_fields - set(sample))
     if missing_fields:
         errors.append(f"{context} is missing fields: {missing_fields}")
+    errors.extend(
+        f"{context}: {error}"
+        for error in gpu_compute_snapshot_errors(sample)
+    )
     if sample.get("available") is not True or sample.get("error") is not None:
         errors.append(f"{context} GPU query is unavailable")
     identity = (
@@ -819,7 +879,34 @@ def _gpu_snapshot_errors(
             for value in (started, sampled, finished)
         ) or not float(started) <= float(sampled) <= float(finished):
             errors.append(f"{context} {suffix} query timestamps are invalid")
+        elif (
+            float(finished) - float(started)
+            > RADIAL_GPU_QUERY_MAX_DURATION_SECONDS
+        ):
+            errors.append(
+                f"{context} {suffix} query duration exceeds the fixed maximum"
+            )
     return errors
+
+
+def _gpu_query_receipt_digest(sample):
+    """Return a canonical identity for one independently timed raw receipt."""
+
+    if not isinstance(sample, dict) or not isinstance(
+        sample.get("query_receipt"), dict
+    ):
+        return None
+    try:
+        payload = json.dumps(
+            sample["query_receipt"],
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _pmon_evidence_errors(
@@ -834,11 +921,31 @@ def _pmon_evidence_errors(
     backend_started_monotonic,
     backend_returned_wall,
     backend_returned_monotonic,
+    sync_finished_wall,
     sync_finished_monotonic,
 ):
+    """Recompute strict/direct or explicitly degraded all-idle pmon evidence."""
+
     errors = []
     if not isinstance(pmon, dict):
         return ["Radial GPU binding pmon evidence is missing"], []
+    for required_field in (
+        "compute_observation_deadline_reached_at_unix_seconds",
+        "compute_observation_deadline_reached_at_monotonic_seconds",
+        "window_compute_ready_at_unix_seconds",
+        "window_compute_ready_at_monotonic_seconds",
+        "window_compute_line_number",
+    ):
+        if required_field not in pmon:
+            errors.append(f"Radial pmon field {required_field} is missing")
+    observation_mode = pmon.get("observation_mode")
+    if observation_mode not in RADIAL_PMON_OBSERVATION_MODES:
+        errors.append("Radial pmon observation mode is invalid")
+    direct_mode = observation_mode == "direct_c_observed"
+    all_idle_mode = (
+        observation_mode
+        == "pmon_reported_all_idle_during_audited_window"
+    )
     raw_stdout = pmon.get("raw_stdout")
     parsed = parse_nvidia_smi_pmon_output(raw_stdout)
     errors.extend(
@@ -874,16 +981,26 @@ def _pmon_evidence_errors(
     )
     if pmon.get("expected_host_pid") != expected_host_pid:
         errors.append("Radial pmon expected host PID is not cross-bound")
+    expected_status = "ok" if direct_mode else "degraded" if all_idle_mode else None
     if (
-        pmon.get("status") != "ok"
+        pmon.get("status") != expected_status
+        or pmon.get("collection_status") != "ok"
+        or pmon.get("direct_compute_type_observed") is not direct_mode
+        or pmon.get("host_pid_observed") is not direct_mode
+        or pmon.get("continuous_exclusivity_proven") is not False
+        or not _finite_number(
+            pmon.get("compute_observation_timeout_seconds"),
+            nonnegative=True,
+        )
+        or float(pmon.get("compute_observation_timeout_seconds", math.nan))
+        != 20.0
         or not isinstance(raw_stdout, str)
         or not isinstance(pmon.get("raw_stderr"), str)
         or not _positive_integer(pmon.get("process_pid"))
         or not isinstance(pmon.get("resolved_executable"), str)
         or not Path(pmon.get("resolved_executable", "")).is_absolute()
         or pmon.get("resolved_executable") != "/usr/bin/nvidia-smi"
-        or not isinstance(pmon.get("exit_code"), int)
-        or isinstance(pmon.get("exit_code"), bool)
+        or not _json_integer(pmon.get("exit_code"))
         or pmon.get("exit_code") not in (0, -15)
         or pmon.get("termination_method") != "terminate"
         or pmon.get("timed_out") is not False
@@ -897,9 +1014,11 @@ def _pmon_evidence_errors(
         raw_stderr.encode("utf-8") if isinstance(raw_stderr, str) else b""
     )
     if (
-        pmon.get("raw_stdout_bytes") != len(stdout_bytes)
+        not _json_integer(pmon.get("raw_stdout_bytes"))
+        or pmon.get("raw_stdout_bytes") != len(stdout_bytes)
         or pmon.get("raw_stdout_sha256")
         != hashlib.sha256(stdout_bytes).hexdigest()
+        or not _json_integer(pmon.get("raw_stderr_bytes"))
         or pmon.get("raw_stderr_bytes") != len(stderr_bytes)
         or pmon.get("raw_stderr_sha256")
         != hashlib.sha256(stderr_bytes).hexdigest()
@@ -941,6 +1060,7 @@ def _pmon_evidence_errors(
         )
         if (
             not isinstance(record, dict)
+            or not _json_integer(record.get("line_index"))
             or record.get("line_index") != index
             or not isinstance(record.get("raw_line"), str)
             or record.get("parsed_row") != rows_by_line.get(index + 1)
@@ -963,7 +1083,12 @@ def _pmon_evidence_errors(
         "idle_baseline_ready_at",
         "host_pid_bound_at",
         "backend_window_started_at",
-        "window_compute_ready_at",
+        (
+            "window_compute_ready_at"
+            if direct_mode
+            else "compute_observation_deadline_reached_at"
+        ),
+        "final_sync_covered_at",
         "stop_requested_at",
         "process_exited_at",
     )
@@ -993,8 +1118,19 @@ def _pmon_evidence_errors(
     backend_window_started = lifecycle_values.get(
         ("backend_window_started_at", "monotonic_seconds")
     )
-    window_compute_ready = lifecycle_values.get(
-        ("window_compute_ready_at", "monotonic_seconds")
+    backend_window_started_wall = lifecycle_values.get(
+        ("backend_window_started_at", "unix_seconds")
+    )
+    observation_ready = lifecycle_values.get(
+        (
+            "window_compute_ready_at"
+            if direct_mode
+            else "compute_observation_deadline_reached_at",
+            "monotonic_seconds",
+        )
+    )
+    final_sync_covered = lifecycle_values.get(
+        ("final_sync_covered_at", "monotonic_seconds")
     )
     stop_requested = lifecycle_values.get(
         ("stop_requested_at", "monotonic_seconds")
@@ -1010,10 +1146,13 @@ def _pmon_evidence_errors(
             idle_ready,
             host_pid_bound,
             backend_window_started,
+            backend_window_started_wall,
+            backend_started_wall,
             backend_started_monotonic,
             backend_returned_monotonic,
-            window_compute_ready,
+            observation_ready,
             sync_finished_monotonic,
+            final_sync_covered,
             stop_requested,
         )
     ) or not (
@@ -1024,12 +1163,29 @@ def _pmon_evidence_errors(
         <= float(host_pid_bound)
         <= float(backend_window_started)
         == float(backend_started_monotonic)
-        <= float(window_compute_ready)
+        <= float(observation_ready)
         <= float(backend_returned_monotonic)
         <= float(sync_finished_monotonic)
+        <= float(final_sync_covered)
         <= float(stop_requested)
     ):
         errors.append("Radial pmon does not span exact backend through final sync")
+    if (
+        not _finite_number(backend_window_started_wall, nonnegative=True)
+        or not _finite_number(backend_started_wall, nonnegative=True)
+        or backend_window_started_wall != backend_started_wall
+    ):
+        errors.append(
+            "Radial pmon Unix backend-window start differs from GPU binding"
+        )
+    if all_idle_mode and all(
+        _finite_number(value, nonnegative=True)
+        for value in (observation_ready, backend_started_monotonic)
+    ) and (
+        float(observation_ready) - float(backend_started_monotonic)
+        < float(pmon.get("compute_observation_timeout_seconds", math.inf))
+    ):
+        errors.append("Radial all-idle pmon observation ended before its timeout")
     rows = parsed["rows"]
     if not rows:
         errors.append("Radial pmon raw output contains no process rows")
@@ -1071,6 +1227,8 @@ def _pmon_evidence_errors(
             )
         else:
             valid_row = (
+                direct_mode
+                and
                 row.get("gpu_index") == 0
                 and row.get("host_pid") == expected_host_pid
                 and row.get("process_type") == "C"
@@ -1100,7 +1258,7 @@ def _pmon_evidence_errors(
         or baseline_row.get("command") != "-"
     ):
         errors.append("Radial pmon idle baseline row is invalid")
-    if isinstance(baseline_line, int) and any(
+    if _positive_integer(baseline_line) and any(
         row.get("host_pid") is not None
         and isinstance(row.get("line_number"), int)
         and row["line_number"] <= baseline_line
@@ -1112,7 +1270,7 @@ def _pmon_evidence_errors(
     matching_rows = [
         row
         for row in rows
-        if isinstance(window_start_line, int)
+        if _positive_integer(window_start_line)
         and row.get("line_number", 0) > window_start_line
         and row.get("gpu_index") == 0
         and row.get("host_pid") == expected_host_pid
@@ -1128,7 +1286,7 @@ def _pmon_evidence_errors(
     )
     selected_window_record = (
         line_records[window_compute_line - 1]
-        if isinstance(window_compute_line, int)
+        if _positive_integer(window_compute_line)
         and 0 < window_compute_line <= len(line_records)
         else None
     )
@@ -1137,17 +1295,17 @@ def _pmon_evidence_errors(
         if isinstance(selected_window_row, dict)
         else None
     )
-    if (
-        not isinstance(window_start_line, int)
-        or isinstance(window_start_line, bool)
-        or not isinstance(baseline_line, int)
+    if direct_mode and (
+        not _positive_integer(window_start_line)
+        or not _positive_integer(baseline_line)
+        or not _positive_integer(window_compute_line)
         or window_start_line < baseline_line
         or window_start_line > len(line_records)
         or not isinstance(selected_window_row, dict)
         or not isinstance(selected_window_record, dict)
     ):
         errors.append("Radial pmon backend-window C line binding is invalid")
-    if not all(
+    if direct_mode and (not all(
         _finite_number(value, nonnegative=True)
         for value in (
             selected_source_time,
@@ -1157,10 +1315,48 @@ def _pmon_evidence_errors(
     ) or not (
         float(backend_started_wall) < float(selected_source_time)
         <= float(backend_returned_wall)
-    ):
+    )):
         errors.append(
             "Radial pmon source-DT sample is not strictly inside the backend window"
         )
+    if all_idle_mode:
+        if matching_rows or any(row.get("host_pid") is not None for row in rows):
+            errors.append("Radial all-idle pmon mode contains a process row")
+        in_backend_idle_rows = [
+            row
+            for row in rows
+            if _positive_integer(window_start_line)
+            and _positive_integer(row.get("line_number"))
+            and row["line_number"] > window_start_line
+            and _finite_number(
+                row.get("source_timestamp_unix_seconds"), nonnegative=True
+            )
+            and _finite_number(backend_started_wall, nonnegative=True)
+            and _finite_number(backend_returned_wall, nonnegative=True)
+            and float(backend_started_wall)
+            < float(row["source_timestamp_unix_seconds"])
+            <= float(backend_returned_wall)
+        ]
+        if not in_backend_idle_rows:
+            errors.append(
+                "Radial all-idle pmon evidence has no source-DT row inside the "
+                "exact backend window"
+            )
+        if (
+            pmon.get("window_compute_ready_at_unix_seconds") is not None
+            or pmon.get("window_compute_ready_at_monotonic_seconds") is not None
+            or pmon.get("window_compute_line_number") is not None
+        ):
+            errors.append("Radial all-idle pmon mode forged a direct-C readiness")
+    elif direct_mode and (
+        pmon.get("compute_observation_deadline_reached_at_unix_seconds")
+        is not None
+        or pmon.get(
+            "compute_observation_deadline_reached_at_monotonic_seconds"
+        )
+        is not None
+    ):
+        errors.append("Radial direct-C pmon mode also claims an all-idle deadline")
     header_records = [
         record
         for record in line_records
@@ -1176,22 +1372,172 @@ def _pmon_evidence_errors(
     ]
     baseline_record = (
         line_records[baseline_line - 1]
-        if isinstance(baseline_line, int)
+        if _positive_integer(baseline_line)
         and 0 < baseline_line <= len(line_records)
         else None
     )
+    final_sync_line = pmon.get("final_sync_covered_line_number")
+    final_sync_row = next(
+        (
+            row
+            for row in rows
+            if row.get("line_number") == final_sync_line
+        ),
+        None,
+    )
+    final_sync_record = (
+        line_records[final_sync_line - 1]
+        if _positive_integer(final_sync_line)
+        and 0 < final_sync_line <= len(line_records)
+        else None
+    )
+    if (
+        not isinstance(final_sync_row, dict)
+        or not isinstance(final_sync_record, dict)
+        or not _finite_number(sync_finished_wall, nonnegative=True)
+        or not _finite_number(sync_finished_monotonic, nonnegative=True)
+        or not _finite_number(
+            final_sync_row.get("source_timestamp_unix_seconds"),
+            nonnegative=True,
+        )
+        or float(final_sync_row["source_timestamp_unix_seconds"])
+        < float(sync_finished_wall)
+        or float(final_sync_record.get(
+            "received_at_monotonic_seconds", -math.inf
+        )) < float(sync_finished_monotonic)
+    ):
+        errors.append("Radial pmon has no valid source-DT row after final sync")
+    if all_idle_mode:
+        valid_window_start = (
+            _positive_integer(window_start_line)
+            and _positive_integer(baseline_line)
+            and baseline_line <= window_start_line <= len(line_records)
+        )
+        if not valid_window_start:
+            errors.append(
+                "Radial all-idle pmon backend-window line boundary is invalid"
+            )
+        coverage_start_candidates = []
+        if valid_window_start and all(
+            _finite_number(value, nonnegative=True)
+            for value in (backend_started_wall, backend_started_monotonic)
+        ):
+            for row in rows:
+                line_number = row.get("line_number")
+                source_time = row.get("source_timestamp_unix_seconds")
+                record = (
+                    line_records[line_number - 1]
+                    if isinstance(line_number, int)
+                    and not isinstance(line_number, bool)
+                    and 0 < line_number <= len(line_records)
+                    else None
+                )
+                received_monotonic = (
+                    record.get("received_at_monotonic_seconds")
+                    if isinstance(record, dict)
+                    else None
+                )
+                if (
+                    isinstance(line_number, int)
+                    and line_number <= window_start_line
+                    and _finite_number(source_time, nonnegative=True)
+                    and _finite_number(received_monotonic, nonnegative=True)
+                    and float(source_time) <= float(backend_started_wall)
+                    and float(received_monotonic)
+                    <= float(backend_started_monotonic)
+                ):
+                    coverage_start_candidates.append((row, record))
+        if not coverage_start_candidates:
+            errors.append(
+                "Radial all-idle pmon cadence lacks a raw row sampled before "
+                "the backend window"
+            )
+        elif not isinstance(final_sync_row, dict):
+            errors.append(
+                "Radial all-idle pmon cadence lacks a final-sync endpoint"
+            )
+        else:
+            coverage_start_row, _ = coverage_start_candidates[-1]
+            coverage_start_line = coverage_start_row.get("line_number")
+            cadence_rows = []
+            for row in rows:
+                line_number = row.get("line_number")
+                if not (
+                    isinstance(line_number, int)
+                    and not isinstance(line_number, bool)
+                    and isinstance(coverage_start_line, int)
+                    and isinstance(final_sync_line, int)
+                    and coverage_start_line <= line_number <= final_sync_line
+                ):
+                    continue
+                record = (
+                    line_records[line_number - 1]
+                    if 0 < line_number <= len(line_records)
+                    else None
+                )
+                cadence_rows.append((row, record))
+            cadence_error = len(cadence_rows) < 2
+            for (previous_row, previous_record), (row, record) in zip(
+                cadence_rows,
+                cadence_rows[1:],
+            ):
+                previous_source = previous_row.get(
+                    "source_timestamp_unix_seconds"
+                )
+                source = row.get("source_timestamp_unix_seconds")
+                previous_received = (
+                    previous_record.get("received_at_monotonic_seconds")
+                    if isinstance(previous_record, dict)
+                    else None
+                )
+                received = (
+                    record.get("received_at_monotonic_seconds")
+                    if isinstance(record, dict)
+                    else None
+                )
+                if not all(
+                    _finite_number(value, nonnegative=True)
+                    for value in (
+                        previous_source,
+                        source,
+                        previous_received,
+                        received,
+                    )
+                ):
+                    cadence_error = True
+                    break
+                source_gap = float(source) - float(previous_source)
+                receipt_gap = float(received) - float(previous_received)
+                if not (
+                    0.0 < source_gap <= RADIAL_PMON_SAMPLE_INTERVAL_SECONDS
+                    and 0.0
+                    < receipt_gap
+                    <= RADIAL_PMON_MAX_RECEIPT_GAP_SECONDS
+                ):
+                    cadence_error = True
+                    break
+            if cadence_error:
+                errors.append(
+                    "Radial all-idle pmon raw rows violate the fixed cadence "
+                    "or continuous backend/final-sync coverage"
+                )
     if (
         not header_records
         or not isinstance(baseline_record, dict)
-        or not isinstance(selected_window_record, dict)
+        or (direct_mode and not isinstance(selected_window_record, dict))
+        or not isinstance(final_sync_record, dict)
     ):
         errors.append("Radial pmon ready events lack matching raw line records")
     else:
-        lifecycle_record_pairs = (
+        lifecycle_record_pairs = [
             ("header_ready_at", header_records[0]),
             ("idle_baseline_ready_at", baseline_record),
-            ("window_compute_ready_at", selected_window_record),
-        )
+            ("final_sync_covered_at", final_sync_record),
+        ]
+        if direct_mode:
+            lifecycle_record_pairs.append(
+                ("window_compute_ready_at", selected_window_record)
+            )
         for event_name, record in lifecycle_record_pairs:
             for suffix in ("unix_seconds", "monotonic_seconds"):
                 if pmon.get(f"{event_name}_{suffix}") != record.get(
@@ -1217,13 +1563,27 @@ def radial_gpu_process_binding_errors(
     if not isinstance(binding, dict):
         return ["Radial GPU process binding must be a JSON object"]
     errors = []
-    if binding.get("schema_version") != RADIAL_GPU_PROCESS_BINDING_SCHEMA_VERSION:
+    if (
+        not _json_integer(binding.get("schema_version"))
+        or binding.get("schema_version")
+        != RADIAL_GPU_PROCESS_BINDING_SCHEMA_VERSION
+    ):
         errors.append("Radial GPU process binding schema is unsupported")
     method = binding.get("binding_method")
     if method not in RADIAL_GPU_PROCESS_BINDING_METHODS:
         errors.append("Radial GPU process binding method is invalid")
-    if binding.get("claim_scope") != RADIAL_GPU_PROCESS_CLAIM_SCOPE:
+    if binding.get("claim_scope") != RADIAL_GPU_PROCESS_CLAIM_SCOPES.get(method):
         errors.append("Radial GPU process binding claim scope is invalid")
+    pmon_observation_mode = binding.get("pmon_observation_mode")
+    if pmon_observation_mode not in RADIAL_PMON_OBSERVATION_MODES:
+        errors.append("Radial GPU process binding pmon mode is invalid")
+    expected_ownership = (
+        "proven_by_nspid"
+        if method == "direct_nspid"
+        else "unknown_sampled_temporal_association_only"
+    )
+    if binding.get("host_pid_ownership") != expected_ownership:
+        errors.append("Radial GPU process ownership scope is invalid")
 
     pre_run_gpu = binding.get("pre_run_gpu")
     if not isinstance(pre_run_gpu, dict):
@@ -1255,12 +1615,22 @@ def radial_gpu_process_binding_errors(
     expected_identity = (0, device_uuid, device_name, boot_id)
     errors.extend(
         f"Radial pre-run GPU evidence: {error}"
+        for error in validate_pre_run_gpu_report(
+            pre_run_gpu,
+            cuda_visible_devices=pre_run_gpu.get("cuda_visible_devices"),
+        )
+    )
+    errors.extend(
+        f"Radial pre-run GPU evidence: {error}"
         for error in trusted_nvidia_smi_metadata_errors(nvidia_smi_binary)
     )
     if (
-        pre_run_gpu.get("schema_version") != 1
+        not _json_integer(pre_run_gpu.get("schema_version"))
+        or pre_run_gpu.get("schema_version") != GPU_EVIDENCE_SCHEMA_VERSION
         or pre_run_gpu.get("check_type") != "pre_run_idle"
+        or not _json_integer(pre_run_gpu.get("physical_device_index"))
         or pre_run_gpu.get("physical_device_index") != 0
+        or not _json_integer(pre_run_gpu.get("device_index"))
         or pre_run_gpu.get("device_index") != 0
         or pre_run_gpu.get("available") is not True
         or pre_run_gpu.get("error") is not None
@@ -1289,6 +1659,7 @@ def radial_gpu_process_binding_errors(
     if (
         binding.get("current_cuda_device_uuid") != device_uuid
         or binding.get("current_cuda_device_name") != device_name
+        or not _json_integer(binding.get("current_cuda_device_index"))
         or binding.get("current_cuda_device_index") != 0
         or binding.get("cuda_visible_devices") != device_uuid
         or pre_run_gpu.get("cuda_visible_devices") != device_uuid
@@ -1353,7 +1724,9 @@ def radial_gpu_process_binding_errors(
     interval_samples = binding.get("interval_samples")
     post_samples = binding.get("post_cuda_samples")
     if (
-        binding.get("interval_seconds") != 0.1
+        not _finite_number(binding.get("interval_seconds"), nonnegative=True)
+        or float(binding.get("interval_seconds", math.nan))
+        != RADIAL_GPU_QUERY_INTERVAL_SECONDS
         or not isinstance(interval_samples, list)
         or len(interval_samples) < 2
     ):
@@ -1362,6 +1735,17 @@ def radial_gpu_process_binding_errors(
     if not isinstance(post_samples, list) or len(post_samples) != 2:
         errors.append("Radial GPU binding requires exactly two post-CUDA samples")
         post_samples = []
+    if (
+        not _finite_number(
+            binding.get("max_query_gap_seconds"), nonnegative=True
+        )
+        or float(binding.get("max_query_gap_seconds", math.nan))
+        != RADIAL_GPU_QUERY_MAX_GAP_SECONDS
+        or not _json_integer(binding.get("minimum_backend_query_samples"))
+        or binding.get("minimum_backend_query_samples")
+        != RADIAL_GPU_QUERY_MIN_BACKEND_SAMPLES
+    ):
+        errors.append("Radial GPU process-query coverage policy is invalid")
     labelled_samples = [
         ("immediate pre-CUDA sample", immediate),
         ("context-live sample", context_live),
@@ -1381,6 +1765,13 @@ def radial_gpu_process_binding_errors(
                 expected_identity,
                 nvidia_smi_binary,
                 context,
+            )
+        )
+    if len(interval_samples) >= 2:
+        errors.extend(
+            f"Radial interval raw receipts: {error}"
+            for error in gpu_compute_snapshot_sequence_errors(
+                interval_samples
             )
         )
     if isinstance(immediate, dict) and (
@@ -1493,6 +1884,107 @@ def radial_gpu_process_binding_errors(
         all_samples,
         key=lambda sample: float(sample["query_finished_at_monotonic_seconds"]),
     )
+    backend_returned = phase_times.get(
+        ("exact_backend_returned_at", "monotonic_seconds")
+    )
+    backend_complete_samples = [
+        sample
+        for sample in interval_samples
+        if isinstance(sample, dict)
+        if _finite_number(
+            sample.get("query_started_at_monotonic_seconds"),
+            nonnegative=True,
+        )
+        and _finite_number(
+            sample.get("query_finished_at_monotonic_seconds"),
+            nonnegative=True,
+        )
+        and _finite_number(backend_started, nonnegative=True)
+        and _finite_number(backend_returned, nonnegative=True)
+        and float(backend_started)
+        <= float(sample["query_started_at_monotonic_seconds"])
+        <= float(sample["query_finished_at_monotonic_seconds"])
+        <= float(backend_returned)
+    ]
+    if backend_complete_samples:
+        errors.extend(
+            f"Radial backend raw receipts: {error}"
+            for error in gpu_compute_snapshot_sequence_errors(
+                backend_complete_samples
+            )
+        )
+    unique_backend_receipts = {
+        digest
+        for digest in (
+            _gpu_query_receipt_digest(sample)
+            for sample in backend_complete_samples
+        )
+        if digest is not None
+    }
+    if any(
+        _gpu_query_receipt_digest(sample) is None
+        for sample in backend_complete_samples
+    ):
+        errors.append("Radial backend raw query receipt identity is invalid")
+    if (
+        len(unique_backend_receipts)
+        < RADIAL_GPU_QUERY_MIN_BACKEND_SAMPLES
+    ):
+        errors.append(
+            "Radial sampled evidence lacks two unique complete raw "
+            "process-query receipts inside the backend window"
+        )
+    coverage_samples = []
+    coverage_keys = set()
+    for sample in [context_live, *all_samples]:
+        if not isinstance(sample, dict):
+            continue
+        key = (
+            sample.get("query_started_at_monotonic_seconds"),
+            sample.get("query_finished_at_monotonic_seconds"),
+        )
+        if key not in coverage_keys:
+            coverage_keys.add(key)
+            coverage_samples.append(sample)
+    coverage_samples.sort(
+        key=lambda sample: float(
+            sample.get("query_started_at_monotonic_seconds", math.inf)
+        )
+    )
+    coverage_end = context_finished
+    if _finite_number(coverage_end, nonnegative=True):
+        for sample in coverage_samples:
+            query_start = sample.get("query_started_at_monotonic_seconds")
+            query_finish = sample.get("query_finished_at_monotonic_seconds")
+            if not (
+                _finite_number(query_start, nonnegative=True)
+                and _finite_number(query_finish, nonnegative=True)
+                and float(query_start) <= float(query_finish)
+            ):
+                continue
+            if float(query_finish) <= float(coverage_end):
+                continue
+            if (
+                float(query_start) - float(coverage_end)
+                > RADIAL_GPU_QUERY_MAX_GAP_SECONDS
+            ):
+                errors.append(
+                    "Radial sampled process-query coverage exceeds the maximum gap"
+                )
+                break
+            coverage_end = max(float(coverage_end), float(query_finish))
+        final_query_finish = (
+            post_samples[-1].get("query_finished_at_monotonic_seconds")
+            if post_samples and isinstance(post_samples[-1], dict)
+            else None
+        )
+        if not _finite_number(final_query_finish, nonnegative=True) or float(
+            coverage_end
+        ) < float(final_query_finish):
+            errors.append(
+                "Radial sampled process-query coverage does not reach the final "
+                "post-sync snapshot"
+            )
     positive_seen = False
     positive_processes = []
     for sample in ordered_samples:
@@ -1597,6 +2089,9 @@ def radial_gpu_process_binding_errors(
         backend_returned_monotonic=phase_times.get(
             ("exact_backend_returned_at", "monotonic_seconds")
         ),
+        sync_finished_wall=phase_times.get(
+            ("cuda_synchronized_at", "unix_seconds")
+        ),
         sync_finished_monotonic=sync_finished,
     )
     errors.extend(pmon_errors)
@@ -1611,10 +2106,24 @@ def radial_gpu_process_binding_errors(
         )
         or "mps" in normalized_name
     )
-    if mps.get("mps_process_detected") is not recomputed_mps:
-        errors.append("Radial MPS conclusion differs from raw process evidence")
     if recomputed_mps:
         errors.append("Radial GPU binding detected MPS")
+    expected_mps_status = (
+        "not_observed"
+        if pmon_observation_mode == "direct_c_observed"
+        else "unknown"
+    )
+    if (
+        mps.get("mps_status") != expected_mps_status
+        or mps.get("direct_compute_type_observed")
+        is not (pmon_observation_mode == "direct_c_observed")
+        or mps.get("host_pid_observed_by_pmon")
+        is not (pmon_observation_mode == "direct_c_observed")
+        or mps.get("continuous_exclusivity_proven") is not False
+        or not isinstance(mps.get("pmon"), dict)
+        or mps["pmon"].get("observation_mode") != pmon_observation_mode
+    ):
+        errors.append("Radial pmon/MPS observation scope is inconsistent")
 
     nspid = binding.get("nspid")
     proc_visibility = binding.get("host_pid_proc_visibility")
@@ -1638,13 +2147,16 @@ def radial_gpu_process_binding_errors(
     if method == "direct_nspid":
         if not isinstance(chain, list) or len(chain) < 2 or chain[0] != host_pid:
             errors.append("Radial direct NSpid binding lacks the outer host PID")
-    elif method == "snapshot_bound_singleton_after_idle_guard":
+    elif method == "sampled_temporal_association_after_idle_guard":
         if (
             chain != [container_pid]
             or host_pid in (chain or [])
             or proc_visibility != {"status": "not_visible", "error": None}
         ):
-            errors.append("Radial snapshot binding lacks strict namespace evidence")
+            errors.append(
+                "Radial sampled temporal association lacks strict namespace "
+                "negative evidence"
+            )
     if binding.get("exact_kernel_completed") is not True:
         errors.append("Radial exact backend completion is not proven")
     if not _positive_integer(binding.get("exact_backend_call_count")):
@@ -1690,21 +2202,30 @@ def radial_microtest_evidence_errors(
         "finite": True,
     }
     for field, expected_value in expected.items():
-        if microtest.get(field) != expected_value:
+        if not _exact_json_value(microtest.get(field), expected_value):
             errors.append(
                 f"Radial microtest {field}={microtest.get(field)!r} != "
                 f"{expected_value!r}"
             )
     call_count = microtest.get("exact_backend_call_count")
     binding = microtest.get("gpu_process_binding")
+    calls = microtest.get("calls")
+    plan_cache_entries = microtest.get("plan_cache_entries")
+    plan_cache_misses = microtest.get("plan_cache_misses")
+    plan_cache_hits = microtest.get("plan_cache_hits")
     if (
         not _positive_integer(call_count)
         or not isinstance(binding, dict)
         or binding.get("exact_backend_call_count") != call_count
-        or microtest.get("calls") != call_count
-        or microtest.get("plan_cache_entries") != 1
-        or microtest.get("plan_cache_misses") != 1
-        or microtest.get("plan_cache_hits") != call_count - 1
+        or not _positive_integer(calls)
+        or calls != call_count
+        or not _positive_integer(plan_cache_entries)
+        or plan_cache_entries != 1
+        or not _positive_integer(plan_cache_misses)
+        or plan_cache_misses != 1
+        or not _json_integer(plan_cache_hits)
+        or plan_cache_hits < 0
+        or plan_cache_hits != call_count - 1
     ):
         errors.append(
             "Radial repeated backend calls/plan-cache metrics are not cross-bound"
@@ -1718,13 +2239,9 @@ def radial_microtest_evidence_errors(
     else:
         if before_cuda.get("status") != "ok":
             errors.append("Radial microtest runtime dependency status is not ok")
-        if not isinstance(before_cuda.get("aliases"), int) or before_cuda.get(
-            "aliases", 0
-        ) <= 0:
+        if not _positive_integer(before_cuda.get("aliases")):
             errors.append("Radial microtest runtime dependency alias count is invalid")
-        if not isinstance(before_cuda.get("mapped_files"), int) or before_cuda.get(
-            "mapped_files", 0
-        ) <= 0:
+        if not _positive_integer(before_cuda.get("mapped_files")):
             errors.append("Radial microtest runtime mapped file count is invalid")
         digest = before_cuda.get("inventory_sha256")
         if not isinstance(digest, str) or len(digest) != 64:
@@ -1746,7 +2263,7 @@ def radial_microtest_evidence_errors(
         errors.append("Radial microtest lacks pre-run idle GPU evidence")
         pre_run_gpu = {}
     expected_pre_run_fields = {
-        "schema_version": 1,
+        "schema_version": GPU_EVIDENCE_SCHEMA_VERSION,
         "check_type": "pre_run_idle",
         "physical_device_index": 0,
         "cuda_visible_devices": device_uuid,
@@ -1762,7 +2279,7 @@ def radial_microtest_evidence_errors(
         "errors": [],
     }
     for field, expected_value in expected_pre_run_fields.items():
-        if pre_run_gpu.get(field) != expected_value:
+        if not _exact_json_value(pre_run_gpu.get(field), expected_value):
             errors.append(
                 f"Radial microtest pre-run {field}="
                 f"{pre_run_gpu.get(field)!r} != {expected_value!r}"
@@ -1793,6 +2310,14 @@ def radial_microtest_evidence_errors(
                 else None
             ),
             "pid_binding_method": binding.get("binding_method"),
+            "pmon_observation_mode": binding.get("pmon_observation_mode"),
+            "gpu_process_claim_scope": binding.get("claim_scope"),
+            "host_pid_ownership": binding.get("host_pid_ownership"),
+            "mps_status": (
+                binding.get("mps", {}).get("mps_status")
+                if isinstance(binding.get("mps"), dict)
+                else None
+            ),
             "pre_run_gpu": binding.get("pre_run_gpu"),
             "pre_run_gpu_sha256": binding.get("pre_run_gpu_sha256"),
             "post_cuda_sampled_at_unix_seconds": (
@@ -1822,7 +2347,9 @@ def radial_microtest_evidence_errors(
             ),
         }
         for field, expected_value in cross_bound_fields.items():
-            if microtest.get(field) != expected_value:
+            if not _exact_json_value(
+                microtest.get(field), expected_value
+            ):
                 errors.append(
                     f"Radial microtest {field} differs from GPU process binding"
                 )
@@ -1849,11 +2376,11 @@ def radial_microtest_evidence_errors(
         ("output_abs_mean", True),
         ("output_abs_max", True),
     ):
-        try:
-            value = float(microtest.get(field))
-        except (TypeError, ValueError):
+        raw_value = microtest.get(field)
+        if not _finite_number(raw_value):
             errors.append(f"Radial microtest {field} is not numeric")
             continue
+        value = float(raw_value)
         if not math.isfinite(value) or (require_positive and value <= 0.0):
             errors.append(
                 f"Radial microtest {field} must be finite and positive"

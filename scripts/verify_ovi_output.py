@@ -20,6 +20,13 @@ if str(REPO_ROOT) not in sys.path:
 from ovi.block_cache import fixed_block_cache_metric_errors
 from ovi.eval_protocol import prompt_sequence_sha256, validate_run_protocol
 from ovi.gpu_process_monitor import (
+    GPU_EVIDENCE_SCHEMA_VERSION,
+    GPU_PROCESS_MONITOR_SCHEMA_VERSION,
+    GPU_QUERY_CADENCE_TOLERANCE_SECONDS,
+    gpu_compute_snapshot_maximum_gap_seconds,
+    gpu_compute_snapshot_observation_span_seconds,
+    gpu_compute_snapshot_sequence_errors,
+    gpu_compute_snapshot_errors,
     trusted_nvidia_smi_metadata_errors,
     validate_pre_run_gpu_report,
 )
@@ -142,6 +149,41 @@ def is_json_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def strict_json_equal(actual, expected):
+    """Compare persisted JSON without Python's bool/int equivalence."""
+
+    if expected is None or isinstance(expected, (bool, str)):
+        return type(actual) is type(expected) and actual == expected
+    if isinstance(expected, int):
+        return is_json_int(actual) and actual == expected
+    if isinstance(expected, float):
+        if not isinstance(actual, (int, float)) or isinstance(actual, bool):
+            return False
+        try:
+            return float(actual) == expected
+        except (OverflowError, ValueError):
+            return False
+    if isinstance(expected, list):
+        return (
+            isinstance(actual, list)
+            and len(actual) == len(expected)
+            and all(
+                strict_json_equal(actual_value, expected_value)
+                for actual_value, expected_value in zip(actual, expected)
+            )
+        )
+    if isinstance(expected, dict):
+        return (
+            isinstance(actual, dict)
+            and set(actual) == set(expected)
+            and all(
+                strict_json_equal(actual[key], expected_value)
+                for key, expected_value in expected.items()
+            )
+        )
+    return type(actual) is type(expected) and actual == expected
+
+
 def expected_radial_runtime_dependency_evidence(receipt):
     """Summarize the exact runtime ELF inventory bound by a Radial receipt."""
 
@@ -161,12 +203,15 @@ def expected_radial_runtime_dependency_evidence(receipt):
             if not isinstance(path, str) or not path:
                 return None
             mapped_paths.add(path)
-    canonical = json.dumps(
-        inventory,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
+    try:
+        canonical = json.dumps(
+            inventory,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
     return {
         "status": "ok",
         "aliases": len(inventory),
@@ -193,9 +238,30 @@ def validate_radial_runtime_dependency_evidence(
         "inventory_sha256",
     }:
         errors.append(f"{context}: runtime dependency fields are invalid")
+    if evidence.get("status") != "ok":
+        errors.append(f"{context}: runtime dependency status is not ok")
+    for field in ("aliases", "mapped_files"):
+        value = evidence.get(field)
+        if not is_json_int(value) or value <= 0:
+            errors.append(
+                f"{context}: runtime dependency {field} must be a positive "
+                "JSON integer"
+            )
+    inventory_sha256 = evidence.get("inventory_sha256")
+    if (
+        not isinstance(inventory_sha256, str)
+        or len(inventory_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in inventory_sha256
+        )
+    ):
+        errors.append(
+            f"{context}: runtime dependency inventory_sha256 is invalid"
+        )
     if expected is None:
         errors.append(f"{context}: copied receipt has no runtime inventory")
-    elif evidence != expected:
+    elif not strict_json_equal(evidence, expected):
         errors.append(
             f"{context}: runtime dependency evidence differs from copied receipt"
         )
@@ -242,6 +308,77 @@ def validate_radial_optional_import_loader_evidence(
         errors.append(
             f"{context}: removed loader prepend path is not the fixed env lib64"
         )
+
+
+def validate_radial_preflight_static_evidence(
+    evidence,
+    errors,
+    *,
+    context="preflight Radial",
+):
+    """Validate the fixed Radial preflight values with exact JSON types."""
+
+    if not isinstance(evidence, dict):
+        errors.append(f"{context}: evidence is missing")
+        return
+    expected = {
+        "pinned_commit": RADIAL_COMMIT,
+        "mask_api": RADIAL_MASK_API,
+        "source_files_verified": True,
+        "flashinfer_files_verified": True,
+        "flashinfer_manifest_verified": True,
+        "runtime_loader_environment_verified": True,
+        "cpu_mask_audits_verified": True,
+        "flashinfer_version": FLASHINFER_VERSION,
+        "flashinfer_apis": {
+            "BlockSparseAttentionWrapper": True,
+            "single_prefill_with_kv_cache": True,
+            "merge_state": True,
+        },
+        "derived_mask_api_callable": True,
+        "install_cuda_kernel_launched": False,
+        "preflight_cuda_microtest_required": True,
+    }
+    for field, expected_value in expected.items():
+        actual_value = evidence.get(field)
+        if not strict_json_equal(actual_value, expected_value):
+            errors.append(
+                f"{context} {field}={actual_value!r} != {expected_value!r}"
+            )
+
+
+def validated_radial_preflight_claims(microtest, validation_errors):
+    """Expose claim limits only after canonical Radial evidence validation."""
+
+    if validation_errors or not isinstance(microtest, dict):
+        return None
+    binding = microtest.get("gpu_process_binding")
+    if not isinstance(binding, dict):
+        return None
+    mps = binding.get("mps")
+    if not isinstance(mps, dict):
+        return None
+    pmon = mps.get("pmon")
+    if not isinstance(pmon, dict):
+        return None
+    return {
+        "status": "validated",
+        "source": "preflight.json.radialattn_microtest",
+        "pmon_status": pmon.get("status"),
+        "pmon_collection_status": pmon.get("collection_status"),
+        "pmon_observation_mode": microtest.get("pmon_observation_mode"),
+        "mps_status": microtest.get("mps_status"),
+        "binding_method": microtest.get("pid_binding_method"),
+        "claim_scope": microtest.get("gpu_process_claim_scope"),
+        "host_pid_ownership": microtest.get("host_pid_ownership"),
+        "direct_compute_type_observed": pmon.get(
+            "direct_compute_type_observed"
+        ),
+        "host_pid_observed_by_pmon": mps.get("host_pid_observed_by_pmon"),
+        "continuous_exclusivity_proven": pmon.get(
+            "continuous_exclusivity_proven"
+        ),
+    }
 
 
 def validate_pre_run_gpu(report, environment, errors):
@@ -293,6 +430,9 @@ def validate_gpu_monitor(
     monitor,
     expected_identity,
     expected_nvidia_smi_binary,
+    expected_boot_id,
+    expected_interval_seconds,
+    minimum_coverage_seconds,
     candidate,
     context,
     errors,
@@ -301,6 +441,14 @@ def validate_gpu_monitor(
     if not isinstance(monitor, dict):
         errors.append(f"{context}: gpu_process_monitor must be a JSON object")
         return
+    if (
+        not is_json_int(monitor.get("schema_version"))
+        or monitor.get("schema_version")
+        != GPU_PROCESS_MONITOR_SCHEMA_VERSION
+    ):
+        errors.append(
+            f"{context}: unsupported GPU process monitor evidence schema"
+        )
     if expected_identity is not None:
         expected_index, expected_uuid, expected_name = expected_identity
         summary_identity = (
@@ -327,6 +475,15 @@ def validate_gpu_monitor(
         or monitor.get("sample_count") != len(samples)
     ):
         errors.append(f"{context}: monitor sample_count does not match samples")
+    interval_seconds = monitor.get("interval_seconds")
+    if (
+        isinstance(interval_seconds, bool)
+        or not isinstance(interval_seconds, (int, float))
+        or not math.isfinite(float(interval_seconds))
+        or float(interval_seconds) <= 0.0
+        or interval_seconds != expected_interval_seconds
+    ):
+        errors.append(f"{context}: monitor interval does not match environment")
 
     counts = []
     distinct_pids = set()
@@ -338,6 +495,7 @@ def validate_gpu_monitor(
     available_nvidia_smi_binaries = []
     nvidia_smi_binary_validation_errors = []
     sample_validation_errors = []
+    snapshot_validation_errors = []
     for sample_index, sample in enumerate(samples):
         sample_context = f"{context}.samples[{sample_index}]"
         if not isinstance(sample, dict):
@@ -348,6 +506,19 @@ def validate_gpu_monitor(
         else:
             available_nvidia_smi_binaries.append(
                 sample.get("nvidia_smi_binary")
+            )
+        sample_snapshot_errors = gpu_compute_snapshot_errors(sample)
+        snapshot_validation_errors.extend(
+            f"samples[{sample_index}]: {error}"
+            for error in sample_snapshot_errors
+        )
+        errors.extend(
+            f"{sample_context}: {error}"
+            for error in sample_snapshot_errors
+        )
+        if sample.get("boot_id") != expected_boot_id:
+            errors.append(
+                f"{sample_context}: boot ID does not match pre-run evidence"
             )
         if (
             not is_json_int(sample.get("device_index"))
@@ -471,6 +642,80 @@ def validate_gpu_monitor(
         )
     if monitor.get("sample_validation_errors") != []:
         errors.append(f"{context}: monitor samples contain validation errors")
+    if monitor.get("snapshot_validation_errors") != snapshot_validation_errors:
+        errors.append(
+            f"{context}: raw-snapshot validation summary disagrees with samples"
+        )
+    if monitor.get("snapshot_validation_errors") != []:
+        errors.append(f"{context}: monitor raw snapshots contain validation errors")
+    sample_sequence_validation_errors = (
+        gpu_compute_snapshot_sequence_errors(
+            samples,
+            float(expected_interval_seconds)
+            + GPU_QUERY_CADENCE_TOLERANCE_SECONDS
+            if isinstance(expected_interval_seconds, (int, float))
+            and not isinstance(expected_interval_seconds, bool)
+            and math.isfinite(float(expected_interval_seconds))
+            else None,
+        )
+    )
+    if (
+        monitor.get("sample_sequence_validation_errors")
+        != sample_sequence_validation_errors
+    ):
+        errors.append(
+            f"{context}: snapshot-sequence summary disagrees with raw samples"
+        )
+    if monitor.get("sample_sequence_validation_errors") != []:
+        errors.append(f"{context}: monitor snapshot sequence is invalid")
+    observation_span_seconds = (
+        gpu_compute_snapshot_observation_span_seconds(samples)
+    )
+    maximum_sample_gap_seconds = (
+        gpu_compute_snapshot_maximum_gap_seconds(samples)
+    )
+    if (
+        monitor.get("cadence_tolerance_seconds")
+        != GPU_QUERY_CADENCE_TOLERANCE_SECONDS
+        or monitor.get("maximum_sample_gap_seconds")
+        != maximum_sample_gap_seconds
+    ):
+        errors.append(f"{context}: monitor cadence summary disagrees")
+    if monitor.get("observation_span_seconds") != observation_span_seconds:
+        errors.append(f"{context}: observation span disagrees with raw samples")
+    if (
+        isinstance(minimum_coverage_seconds, bool)
+        or not isinstance(minimum_coverage_seconds, (int, float))
+        or not math.isfinite(float(minimum_coverage_seconds))
+        or float(minimum_coverage_seconds) <= 0.0
+        or observation_span_seconds is None
+        or observation_span_seconds < float(minimum_coverage_seconds)
+    ):
+        errors.append(
+            f"{context}: GPU observations do not cover total generation time"
+        )
+    first_boot_id = (
+        samples[0].get("boot_id")
+        if isinstance(samples[0], dict)
+        else None
+    )
+    boot_id_consistent = (
+        bool(samples)
+        and first_boot_id is not None
+        and all(
+            isinstance(sample, dict)
+            and sample.get("boot_id") == first_boot_id
+            for sample in samples
+        )
+    )
+    if monitor.get("boot_id") != first_boot_id:
+        errors.append(f"{context}: boot ID summary differs from first sample")
+    if monitor.get("boot_id") != expected_boot_id:
+        errors.append(f"{context}: boot ID summary differs from pre-run evidence")
+    if monitor.get("boot_id_consistent") is not boot_id_consistent:
+        errors.append(f"{context}: boot ID consistency summary disagrees")
+    if monitor.get("boot_id_consistent") is not True:
+        errors.append(f"{context}: monitor samples cross boot boundaries")
 
     nvidia_smi_binary_fixed_valid = (
         bool(available_nvidia_smi_binaries)
@@ -527,6 +772,9 @@ def validate_gpu_monitor(
     exact_singleton = (
         not incomplete_samples
         and not sample_validation_errors
+        and not snapshot_validation_errors
+        and not sample_sequence_validation_errors
+        and boot_id_consistent
         and all(count == 1 for count in counts)
     )
     single_distinct_pid = exact_singleton and len(distinct_pids) == 1
@@ -664,15 +912,25 @@ def validate_radial_dispatcher(
         "fallback_allowed": False,
     }
     for field, expected in expected_provenance.items():
-        if details.get(field) != expected:
+        if not strict_json_equal(details.get(field), expected):
             errors.append(
                 f"{context}: Radial backend_details {field}="
                 f"{details.get(field)!r} != {expected!r}"
             )
     calls = dispatcher.get("calls_total")
-    if details.get("calls") != calls:
+    if not is_json_int(calls) or calls <= 0:
         errors.append(
-            f"{context}: Radial backend calls={details.get('calls')} != "
+            f"{context}: Radial dispatcher calls_total must be a positive "
+            "JSON integer"
+        )
+    backend_calls = details.get("calls")
+    if not is_json_int(backend_calls) or backend_calls <= 0:
+        errors.append(
+            f"{context}: Radial backend calls must be a positive JSON integer"
+        )
+    elif not is_json_int(calls) or backend_calls != calls:
+        errors.append(
+            f"{context}: Radial backend calls={backend_calls} != "
             f"dispatcher calls_total={calls}"
         )
     expected_calls_by_method = {
@@ -681,37 +939,61 @@ def validate_radial_dispatcher(
         "radial": calls,
         "svg": 0,
     }
-    if dispatcher.get("calls_by_method") != expected_calls_by_method:
+    calls_by_method = dispatcher.get("calls_by_method")
+    calls_by_method_types_valid = (
+        isinstance(calls_by_method, dict)
+        and set(calls_by_method) == set(expected_calls_by_method)
+        and all(
+            is_json_int(value) and value >= 0
+            for value in calls_by_method.values()
+        )
+    )
+    if not calls_by_method_types_valid:
+        errors.append(
+            f"{context}: Radial calls_by_method must contain non-negative "
+            "JSON integer counters"
+        )
+    elif not strict_json_equal(calls_by_method, expected_calls_by_method):
         errors.append(
             f"{context}: Radial calls_by_method="
-            f"{dispatcher.get('calls_by_method')!r} != "
+            f"{calls_by_method!r} != "
             f"{expected_calls_by_method!r}"
         )
-    if details.get("last_shape") != [1, 15004, 24, 128]:
+    if not strict_json_equal(details.get("last_shape"), [1, 15004, 24, 128]):
         errors.append(f"{context}: Radial last_shape is not fixed Ovi NHD")
-    if details.get("last_grid") != list(RADIAL_GRID):
+    if not strict_json_equal(details.get("last_grid"), list(RADIAL_GRID)):
         errors.append(f"{context}: Radial last_grid is not [31, 22, 22]")
     if details.get("last_dtype") != "torch.bfloat16":
         errors.append(f"{context}: Radial last_dtype is not torch.bfloat16")
     if details.get("last_device") != "cuda:0":
         errors.append(f"{context}: Radial last_device is not cuda:0")
-    if details.get("plan_cache_entries") != 1:
+    plan_cache_entries = details.get("plan_cache_entries")
+    if not is_json_int(plan_cache_entries) or plan_cache_entries != 1:
         errors.append(f"{context}: Radial must use exactly one keyed plan")
-    misses = as_int(details.get("plan_cache_misses"))
-    hits = as_int(details.get("plan_cache_hits"))
-    if misses not in (0, 1) or hits is None or hits < 0:
+    misses = details.get("plan_cache_misses")
+    hits = details.get("plan_cache_hits")
+    if (
+        not is_json_int(misses)
+        or misses not in (0, 1)
+        or not is_json_int(hits)
+        or hits < 0
+    ):
         errors.append(f"{context}: Radial plan-cache counters are invalid")
-    elif isinstance(calls, int) and hits + misses != calls:
+    elif not is_json_int(calls) or hits + misses != calls:
         errors.append(
             f"{context}: Radial plan cache hits+misses != backend calls"
         )
 
     profile = details.get("profile")
-    expected_audit = RADIAL_PROFILE_AUDITS.get(profile)
+    expected_audit = (
+        RADIAL_PROFILE_AUDITS.get(profile)
+        if isinstance(profile, str)
+        else None
+    )
     observed_audit = details.get("last_mask_audit")
     if expected_audit is None:
         errors.append(f"{context}: unknown Radial profile {profile!r}")
-    elif observed_audit != expected_audit:
+    elif not strict_json_equal(observed_audit, expected_audit):
         errors.append(
             f"{context}: Radial mask audit differs from fixed {profile} audit"
         )
@@ -720,21 +1002,32 @@ def validate_radial_dispatcher(
     if not isinstance(receipt_summary, dict):
         errors.append(f"{context}: Radial backend receipt summary is missing")
     else:
+        receipt_runtime = receipt_summary.get("runtime_dependencies")
+        validate_radial_runtime_dependency_evidence(
+            receipt_runtime,
+            receipt_runtime,
+            f"{context}: Radial backend receipt runtime dependencies",
+            errors,
+        )
         runtime_after_cuda = details.get(
             "runtime_dependencies_after_first_cuda"
         )
-        if runtime_after_cuda != receipt_summary.get("runtime_dependencies"):
-            errors.append(
-                f"{context}: Radial runtime dependencies after first CUDA "
-                "call differ from the build-time receipt inventory"
-            )
+        validate_radial_runtime_dependency_evidence(
+            runtime_after_cuda,
+            receipt_runtime,
+            f"{context}: Radial runtime dependencies after first CUDA call",
+            errors,
+        )
     if isinstance(receipt_summary, dict) and expected_receipt is not None:
+        expected_derived_module = expected_receipt.get("derived_module")
         expected_summary = {
             "path": str(Path(expected_receipt["_copied_path"]).resolve()),
             "commit": expected_receipt.get("commit"),
-            "derived_module_sha256": expected_receipt.get(
-                "derived_module", {}
-            ).get("sha256"),
+            "derived_module_sha256": (
+                expected_derived_module.get("sha256")
+                if isinstance(expected_derived_module, dict)
+                else None
+            ),
             "flashinfer_version": expected_receipt.get("flashinfer_version"),
             "runtime_dependencies": (
                 expected_radial_runtime_dependency_evidence(expected_receipt)
@@ -743,14 +1036,14 @@ def validate_radial_dispatcher(
         # The backend reads the cache receipt rather than the copied evidence;
         # bind immutable contents but allow its original cache path.
         expected_summary["path"] = expected_receipt.get("_original_path")
-        if receipt_summary != expected_summary:
+        if not strict_json_equal(receipt_summary, expected_summary):
             errors.append(
                 f"{context}: Radial backend receipt summary differs from run evidence"
             )
 
     if expected_settings is not None:
         for field, expected in expected_settings.items():
-            if details.get(field) != expected:
+            if not strict_json_equal(details.get(field), expected):
                 errors.append(
                     f"{context}: Radial setting {field}="
                     f"{details.get(field)!r} != environment {expected!r}"
@@ -1067,6 +1360,7 @@ def verify(path, require_metrics=True, expected_video_frames=121):
 
 def verify_run_protocol(run_dir, reports):
     errors = []
+    radial_claims = None
     environment_path = run_dir / "environment.json"
     environment = json.loads(environment_path.read_text()) if environment_path.is_file() else {}
     validate_run_protocol(environment, errors)
@@ -1230,6 +1524,13 @@ def verify_run_protocol(run_dir, reports):
                     if isinstance(pre_run_gpu, dict)
                     else None
                 ),
+                (
+                    pre_run_gpu.get("boot_id")
+                    if isinstance(pre_run_gpu, dict)
+                    else None
+                ),
+                environment.get("gpu_process_monitor_interval_seconds"),
+                item.get("total_generation_seconds"),
                 candidate,
                 f"{record_type}[{record_index}]",
                 errors,
@@ -1296,10 +1597,17 @@ def verify_run_protocol(run_dir, reports):
                     )
                 if isinstance(install_gpu_report, dict):
                     if (
-                        install_gpu_report.get("schema_version") != 1
+                        not is_json_int(
+                            install_gpu_report.get("schema_version")
+                        )
+                        or install_gpu_report.get("schema_version")
+                        != GPU_EVIDENCE_SCHEMA_VERSION
                         or install_gpu_report.get("check_type") != "pre_run_idle"
                         or install_gpu_report.get("valid_for_run") is not True
                         or install_gpu_report.get("idle") is not True
+                        or not is_json_int(
+                            install_gpu_report.get("process_count")
+                        )
                         or install_gpu_report.get("process_count") != 0
                         or install_gpu_report.get("processes") != []
                         or install_gpu_report.get("errors") != []
@@ -1391,8 +1699,12 @@ def verify_run_protocol(run_dir, reports):
                 if not isinstance(metadata, dict):
                     errors.append(f"copied Radial receipt lacks {field}")
                 elif path.is_file() and (
-                    path.stat().st_size != metadata.get("bytes")
-                    or sha256(path) != metadata.get("sha256")
+                    not strict_json_equal(
+                        metadata.get("bytes"), path.stat().st_size
+                    )
+                    or not strict_json_equal(
+                        metadata.get("sha256"), sha256(path)
+                    )
                 ):
                     errors.append(
                         f"copied Radial {field} differs from install receipt"
@@ -1413,10 +1725,14 @@ def verify_run_protocol(run_dir, reports):
             if not isinstance(manifest_fingerprint, dict):
                 errors.append("copied Radial receipt lacks flashinfer_manifest")
             elif flashinfer_manifest_path.is_file() and (
-                flashinfer_manifest_path.stat().st_size
-                != manifest_fingerprint.get("bytes")
-                or sha256(flashinfer_manifest_path)
-                != manifest_fingerprint.get("sha256")
+                not strict_json_equal(
+                    manifest_fingerprint.get("bytes"),
+                    flashinfer_manifest_path.stat().st_size,
+                )
+                or not strict_json_equal(
+                    manifest_fingerprint.get("sha256"),
+                    sha256(flashinfer_manifest_path),
+                )
             ):
                 errors.append(
                     "copied FlashInfer manifest differs from install receipt"
@@ -1434,31 +1750,14 @@ def verify_run_protocol(run_dir, reports):
         if not isinstance(preflight_radial, dict):
             errors.append("Radial run preflight is missing radialattn evidence")
         else:
-            expected_preflight = {
-                "pinned_commit": RADIAL_COMMIT,
-                "mask_api": RADIAL_MASK_API,
-                "source_files_verified": True,
-                "flashinfer_files_verified": True,
-                "flashinfer_manifest_verified": True,
-                "runtime_loader_environment_verified": True,
-                "cpu_mask_audits_verified": True,
-                "flashinfer_version": FLASHINFER_VERSION,
-                "flashinfer_apis": {
-                    "BlockSparseAttentionWrapper": True,
-                    "single_prefill_with_kv_cache": True,
-                    "merge_state": True,
-                },
-                "derived_mask_api_callable": True,
-                "install_cuda_kernel_launched": False,
-                "preflight_cuda_microtest_required": True,
-            }
-            for field, expected in expected_preflight.items():
-                if preflight_radial.get(field) != expected:
-                    errors.append(
-                        f"preflight Radial {field}="
-                        f"{preflight_radial.get(field)!r} != {expected!r}"
-                    )
-            if preflight_radial.get("install_receipt_contents") != copied_receipt:
+            validate_radial_preflight_static_evidence(
+                preflight_radial,
+                errors,
+            )
+            if not strict_json_equal(
+                preflight_radial.get("install_receipt_contents"),
+                copied_receipt,
+            ):
                 errors.append("preflight Radial receipt differs from copied receipt")
             validate_radial_runtime_dependency_evidence(
                 preflight_radial.get(
@@ -1481,7 +1780,7 @@ def verify_run_protocol(run_dir, reports):
             else None
         )
         preflight_microtest = preflight.get("radialattn_microtest")
-        for error in radial_microtest_evidence_errors(
+        radial_microtest_errors = radial_microtest_evidence_errors(
             preflight_microtest,
             expected_gpu_uuid=expected_gpu_uuid,
             expected_pre_run_gpu=pre_run_gpu,
@@ -1492,8 +1791,13 @@ def verify_run_protocol(run_dir, reports):
             ),
             expected_pre_run_gpu_path=str(pre_run_gpu_path.resolve()),
             expected_python_executable=preflight.get("python_executable"),
-        ):
+        )
+        for error in radial_microtest_errors:
             errors.append(f"Radial preflight microtest: {error}")
+        radial_claims = validated_radial_preflight_claims(
+            preflight_microtest,
+            radial_microtest_errors,
+        )
         if isinstance(preflight_microtest, dict):
             for phase in ("before_cuda", "after_cuda"):
                 validate_radial_runtime_dependency_evidence(
@@ -1632,7 +1936,7 @@ def verify_run_protocol(run_dir, reports):
         and measurement_runs >= 3
         and all(not report["errors"] for report in reports)
     )
-    return {
+    protocol = {
         "status": "failed" if errors else "ok",
         "errors": errors,
         "expected_warmup_records": expected_warmups,
@@ -1642,6 +1946,27 @@ def verify_run_protocol(run_dir, reports):
         "benchmark_candidate": candidate,
         "benchmark_valid": benchmark_valid,
     }
+    if attention_method == "radial":
+        protocol["radial_evidence"] = radial_claims
+    return protocol
+
+
+def build_verification_summary(reports, protocol):
+    """Build the persisted report, including validated method-specific claims."""
+
+    failed = any(item["errors"] for item in reports) or (
+        protocol is not None and protocol["errors"]
+    )
+    summary = {
+        "status": "failed" if failed else "ok",
+        "artifact_count": len(reports),
+        "artifacts": reports,
+        "protocol": protocol,
+        "benchmark_valid": bool(protocol and protocol["benchmark_valid"]),
+    }
+    if isinstance(protocol, dict) and "radial_evidence" in protocol:
+        summary["radial_evidence"] = protocol["radial_evidence"]
+    return summary
 
 
 def main():
@@ -1684,16 +2009,7 @@ def main():
         if args.path.is_dir() and not args.media_only
         else None
     )
-    failed = any(item["errors"] for item in reports) or (
-        protocol is not None and protocol["errors"]
-    )
-    summary = {
-        "status": "failed" if failed else "ok",
-        "artifact_count": len(reports),
-        "artifacts": reports,
-        "protocol": protocol,
-        "benchmark_valid": bool(protocol and protocol["benchmark_valid"]),
-    }
+    summary = build_verification_summary(reports, protocol)
     output_path = args.path.with_suffix(".verification.json") if args.path.is_file() else args.path / "verification.json"
     output_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n"

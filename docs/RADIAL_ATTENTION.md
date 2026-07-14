@@ -94,14 +94,41 @@ directory. Preflight and
 the final verifier bind those files, the fixed run protocol, dispatcher call
 counts, mask audit, tail strategy, GPU identity, and generated media.
 
-After the runner proves physical GPU 0 is idle, preflight launches the same
-exact-shape conservative backend once on BF16 A100 tensors. It requires finite
-output, the fixed mask audit, one planned cache entry, the prefix/tail merge
-strategy, a GPU UUID matching the physical-GPU-0 idle record, and exactly one
-compute process whose host PID is the current microtest process before Ovi
-checkpoints load. Linux PID namespaces are handled through `/proc/self/status`
-`NSpid` evidence instead of assuming container PID equals host PID.
+After the runner proves physical GPU 0 is idle, preflight repeatedly launches
+the same exact-shape conservative backend on BF16 A100 tensors. It requires
+finite output, the fixed mask audit, one planned cache entry, the prefix/tail
+merge strategy, allocator evidence covering the live QKV tensors, and a CUDA
+UUID matching the physical-GPU-0 idle record before Ovi checkpoints load.
 
-No CUDA run has been claimed by this scaffold. In particular, the FlashInfer
-candidate and its Ovi A100 behavior remain unvalidated until installation,
-preflight, and a guarded smoke run all succeed on `lsh-stable30138`.
+Every GPU identity/process query retains its fixed command, trusted executable
+fingerprint, raw stdout/stderr, exit code, timestamps, byte counts, and hashes.
+The final verifier reparses those raw receipts. Samples after CUDA context
+creation must remain a stable singleton, include complete queries inside the
+exact backend window, continue through final synchronization, and have no gap
+larger than the fixed bound.
+
+Pre-run GPU evidence and generation GPU-monitor summaries use evidence schema
+version 2. Version 1 formal-run artifacts are intentionally rejected rather
+than inferred or rewritten: their missing schema guarantees cannot be migrated
+after collection, so every affected method must be rerun in a fresh directory.
+
+There are two explicitly different process-evidence outcomes:
+
+- `direct_c_observed`: `nvidia-smi pmon` reports the sampled host PID as a
+  direct `C` client inside the exact backend window.
+- `pmon_reported_all_idle_during_audited_window`: the trusted `pmon` stream is
+  syntactically valid but reports only strict idle rows while independent
+  `query-compute-apps` receipts show one stable process. This is a degraded
+  host-observability result. It proves only a sampled temporal association
+  after the idle guard; host-PID ownership, MPS absence, and continuous
+  exclusivity remain unknown and are never claimed.
+
+Linux PID namespaces are checked through `/proc/self/status` `NSpid`. The
+direct mode requires the outer PID to match. The degraded association is
+allowed only for a single-level namespace when `/proc/<sampled-host-pid>` is
+absent with `ENOENT`; permission or other lookup failures are rejected.
+
+The observed all-idle `pmon` behavior is therefore preserved as evidence of a
+host/container observability limitation, not rewritten as a direct-compute or
+MPS-free success. A formal Radial result still requires the exact wrapper,
+dispatcher, output, media, and final verifier checks to pass.

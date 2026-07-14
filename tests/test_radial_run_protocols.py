@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+from copy import deepcopy
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -31,7 +32,143 @@ def fixed_environment(profile, *, smoke):
     return materialize_run_protocol(f"radial_{profile}_{suffix}")
 
 
+def radial_dispatcher_fixture(calls=2950):
+    runtime_dependencies = {
+        "status": "ok",
+        "aliases": 26,
+        "mapped_files": 31,
+        "inventory_sha256": "a" * 64,
+    }
+    return {
+        "calls_total": calls,
+        "calls_by_method": {
+            "dense": 0,
+            "sparge": 0,
+            "radial": calls,
+            "svg": 0,
+        },
+        "backend_details": {
+            "backend": "official_radial_attention_flashinfer",
+            "repository": (
+                "https://github.com/mit-han-lab/radial-attention.git"
+            ),
+            "pinned_commit": RADIAL_COMMIT,
+            "mask_api": "gen_log_mask_shrinked",
+            "profile": "conservative",
+            "decay_factor": 4.0,
+            "model_type": "wan",
+            "block_size": 128,
+            "sequence": 15004,
+            "prefix_sequence": 14976,
+            "tail_sequence": 28,
+            "tail_strategy": "dense_lse_merge_no_padding",
+            "empty_row_policy": "dense_row",
+            "empty_rows": [22, 56, 90],
+            "fallback_allowed": False,
+            "calls": calls,
+            "plan_cache_entries": 1,
+            "plan_cache_hits": calls,
+            "plan_cache_misses": 0,
+            "last_shape": [1, 15004, 24, 128],
+            "last_grid": [31, 22, 22],
+            "last_device": "cuda:0",
+            "last_dtype": "torch.bfloat16",
+            "last_mask_audit": dict(
+                VERIFIER.RADIAL_PROFILE_AUDITS["conservative"]
+            ),
+            "install_receipt": {
+                "runtime_dependencies": dict(runtime_dependencies)
+            },
+            "runtime_dependencies_after_first_cuda": dict(
+                runtime_dependencies
+            ),
+        },
+    }
+
+
 class RadialRunProtocolTests(unittest.TestCase):
+    def test_verified_degraded_pmon_claims_are_explicit_in_summary(self):
+        microtest = {
+            "pmon_observation_mode": (
+                "pmon_reported_all_idle_during_audited_window"
+            ),
+            "mps_status": "unknown",
+            "pid_binding_method": (
+                "sampled_temporal_association_after_idle_guard"
+            ),
+            "gpu_process_claim_scope": (
+                "sampled_temporal_association_not_pid_ownership_or_"
+                "continuous_exclusivity"
+            ),
+            "host_pid_ownership": (
+                "unknown_sampled_temporal_association_only"
+            ),
+            "gpu_process_binding": {
+                "mps": {
+                    "mps_status": "unknown",
+                    "host_pid_observed_by_pmon": False,
+                    "pmon": {
+                        "status": "degraded",
+                        "collection_status": "ok",
+                        "direct_compute_type_observed": False,
+                        "continuous_exclusivity_proven": False,
+                    },
+                }
+            },
+        }
+        claims = VERIFIER.validated_radial_preflight_claims(microtest, [])
+        self.assertEqual(
+            claims,
+            {
+                "status": "validated",
+                "source": "preflight.json.radialattn_microtest",
+                "pmon_status": "degraded",
+                "pmon_collection_status": "ok",
+                "pmon_observation_mode": (
+                    "pmon_reported_all_idle_during_audited_window"
+                ),
+                "mps_status": "unknown",
+                "binding_method": (
+                    "sampled_temporal_association_after_idle_guard"
+                ),
+                "claim_scope": (
+                    "sampled_temporal_association_not_pid_ownership_or_"
+                    "continuous_exclusivity"
+                ),
+                "host_pid_ownership": (
+                    "unknown_sampled_temporal_association_only"
+                ),
+                "direct_compute_type_observed": False,
+                "host_pid_observed_by_pmon": False,
+                "continuous_exclusivity_proven": False,
+            },
+        )
+        protocol = {
+            "status": "ok",
+            "errors": [],
+            "benchmark_valid": True,
+            "radial_evidence": claims,
+        }
+        summary = VERIFIER.build_verification_summary(
+            [{"errors": []}], protocol
+        )
+        self.assertEqual(summary["radial_evidence"], claims)
+        self.assertEqual(summary["protocol"]["radial_evidence"], claims)
+        self.assertTrue(summary["benchmark_valid"])
+
+    def test_unvalidated_radial_preflight_claims_are_not_republished(self):
+        microtest = {
+            "gpu_process_binding": {
+                "mps": {"pmon": {"status": "degraded"}}
+            }
+        }
+        self.assertIsNone(
+            VERIFIER.validated_radial_preflight_claims(
+                microtest,
+                ["canonical evidence validation failed"],
+            )
+        )
+
     def test_runtime_loader_evidence_is_bound_to_receipt_and_opencv_path(self):
         receipt = {
             "runtime_loaded_dependencies": {
@@ -92,6 +229,90 @@ class RadialRunProtocolTests(unittest.TestCase):
         )
         self.assertTrue(any("copied receipt" in error for error in errors))
         self.assertTrue(any("fixed env lib64" in error for error in errors))
+
+    def test_runtime_dependency_counts_reject_json_booleans(self):
+        expected = {
+            "status": "ok",
+            "aliases": 2,
+            "mapped_files": 3,
+            "inventory_sha256": "a" * 64,
+        }
+        for field in ("aliases", "mapped_files"):
+            with self.subTest(field=field):
+                evidence = dict(expected)
+                evidence[field] = True
+                errors = []
+                VERIFIER.validate_radial_runtime_dependency_evidence(
+                    evidence,
+                    expected,
+                    "test",
+                    errors,
+                )
+                self.assertTrue(
+                    any(
+                        field in error and "JSON integer" in error
+                        for error in errors
+                    ),
+                    errors,
+                )
+
+    def test_radial_preflight_static_flags_and_apis_require_json_booleans(self):
+        evidence = {
+            "pinned_commit": RADIAL_COMMIT,
+            "mask_api": "gen_log_mask_shrinked",
+            "source_files_verified": True,
+            "flashinfer_files_verified": True,
+            "flashinfer_manifest_verified": True,
+            "runtime_loader_environment_verified": True,
+            "cpu_mask_audits_verified": True,
+            "flashinfer_version": VERIFIER.FLASHINFER_VERSION,
+            "flashinfer_apis": {
+                "BlockSparseAttentionWrapper": True,
+                "single_prefill_with_kv_cache": True,
+                "merge_state": True,
+            },
+            "derived_mask_api_callable": True,
+            "install_cuda_kernel_launched": False,
+            "preflight_cuda_microtest_required": True,
+        }
+        errors = []
+        VERIFIER.validate_radial_preflight_static_evidence(evidence, errors)
+        self.assertEqual(errors, [])
+
+        boolean_fields = (
+            "source_files_verified",
+            "flashinfer_files_verified",
+            "flashinfer_manifest_verified",
+            "runtime_loader_environment_verified",
+            "cpu_mask_audits_verified",
+            "derived_mask_api_callable",
+            "install_cuda_kernel_launched",
+            "preflight_cuda_microtest_required",
+        )
+        for field in boolean_fields:
+            with self.subTest(field=field):
+                mutation = deepcopy(evidence)
+                mutation[field] = 1 if evidence[field] is True else 0
+                errors = []
+                VERIFIER.validate_radial_preflight_static_evidence(
+                    mutation,
+                    errors,
+                )
+                self.assertTrue(any(field in error for error in errors), errors)
+
+        for api in evidence["flashinfer_apis"]:
+            with self.subTest(api=api):
+                mutation = deepcopy(evidence)
+                mutation["flashinfer_apis"][api] = 1
+                errors = []
+                VERIFIER.validate_radial_preflight_static_evidence(
+                    mutation,
+                    errors,
+                )
+                self.assertTrue(
+                    any("flashinfer_apis" in error for error in errors),
+                    errors,
+                )
 
     def test_all_four_fixed_profiles_and_run_tiers_are_accepted(self):
         for profile in ("conservative", "aggressive"):
@@ -203,58 +424,7 @@ class RadialRunProtocolTests(unittest.TestCase):
         self.assertEqual(len(parents), len(names))
 
     def test_dispatcher_validator_requires_real_radial_calls_and_tail_audit(self):
-        calls = 2950
-        runtime_dependencies = {
-            "status": "ok",
-            "aliases": 26,
-            "mapped_files": 31,
-            "inventory_sha256": "a" * 64,
-        }
-        dispatcher = {
-            "calls_total": calls,
-            "calls_by_method": {
-                "dense": 0,
-                "sparge": 0,
-                "radial": calls,
-                "svg": 0,
-            },
-            "backend_details": {
-                "backend": "official_radial_attention_flashinfer",
-                "repository": (
-                    "https://github.com/mit-han-lab/radial-attention.git"
-                ),
-                "pinned_commit": RADIAL_COMMIT,
-                "mask_api": "gen_log_mask_shrinked",
-                "profile": "conservative",
-                "decay_factor": 4.0,
-                "model_type": "wan",
-                "block_size": 128,
-                "sequence": 15004,
-                "prefix_sequence": 14976,
-                "tail_sequence": 28,
-                "tail_strategy": "dense_lse_merge_no_padding",
-                "empty_row_policy": "dense_row",
-                "empty_rows": [22, 56, 90],
-                "fallback_allowed": False,
-                "calls": calls,
-                "plan_cache_entries": 1,
-                "plan_cache_hits": calls,
-                "plan_cache_misses": 0,
-                "last_shape": [1, 15004, 24, 128],
-                "last_grid": [31, 22, 22],
-                "last_device": "cuda:0",
-                "last_dtype": "torch.bfloat16",
-                "last_mask_audit": dict(
-                    VERIFIER.RADIAL_PROFILE_AUDITS["conservative"]
-                ),
-                "install_receipt": {
-                    "runtime_dependencies": dict(runtime_dependencies)
-                },
-                "runtime_dependencies_after_first_cuda": dict(
-                    runtime_dependencies
-                ),
-            },
-        }
+        dispatcher = radial_dispatcher_fixture()
         errors = []
         VERIFIER.validate_radial_dispatcher(dispatcher, errors)
         self.assertEqual(errors, [])
@@ -276,6 +446,82 @@ class RadialRunProtocolTests(unittest.TestCase):
         errors = []
         VERIFIER.validate_radial_dispatcher(dispatcher, errors)
         self.assertTrue(any("after first CUDA" in error for error in errors))
+
+    def test_dispatcher_validator_rejects_bool_int_substitution_per_field(self):
+        mutations = (
+            (
+                "fallback_allowed",
+                lambda item: item["backend_details"].__setitem__(
+                    "fallback_allowed", 0
+                ),
+            ),
+            (
+                "calls_total_bool",
+                lambda item: item.__setitem__("calls_total", True),
+            ),
+            (
+                "calls_total_zero",
+                lambda item: item.__setitem__("calls_total", 0),
+            ),
+            (
+                "backend_calls_bool",
+                lambda item: item["backend_details"].__setitem__("calls", True),
+            ),
+            (
+                "backend_calls_zero",
+                lambda item: item["backend_details"].__setitem__("calls", 0),
+            ),
+            *(
+                (
+                    f"calls_by_method_{method}",
+                    lambda item, method=method: item["calls_by_method"].__setitem__(
+                        method,
+                        True if method == "radial" else False,
+                    ),
+                )
+                for method in ("dense", "sparge", "radial", "svg")
+            ),
+            (
+                "plan_cache_entries",
+                lambda item: item["backend_details"].__setitem__(
+                    "plan_cache_entries", True
+                ),
+            ),
+            (
+                "plan_cache_hits",
+                lambda item: item["backend_details"].__setitem__(
+                    "plan_cache_hits", True
+                ),
+            ),
+            (
+                "plan_cache_misses",
+                lambda item: item["backend_details"].__setitem__(
+                    "plan_cache_misses", False
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                dispatcher = radial_dispatcher_fixture()
+                mutate(dispatcher)
+                errors = []
+                VERIFIER.validate_radial_dispatcher(dispatcher, errors)
+                self.assertTrue(errors, label)
+
+    def test_dispatcher_runtime_receipts_use_strict_json_comparison(self):
+        dispatcher = radial_dispatcher_fixture()
+        dispatcher["backend_details"][
+            "runtime_dependencies_after_first_cuda"
+        ]["aliases"] = True
+        errors = []
+        VERIFIER.validate_radial_dispatcher(dispatcher, errors)
+        self.assertTrue(
+            any(
+                "after first CUDA" in error and "aliases" in error
+                for error in errors
+            ),
+            errors,
+        )
 
 
 class RadialPinAndInstallerTests(unittest.TestCase):

@@ -17,6 +17,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from ovi.gpu_process_monitor import (
     GpuProcessMonitor,
+    gpu_compute_snapshot_errors,
     query_gpu_compute_processes,
     trusted_nvidia_smi_metadata,
     validate_pre_run_gpu_report,
@@ -35,6 +36,8 @@ from ovi.radial_evidence import (
     RADIAL_HEAD_DIM,
     RADIAL_HEADS,
     RADIAL_MASK_API,
+    RADIAL_PMON_MAX_RECEIPT_GAP_SECONDS,
+    RADIAL_PMON_SAMPLE_INTERVAL_SECONDS,
     RADIAL_SEQUENCE,
     parse_nvidia_smi_pmon_output,
 )
@@ -56,12 +59,15 @@ class _IdentityOviAttention:
         return value
 
 
-GPU_PROCESS_BINDING_SCHEMA_VERSION = 1
+GPU_PROCESS_BINDING_SCHEMA_VERSION = 2
 GPU_IDLE_GUARD_MAX_AGE_SECONDS = 600.0
 PMON_READY_TIMEOUT_SECONDS = 15.0
 PMON_WINDOW_TIMEOUT_SECONDS = 20.0
+PMON_FINAL_COVERAGE_TIMEOUT_SECONDS = 5.0
 PMON_TERMINATE_TIMEOUT_SECONDS = 5.0
 PMON_KILL_TIMEOUT_SECONDS = 5.0
+GPU_QUERY_MAX_GAP_SECONDS = 1.0
+GPU_QUERY_MIN_BACKEND_SAMPLES = 2
 
 
 class RadialPmonEvidenceError(RadialAttentionDependencyError):
@@ -155,9 +161,11 @@ class _ContinuousPmon:
         self._reader_errors = []
         self._lifecycle_errors = []
         self._threads = []
+        self._stream_eof = {"stdout": False, "stderr": False}
         self._header_columns = None
         self._parsed_rows = []
         self._last_source_timestamp = None
+        self._last_row_received_monotonic = None
         self._parser_errors = []
         self._timed_out = False
         self._termination_method = None
@@ -172,6 +180,9 @@ class _ContinuousPmon:
         self._backend_window_start_line_number = None
         self._window_compute_ready = (None, None)
         self._window_compute_line_number = None
+        self._compute_observation_deadline_reached = (None, None)
+        self._final_sync_covered = (None, None)
+        self._final_sync_covered_line_number = None
         self._stop_requested = (None, None)
         self._process_exited = (None, None)
 
@@ -268,6 +279,12 @@ class _ContinuousPmon:
             > float(self._backend_window_started[0])
             and self._window_compute_ready[0] is None
         ):
+            if self._compute_observation_deadline_reached[0] is not None:
+                self._append_lifecycle_error(
+                    "pmon observed direct C only after the bounded all-idle "
+                    "observation deadline"
+                )
+                return False
             self._window_compute_ready = row_receipt
             self._window_compute_line_number = line_number
         return True
@@ -290,11 +307,15 @@ class _ContinuousPmon:
             row_receipt = self._row_receipt(row, receipt)
             source_timestamp = row.get("source_timestamp_unix_seconds")
             received_wall = row_receipt[0]
+            received_monotonic = row_receipt[1]
             if (
                 not self._row_has_source_dt(row)
                 or not isinstance(received_wall, (int, float))
                 or isinstance(received_wall, bool)
                 or not math.isfinite(float(received_wall))
+                or not isinstance(received_monotonic, (int, float))
+                or isinstance(received_monotonic, bool)
+                or not math.isfinite(float(received_monotonic))
                 or float(source_timestamp) > float(received_wall) + 1.0
                 or float(received_wall) - float(source_timestamp) > 5.0
                 or (
@@ -306,7 +327,27 @@ class _ContinuousPmon:
                     f"pmon row source timestamp is invalid: {row!r}"
                 )
                 continue
+            if self._last_source_timestamp is not None:
+                source_gap = (
+                    float(source_timestamp) - self._last_source_timestamp
+                )
+                receipt_gap = (
+                    float(received_monotonic)
+                    - float(self._last_row_received_monotonic)
+                )
+                if not (
+                    0.0 < source_gap
+                    <= RADIAL_PMON_SAMPLE_INTERVAL_SECONDS
+                    and 0.0 < receipt_gap
+                    <= RADIAL_PMON_MAX_RECEIPT_GAP_SECONDS
+                ):
+                    self._append_lifecycle_error(
+                        "pmon output violated the fixed 1-second source "
+                        "cadence or continuous receipt coverage: "
+                        f"source_gap={source_gap!r}, receipt_gap={receipt_gap!r}"
+                    )
             self._last_source_timestamp = float(source_timestamp)
+            self._last_row_received_monotonic = float(received_monotonic)
             if self._row_is_mps(row):
                 self._append_lifecycle_error(
                     f"pmon detected an MPS process: {row!r}"
@@ -377,33 +418,36 @@ class _ContinuousPmon:
             )
         self._validate_new_rows(rows, receipt)
 
-    def _read_stream(self, stream_name, stream):
+    def _record_stream_line(self, stream_name, raw_line, receipt=None):
+        """Record one raw line through the same parser path used by readers."""
+
         target = (
             self._stdout_line_records
             if stream_name == "stdout"
             else self._stderr_line_records
         )
+        receipt = self._now() if receipt is None else receipt
+        with self._condition:
+            record = {
+                "line_index": len(target),
+                "raw_line": raw_line,
+                "received_at_unix_seconds": receipt[0],
+                "received_at_monotonic_seconds": receipt[1],
+            }
+            target.append(record)
+            if stream_name == "stdout":
+                self._refresh_parse(receipt)
+            elif "mps" in raw_line.lower():
+                self._append_lifecycle_error("pmon stderr mentioned MPS")
+            self._condition.notify_all()
+
+    def _read_stream(self, stream_name, stream):
         try:
             while True:
                 raw_line = stream.readline()
                 if raw_line == "":
                     break
-                receipt = self._now()
-                with self._condition:
-                    record = {
-                        "line_index": len(target),
-                        "raw_line": raw_line,
-                        "received_at_unix_seconds": receipt[0],
-                        "received_at_monotonic_seconds": receipt[1],
-                    }
-                    target.append(record)
-                    if stream_name == "stdout":
-                        self._refresh_parse(receipt)
-                    elif "mps" in raw_line.lower():
-                        self._append_lifecycle_error(
-                            "pmon stderr mentioned MPS"
-                        )
-                    self._condition.notify_all()
+                self._record_stream_line(stream_name, raw_line)
         except Exception as exc:
             with self._condition:
                 self._reader_errors.append(
@@ -412,6 +456,15 @@ class _ContinuousPmon:
                 self._condition.notify_all()
         finally:
             with self._condition:
+                self._stream_eof[stream_name] = True
+                process_running = (
+                    self.process is not None and self.process.poll() is None
+                )
+                if self._stop_requested[0] is None and process_running:
+                    self._append_lifecycle_error(
+                        f"pmon {stream_name} ended while the process was "
+                        "still running"
+                    )
                 self._condition.notify_all()
 
     def start(self):
@@ -545,6 +598,61 @@ class _ContinuousPmon:
             self._raise_if_failed("backend window sampling")
             return self._window_compute_ready[0] is not None
 
+    def mark_compute_observation_deadline_reached(self):
+        """Record the bounded no-C observation without skipping final checks."""
+
+        with self._condition:
+            self._raise_if_failed("compute observation deadline")
+            if self._backend_window_started[0] is None:
+                raise RadialAttentionDependencyError(
+                    "Cannot close pmon compute observation before backend start"
+                )
+            if self._window_compute_ready[0] is not None:
+                raise RadialAttentionDependencyError(
+                    "Cannot mark an all-idle pmon deadline after observing C"
+                )
+            if self._compute_observation_deadline_reached[0] is None:
+                self._compute_observation_deadline_reached = self._now()
+            return self._compute_observation_deadline_reached
+
+    def wait_for_final_sync_coverage(self, sync_wall, sync_monotonic):
+        """Wait for a source-DT row sampled after the final CUDA sync."""
+
+        sync_wall = float(sync_wall)
+        sync_monotonic = float(sync_monotonic)
+
+        def find_covering_row():
+            for row in self._parsed_rows:
+                line_number = row.get("line_number")
+                if (
+                    not isinstance(line_number, int)
+                    or isinstance(line_number, bool)
+                    or line_number <= 0
+                    or line_number > len(self._stdout_line_records)
+                    or not self._row_has_source_dt(row)
+                ):
+                    continue
+                record = self._stdout_line_records[line_number - 1]
+                if (
+                    float(record["received_at_monotonic_seconds"])
+                    >= sync_monotonic
+                    and float(row["source_timestamp_unix_seconds"])
+                    >= sync_wall
+                ):
+                    self._final_sync_covered = (
+                        record["received_at_unix_seconds"],
+                        record["received_at_monotonic_seconds"],
+                    )
+                    self._final_sync_covered_line_number = line_number
+                    return True
+            return False
+
+        self._wait_for(
+            find_covering_row,
+            "final CUDA sync coverage",
+            PMON_FINAL_COVERAGE_TIMEOUT_SECONDS,
+        )
+
     def require_running(self, phase):
         with self._condition:
             self._raise_if_failed(phase)
@@ -632,6 +740,8 @@ class _ContinuousPmon:
             record["parsed_row"] = rows_by_line.get(record["line_index"] + 1)
         parser_errors = parsed.get("errors")
         errors = [*self._reader_errors, *self._lifecycle_errors]
+        if self._timed_out:
+            errors.append("continuous pmon timed out during the audited lifecycle")
         if raw_stderr:
             errors.append("continuous pmon emitted stderr during the audit")
         if not isinstance(parser_errors, list):
@@ -731,9 +841,25 @@ class _ContinuousPmon:
                 and row["source_time"] in raw_line
             ):
                 matching_rows_in_window.append(row)
-        if not matching_rows_in_window:
+        all_rows_strict_idle = bool(final_rows) and all(
+            isinstance(row, dict)
+            and row.get("gpu_index") == self.device_index
+            and row.get("host_pid") is None
+            and row.get("process_type") is None
+            and row.get("command") == "-"
+            and self._row_has_source_dt(row)
+            for row in final_rows
+        )
+        direct_c_observed = bool(matching_rows_in_window)
+        all_idle_observation = (
+            not direct_c_observed
+            and all_rows_strict_idle
+            and self._compute_observation_deadline_reached[0] is not None
+        )
+        if not direct_c_observed and not all_idle_observation:
             errors.append(
-                "pmon observed no source-DT direct C row in the backend window"
+                "pmon neither observed a backend-window direct C row nor "
+                "completed a strict all-idle observation"
             )
         selected_window_row = next(
             (
@@ -749,7 +875,7 @@ class _ContinuousPmon:
             and 0 < self._window_compute_line_number <= len(stdout_records)
             else None
         )
-        if (
+        if direct_c_observed and (
             self._window_compute_ready[0] is None
             or not isinstance(selected_window_row, dict)
             or not isinstance(selected_window_record, dict)
@@ -761,8 +887,58 @@ class _ContinuousPmon:
             errors.append(
                 "pmon window-C readiness does not bind a matching raw line"
             )
+        final_sync_line = self._final_sync_covered_line_number
+        final_sync_row = next(
+            (
+                row
+                for row in final_rows
+                if isinstance(row, dict)
+                and row.get("line_number") == final_sync_line
+            ),
+            None,
+        )
+        final_sync_record = (
+            stdout_records[final_sync_line - 1]
+            if isinstance(final_sync_line, int)
+            and not isinstance(final_sync_line, bool)
+            and 0 < final_sync_line <= len(stdout_records)
+            else None
+        )
+        if (
+            not isinstance(final_sync_row, dict)
+            or not isinstance(final_sync_record, dict)
+            or self._final_sync_covered[0]
+            != final_sync_record.get("received_at_unix_seconds")
+            or self._final_sync_covered[1]
+            != final_sync_record.get("received_at_monotonic_seconds")
+        ):
+            errors.append(
+                "pmon final-sync coverage does not bind a matching raw line"
+            )
+        observation_mode = (
+            "direct_c_observed"
+            if direct_c_observed
+            else "pmon_reported_all_idle_during_audited_window"
+            if all_idle_observation
+            else "invalid"
+        )
+        status = (
+            "failed"
+            if errors
+            else "ok"
+            if direct_c_observed
+            else "degraded"
+        )
         return {
-            "status": "ok" if not errors else "failed",
+            "status": status,
+            "collection_status": "ok" if not errors else "failed",
+            "observation_mode": observation_mode,
+            "direct_compute_type_observed": direct_c_observed,
+            "host_pid_observed": direct_c_observed,
+            "continuous_exclusivity_proven": False,
+            "compute_observation_timeout_seconds": (
+                PMON_WINDOW_TIMEOUT_SECONDS
+            ),
             "command": list(self.command),
             "nvidia_smi_binary": dict(self.nvidia_smi_binary),
             "resolved_executable": self.resolved_executable,
@@ -813,6 +989,17 @@ class _ContinuousPmon:
                 self._window_compute_ready[1]
             ),
             "window_compute_line_number": self._window_compute_line_number,
+            "compute_observation_deadline_reached_at_unix_seconds": (
+                self._compute_observation_deadline_reached[0]
+            ),
+            "compute_observation_deadline_reached_at_monotonic_seconds": (
+                self._compute_observation_deadline_reached[1]
+            ),
+            "final_sync_covered_at_unix_seconds": self._final_sync_covered[0],
+            "final_sync_covered_at_monotonic_seconds": self._final_sync_covered[1],
+            "final_sync_covered_line_number": (
+                self._final_sync_covered_line_number
+            ),
             "stop_requested_at_unix_seconds": self._stop_requested[0],
             "stop_requested_at_monotonic_seconds": self._stop_requested[1],
             "process_exited_at_unix_seconds": self._process_exited[0],
@@ -1069,14 +1256,41 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
                 exact_backend_call_count += 1
                 torch.cuda.synchronize(device)
                 pmon.require_running("exact backend return")
-                if pmon.window_compute_seen():
-                    break
-                if time.monotonic() >= backend_window_deadline:
-                    raise RadialAttentionDependencyError(
-                        "continuous pmon observed no direct C sample during "
-                        f"{exact_backend_call_count} exact backend calls within "
-                        f"{PMON_WINDOW_TIMEOUT_SECONDS:.1f}s"
+                current_monotonic = time.monotonic()
+                current_interval_samples = monitor.summary()["samples"]
+                backend_query_samples = [
+                    sample
+                    for sample in current_interval_samples
+                    if isinstance(sample, dict)
+                    and isinstance(
+                        sample.get("query_started_at_monotonic_seconds"),
+                        (int, float),
                     )
+                    and not isinstance(
+                        sample.get("query_started_at_monotonic_seconds"), bool
+                    )
+                    and isinstance(
+                        sample.get("query_finished_at_monotonic_seconds"),
+                        (int, float),
+                    )
+                    and not isinstance(
+                        sample.get("query_finished_at_monotonic_seconds"), bool
+                    )
+                    and exact_backend_started_at_monotonic_seconds
+                    <= float(sample["query_started_at_monotonic_seconds"])
+                    <= float(sample["query_finished_at_monotonic_seconds"])
+                    <= current_monotonic
+                ]
+                if (
+                    pmon.window_compute_seen()
+                    and len(backend_query_samples)
+                    >= GPU_QUERY_MIN_BACKEND_SAMPLES
+                ):
+                    break
+                if current_monotonic >= backend_window_deadline:
+                    if not pmon.window_compute_seen():
+                        pmon.mark_compute_observation_deadline_reached()
+                    break
             exact_backend_returned_at_unix_seconds = time.time()
             exact_backend_returned_at_monotonic_seconds = time.monotonic()
             if tuple(output.shape) != (
@@ -1116,6 +1330,10 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
             torch.cuda.synchronize(device)
             cuda_synchronized_at_unix = time.time()
             cuda_synchronized_at_monotonic = time.monotonic()
+            pmon.wait_for_final_sync_coverage(
+                cuda_synchronized_at_unix,
+                cuda_synchronized_at_monotonic,
+            )
         except Exception as exc:
             pmon_error = exc
         finally:
@@ -1126,10 +1344,19 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
                 f"Radial pmon-audited backend window failed: {pmon_error!r}",
                 process_type_sample,
             ) from pmon_error
-        if process_type_sample.get("status") != "ok":
+        if process_type_sample.get("status") not in ("ok", "degraded"):
             raise RadialPmonEvidenceError(
                 "continuous pmon evidence is invalid: "
                 + "; ".join(process_type_sample.get("errors", [])),
+                process_type_sample,
+            )
+        pmon_observation_mode = process_type_sample.get("observation_mode")
+        if pmon_observation_mode not in (
+            "direct_c_observed",
+            "pmon_reported_all_idle_during_audited_window",
+        ):
+            raise RadialPmonEvidenceError(
+                "continuous pmon returned an unsupported observation mode",
                 process_type_sample,
             )
         window_line_number = process_type_sample.get(
@@ -1166,7 +1393,7 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
         pmon_stop_monotonic = process_type_sample.get(
             "stop_requested_at_monotonic_seconds"
         )
-        if not (
+        if pmon_observation_mode == "direct_c_observed" and not (
             isinstance(window_source_time, (int, float))
             and not isinstance(window_source_time, bool)
             and math.isfinite(float(window_source_time))
@@ -1218,7 +1445,15 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
     pid_binding_method = (
         "direct_nspid"
         if host_pid_namespace_visible
-        else "snapshot_bound_singleton_after_idle_guard"
+        else "sampled_temporal_association_after_idle_guard"
+    )
+    claim_scope = (
+        "snapshot_bound_not_continuous_exclusivity"
+        if pid_binding_method == "direct_nspid"
+        else (
+            "sampled_temporal_association_not_pid_ownership_or_"
+            "continuous_exclusivity"
+        )
     )
     binding_errors = []
     gpu_identity = post_cuda_sample_2
@@ -1238,6 +1473,10 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
         post_cuda_sample_2,
     ]
     for index, sample in enumerate(named_samples):
+        binding_errors.extend(
+            f"GPU sample {index}: {error}"
+            for error in gpu_compute_snapshot_errors(sample)
+        )
         identity = (
             sample.get("device_index"),
             sample.get("device_uuid"),
@@ -1307,6 +1546,85 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
         binding_errors.append(
             "sampled live-phase GPU snapshots were not all singleton"
         )
+    backend_bound_samples = [
+        sample
+        for sample in live_phase_samples
+        if isinstance(
+            sample.get("query_started_at_monotonic_seconds"), (int, float)
+        )
+        and not isinstance(
+            sample.get("query_started_at_monotonic_seconds"), bool
+        )
+        and isinstance(
+            sample.get("query_finished_at_monotonic_seconds"), (int, float)
+        )
+        and not isinstance(
+            sample.get("query_finished_at_monotonic_seconds"), bool
+        )
+        and exact_backend_started_at_monotonic_seconds
+        <= float(sample["query_started_at_monotonic_seconds"])
+        <= float(sample["query_finished_at_monotonic_seconds"])
+        <= exact_backend_returned_at_monotonic_seconds
+    ]
+    if len(backend_bound_samples) < GPU_QUERY_MIN_BACKEND_SAMPLES:
+        binding_errors.append(
+            "sampled process evidence lacks two complete queries inside the "
+            "exact backend window"
+        )
+    coverage_samples = []
+    coverage_keys = set()
+    for sample in [context_live_sample, *live_phase_samples]:
+        key = (
+            sample.get("query_started_at_monotonic_seconds"),
+            sample.get("query_finished_at_monotonic_seconds"),
+        )
+        if key not in coverage_keys:
+            coverage_keys.add(key)
+            coverage_samples.append(sample)
+    coverage_samples.sort(
+        key=lambda sample: float(
+            sample.get("query_started_at_monotonic_seconds", math.inf)
+        )
+    )
+    coverage_end = context_live_sample.get(
+        "query_finished_at_monotonic_seconds"
+    )
+    if not isinstance(coverage_end, (int, float)) or isinstance(
+        coverage_end, bool
+    ):
+        binding_errors.append("context-live query coverage timestamp is invalid")
+    else:
+        for sample in coverage_samples:
+            query_start = sample.get("query_started_at_monotonic_seconds")
+            query_finish = sample.get("query_finished_at_monotonic_seconds")
+            if (
+                not isinstance(query_start, (int, float))
+                or isinstance(query_start, bool)
+                or not isinstance(query_finish, (int, float))
+                or isinstance(query_finish, bool)
+                or float(query_start) > float(query_finish)
+            ):
+                continue
+            if float(query_finish) <= float(coverage_end):
+                continue
+            if float(query_start) - float(coverage_end) > GPU_QUERY_MAX_GAP_SECONDS:
+                binding_errors.append(
+                    "sampled process-query coverage contains a gap larger than "
+                    f"{GPU_QUERY_MAX_GAP_SECONDS:.1f}s"
+                )
+                break
+            coverage_end = max(float(coverage_end), float(query_finish))
+        final_query_finish = post_cuda_sample_2.get(
+            "query_finished_at_monotonic_seconds"
+        )
+        if (
+            not isinstance(final_query_finish, (int, float))
+            or isinstance(final_query_finish, bool)
+            or float(coverage_end) < float(final_query_finish)
+        ):
+            binding_errors.append(
+                "sampled process-query coverage does not reach the final snapshot"
+            )
 
     positive_processes = [
         sample["processes"][0]
@@ -1390,8 +1708,10 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
         for row in pmon_rows
         if isinstance(row, dict)
     )
-    if (
-        process_type_sample.get("status") != "ok"
+    pmon_status = process_type_sample.get("status")
+    pmon_mode = process_type_sample.get("observation_mode")
+    common_pmon_invalid = (
+        process_type_sample.get("collection_status") != "ok"
         or not isinstance(pmon_rows, list)
         or not isinstance(process_type_sample.get("header_columns"), list)
         or not process_type_sample.get("header_columns")
@@ -1400,7 +1720,6 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
         or not idle_pmon_rows
         or not isinstance(backend_window_start_line_number, int)
         or backend_window_start_line_number < idle_baseline_line_number
-        or not isinstance(selected_window_c_row, dict)
         or process_type_sample.get("expected_host_pid") != host_pid
         or process_type_sample.get(
             "backend_window_started_at_unix_seconds"
@@ -1408,12 +1727,6 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
         or process_type_sample.get(
             "backend_window_started_at_monotonic_seconds"
         ) != exact_backend_started_at_monotonic_seconds
-        or float(selected_window_c_row.get(
-            "source_timestamp_unix_seconds", -math.inf
-        )) <= exact_backend_started_at_unix_seconds
-        or float(selected_window_c_row.get(
-            "source_timestamp_unix_seconds", math.inf
-        )) > exact_backend_returned_at_unix_seconds
         or any(
             row.get("gpu_index") != 0
             or row.get("process_type") is not None
@@ -1421,20 +1734,64 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
             or not _ContinuousPmon._row_has_source_dt(row)
             for row in idle_pmon_rows
         )
-        or any(
-            row.get("gpu_index") != 0
-            or row.get("host_pid") != host_pid
-            or row.get("process_type") != "C"
-            or not isinstance(row.get("command"), str)
-            or not row["command"].strip()
-            or not _ContinuousPmon._row_has_source_dt(row)
-            for row in actual_pmon_rows
-        )
         or pmon_mps_process_detected
+    )
+    strict_pmon_invalid = (
+        pmon_mode == "direct_c_observed"
+        and (
+            pmon_status != "ok"
+            or not isinstance(selected_window_c_row, dict)
+            or float(
+                selected_window_c_row.get(
+                    "source_timestamp_unix_seconds", -math.inf
+                )
+            )
+            <= exact_backend_started_at_unix_seconds
+            or float(
+                selected_window_c_row.get(
+                    "source_timestamp_unix_seconds", math.inf
+                )
+            )
+            > exact_backend_returned_at_unix_seconds
+            or any(
+                row.get("gpu_index") != 0
+                or row.get("host_pid") != host_pid
+                or row.get("process_type") != "C"
+                or not isinstance(row.get("command"), str)
+                or not row["command"].strip()
+                or not _ContinuousPmon._row_has_source_dt(row)
+                for row in actual_pmon_rows
+            )
+        )
+    )
+    all_idle_pmon_invalid = (
+        pmon_mode == "pmon_reported_all_idle_during_audited_window"
+        and (
+            pmon_status != "degraded"
+            or actual_pmon_rows != []
+            or process_type_sample.get("direct_compute_type_observed") is not False
+            or process_type_sample.get("host_pid_observed") is not False
+            or not isinstance(
+                process_type_sample.get(
+                    "compute_observation_deadline_reached_at_monotonic_seconds"
+                ),
+                (int, float),
+            )
+        )
+    )
+    if (
+        common_pmon_invalid
+        or strict_pmon_invalid
+        or all_idle_pmon_invalid
+        or pmon_mode
+        not in (
+            "direct_c_observed",
+            "pmon_reported_all_idle_during_audited_window",
+        )
     ):
         binding_errors.append(
-            "continuous pmon lacks an idle baseline followed by the expected "
-            "source-DT direct C client during the audited backend window"
+            "continuous pmon evidence is neither a valid direct-C observation "
+            "nor a strict all-idle host-observability result"
         )
 
     if nspid_evidence.get("status") != "ok":
@@ -1444,10 +1801,11 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
             binding_errors.append("direct NSpid binding lacks outer host PID")
     elif (
         pid_namespace_chain != [os.getpid()]
-        or proc_visibility.get("status") != "not_visible"
+        or proc_visibility != {"status": "not_visible", "error": None}
     ):
         binding_errors.append(
-            "snapshot binding lacks isolated PID namespace/proc visibility evidence"
+            "sampled temporal association lacks isolated PID namespace/proc "
+            "visibility evidence"
         )
 
     pre_wall = float(pre_run_gpu["sampled_at_unix_seconds"])
@@ -1498,6 +1856,18 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
         "pid_namespace_chain": pid_namespace_chain,
         "host_pid_namespace_visible": host_pid_namespace_visible,
         "pid_binding_method": pid_binding_method,
+        "pmon_observation_mode": pmon_mode,
+        "gpu_process_claim_scope": claim_scope,
+        "host_pid_ownership": (
+            "proven_by_nspid"
+            if pid_binding_method == "direct_nspid"
+            else "unknown_sampled_temporal_association_only"
+        ),
+        "mps_status": (
+            "not_observed"
+            if pmon_mode == "direct_c_observed"
+            else "unknown"
+        ),
         "pre_run_gpu": dict(pre_run_gpu),
         "pre_run_gpu_sha256": pre_run_gpu_sha256,
         "post_cuda_sampled_at_unix_seconds": gpu_identity[
@@ -1509,7 +1879,13 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
         "gpu_process_binding": {
             "schema_version": GPU_PROCESS_BINDING_SCHEMA_VERSION,
             "binding_method": pid_binding_method,
-            "claim_scope": "snapshot_bound_not_continuous_exclusivity",
+            "claim_scope": claim_scope,
+            "pmon_observation_mode": pmon_mode,
+            "host_pid_ownership": (
+                "proven_by_nspid"
+                if pid_binding_method == "direct_nspid"
+                else "unknown_sampled_temporal_association_only"
+            ),
             "pre_run_gpu_path": str(pre_run_gpu_path),
             "pre_run_gpu_sha256": pre_run_gpu_sha256,
             "pre_run_gpu": dict(pre_run_gpu),
@@ -1578,11 +1954,24 @@ def run_microtest(device_index=0, pre_run_gpu=None, pre_run_gpu_path=None):
             "mps": {
                 "cuda_mps_environment_variables": mps_variables,
                 "pmon": process_type_sample,
-                "mps_process_detected": pmon_mps_process_detected,
+                "mps_status": (
+                    "not_observed"
+                    if pmon_mode == "direct_c_observed"
+                    else "unknown"
+                ),
+                "direct_compute_type_observed": (
+                    pmon_mode == "direct_c_observed"
+                ),
+                "host_pid_observed_by_pmon": (
+                    pmon_mode == "direct_c_observed"
+                ),
+                "continuous_exclusivity_proven": False,
             },
             "immediate_pre_cuda_sample": immediate_idle_sample,
             "context_live_sample": context_live_sample,
             "interval_seconds": 0.1,
+            "max_query_gap_seconds": GPU_QUERY_MAX_GAP_SECONDS,
+            "minimum_backend_query_samples": GPU_QUERY_MIN_BACKEND_SAMPLES,
             "interval_samples": interval_samples,
             "post_cuda_samples": [
                 post_cuda_sample_1,
