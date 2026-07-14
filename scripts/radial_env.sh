@@ -27,4 +27,5 @@ if [[ ! -d "${RADIAL_TORCH_LIB}" || ! -d "${RADIAL_CUDA_LIB}" ]]; then
   return 2 2>/dev/null || exit 2
 fi
 export LD_LIBRARY_PATH="${RADIAL_TORCH_LIB}:${RADIAL_CUDA_LIB}"
+export FASTA2V_ATTENTION_METHOD="radial"
 unset RADIAL_TORCH_LIB RADIAL_CUDA_LIB

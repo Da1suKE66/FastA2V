@@ -52,7 +52,7 @@ FLASHINFER_REQUIRED_APIS = (
     "merge_state",
 )
 FLASHINFER_MANIFEST_FILENAME = "radial-flashinfer-manifest.json"
-FLASHINFER_MANIFEST_SCHEMA = "fasta2v.flashinfer-install-manifest.v2"
+FLASHINFER_MANIFEST_SCHEMA = "fasta2v.flashinfer-install-manifest.v3"
 
 RADIAL_SEQUENCE = 15004
 RADIAL_PREFIX_SEQUENCE = 14976
@@ -141,6 +141,71 @@ def ldd_resolved_library_paths(output):
         if match and match.group(1) not in paths:
             paths.append(match.group(1))
     return tuple(paths)
+
+
+def ldd_resolved_libraries(output):
+    """Return ordered ``(loader_name, absolute_path)`` entries from ldd."""
+
+    libraries = []
+    for line in str(output).splitlines():
+        arrow = re.match(
+            r"^\s*(\S+)\s+=>\s+(/\S+)\s+\(0x[0-9A-Fa-f]+\)", line
+        )
+        if arrow:
+            item = (arrow.group(1), arrow.group(2))
+        else:
+            direct = re.match(
+                r"^\s*(/\S+)\s+\(0x[0-9A-Fa-f]+\)", line
+            )
+            if not direct:
+                continue
+            item = (Path(direct.group(1)).name, direct.group(1))
+        if item not in libraries:
+            libraries.append(item)
+    return tuple(libraries)
+
+
+def loaded_shared_object_paths(maps_text=None):
+    """Return canonical file-backed shared objects from Linux proc maps."""
+
+    if maps_text is None:
+        maps_path = Path("/proc/self/maps")
+        try:
+            maps_text = maps_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(f"cannot read runtime loader maps: {exc}") from exc
+    paths = set()
+    for line in str(maps_text).splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) != 6:
+            continue
+        mapped_path = fields[5]
+        if not mapped_path.startswith("/") or ".so" not in Path(mapped_path).name:
+            continue
+        paths.add(str(Path(mapped_path).resolve()))
+    return tuple(sorted(paths))
+
+
+def library_alias_matches_path(alias, path):
+    """Match an ldd loader name to its mapped versioned file name."""
+
+    alias = str(alias)
+    name = Path(path).name
+    return name == alias or name.startswith(alias + ".")
+
+
+def mapped_library_paths_by_alias(aliases, mapped_paths):
+    """Map each dependency loader name to every matching loaded object."""
+
+    unique_paths = tuple(sorted(set(str(Path(path).resolve()) for path in mapped_paths)))
+    return {
+        str(alias): [
+            path
+            for path in unique_paths
+            if library_alias_matches_path(alias, path)
+        ]
+        for alias in sorted(set(str(alias) for alias in aliases))
+    }
 
 
 def _canonical_loader_search_paths(search_paths):
@@ -234,6 +299,9 @@ def expected_flashinfer_manifest(receipt):
         "ldd_executable": receipt.get("ldd_executable"),
         "ldd_search_paths": receipt.get("ldd_search_paths"),
         "ldd_dependencies": receipt.get("ldd_dependencies"),
+        "runtime_loaded_dependencies": receipt.get(
+            "runtime_loaded_dependencies"
+        ),
         "runtime_loader_environment": receipt.get(
             "runtime_loader_environment"
         ),
@@ -364,6 +432,7 @@ def radial_receipt_evidence_errors(
     installed_files = receipt.get("installed_flashinfer_files")
     native_files = []
     native_dependency_paths = set()
+    native_dependency_aliases = set()
     if not isinstance(installed_files, dict) or not installed_files:
         errors.append("receipt installed_flashinfer_files is missing")
     else:
@@ -389,6 +458,9 @@ def radial_receipt_evidence_errors(
                 ldd_normalized_output = metadata.get("ldd_normalized_output")
                 ldd_sha256 = metadata.get("ldd_sha256")
                 ldd_dependency_paths = metadata.get("ldd_dependency_paths")
+                ldd_dependency_libraries = metadata.get(
+                    "ldd_dependency_libraries"
+                )
                 if not isinstance(ldd_output, str) or not ldd_output.strip():
                     errors.append(
                         f"receipt FlashInfer native ldd output is missing: {name}"
@@ -421,6 +493,19 @@ def radial_receipt_evidence_errors(
                     )
                 else:
                     native_dependency_paths.update(parsed_dependency_paths)
+                parsed_dependency_libraries = [
+                    {"name": alias, "path": path}
+                    for alias, path in ldd_resolved_libraries(ldd_output or "")
+                ]
+                if ldd_dependency_libraries != parsed_dependency_libraries:
+                    errors.append(
+                        "receipt FlashInfer native dependency aliases differ from "
+                        f"ldd output: {name}"
+                    )
+                else:
+                    native_dependency_aliases.update(
+                        item["name"] for item in parsed_dependency_libraries
+                    )
         installed_init = installed_files.get("__init__.py")
         if isinstance(installed_init, dict) and isinstance(flashinfer_module, dict):
             if (
@@ -456,6 +541,48 @@ def radial_receipt_evidence_errors(
                 errors.append(
                     "receipt resolved ldd dependency path is not absolute: "
                     f"{reported_path}"
+                )
+
+    runtime_dependencies = receipt.get("runtime_loaded_dependencies")
+    expected_runtime_aliases = native_dependency_aliases | {
+        Path(name).name for name in native_files
+    }
+    if not isinstance(runtime_dependencies, dict) or not runtime_dependencies:
+        errors.append("receipt runtime_loaded_dependencies is missing")
+    else:
+        if set(runtime_dependencies) != expected_runtime_aliases:
+            errors.append(
+                "receipt runtime dependency aliases differ from ldd/native files"
+            )
+        for alias, fingerprints in runtime_dependencies.items():
+            if not isinstance(fingerprints, list) or not fingerprints:
+                errors.append(
+                    f"receipt runtime dependency mappings are missing: {alias}"
+                )
+                continue
+            paths = []
+            for metadata in fingerprints:
+                if not _valid_fingerprint(metadata):
+                    errors.append(
+                        "receipt runtime dependency fingerprint is invalid: "
+                        f"{alias}"
+                    )
+                    continue
+                path = metadata.get("path", "")
+                if not Path(path).is_absolute():
+                    errors.append(
+                        "receipt runtime dependency path is not absolute: "
+                        f"{alias}"
+                    )
+                if not library_alias_matches_path(alias, path):
+                    errors.append(
+                        "receipt runtime dependency path does not match alias: "
+                        f"{alias} -> {path}"
+                    )
+                paths.append(path)
+            if len(paths) != len(set(paths)):
+                errors.append(
+                    f"receipt runtime dependency paths are duplicated: {alias}"
                 )
 
     audits = receipt.get("cpu_mask_audits")
@@ -509,6 +636,26 @@ def radial_microtest_evidence_errors(microtest, expected_gpu_uuid=None):
                 f"Radial microtest {field}={microtest.get(field)!r} != "
                 f"{expected_value!r}"
             )
+    before_cuda = microtest.get("runtime_dependencies_before_cuda")
+    after_cuda = microtest.get("runtime_dependencies_after_cuda")
+    if before_cuda != after_cuda:
+        errors.append("Radial microtest runtime dependencies changed after CUDA")
+    if not isinstance(before_cuda, dict):
+        errors.append("Radial microtest lacks runtime dependency evidence")
+    else:
+        if before_cuda.get("status") != "ok":
+            errors.append("Radial microtest runtime dependency status is not ok")
+        if not isinstance(before_cuda.get("aliases"), int) or before_cuda.get(
+            "aliases", 0
+        ) <= 0:
+            errors.append("Radial microtest runtime dependency alias count is invalid")
+        if not isinstance(before_cuda.get("mapped_files"), int) or before_cuda.get(
+            "mapped_files", 0
+        ) <= 0:
+            errors.append("Radial microtest runtime mapped file count is invalid")
+        digest = before_cuda.get("inventory_sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            errors.append("Radial microtest runtime dependency digest is invalid")
     device_uuid = microtest.get("device_uuid")
     if not isinstance(device_uuid, str) or not device_uuid.startswith("GPU-"):
         errors.append("Radial microtest device_uuid is missing or invalid")

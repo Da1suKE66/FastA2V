@@ -7,20 +7,74 @@ import logging
 import subprocess
 import time
 from datetime import datetime, timezone
-import torch
-from tqdm import tqdm
-from omegaconf import OmegaConf
-from ovi.utils.io_utils import save_video
-from ovi.utils.processing_utils import format_prompt_for_filename, validate_and_process_user_prompt
-from ovi.utils.utils import get_arguments
-from ovi.distributed_comms.util import get_world_size, get_local_rank, get_global_rank
-from ovi.distributed_comms.parallel_states import initialize_sequence_parallel_state, get_sequence_parallel_state, nccl_info
-from ovi.ovi_fusion_engine import OviFusionEngine
-from ovi.eval_protocol import prompt_sequence_sha256
-from ovi.gpu_process_monitor import (
-    GpuProcessMonitor,
-    validate_pre_run_gpu_report,
-)
+from pathlib import Path
+
+
+_RADIAL_BOOTSTRAP_RECEIPT = None
+_RADIAL_BOOTSTRAP_EVIDENCE = None
+if os.environ.get("FASTA2V_ATTENTION_METHOD") == "radial":
+    from ovi.modules.radial_attention_backend import (
+        load_flashinfer_api,
+        restore_radial_loader_after_preloaded_optional_imports,
+        verify_radial_install_receipt,
+        verify_radial_runtime_loaded_dependencies,
+        verify_radial_runtime_loader_environment,
+    )
+
+    _radial_receipt_path, _RADIAL_BOOTSTRAP_RECEIPT = (
+        verify_radial_install_receipt()
+    )
+    verify_radial_runtime_loader_environment(_RADIAL_BOOTSTRAP_RECEIPT)
+    load_flashinfer_api(
+        _RADIAL_BOOTSTRAP_RECEIPT["installed_flashinfer_package_root"]
+    )
+    _RADIAL_BOOTSTRAP_EVIDENCE = {
+        "status": "ok",
+        "receipt_path": str(_radial_receipt_path),
+        "before_optional_imports": verify_radial_runtime_loaded_dependencies(
+            _RADIAL_BOOTSTRAP_RECEIPT
+        ),
+    }
+
+try:
+    import torch
+    from tqdm import tqdm
+    from omegaconf import OmegaConf
+    from ovi.utils.io_utils import save_video
+    from ovi.utils.processing_utils import (
+        format_prompt_for_filename,
+        validate_and_process_user_prompt,
+    )
+    from ovi.utils.utils import get_arguments
+    from ovi.distributed_comms.util import (
+        get_world_size,
+        get_local_rank,
+        get_global_rank,
+    )
+    from ovi.distributed_comms.parallel_states import (
+        initialize_sequence_parallel_state,
+        get_sequence_parallel_state,
+        nccl_info,
+    )
+    from ovi.ovi_fusion_engine import OviFusionEngine
+    from ovi.eval_protocol import prompt_sequence_sha256
+    from ovi.gpu_process_monitor import (
+        GpuProcessMonitor,
+        validate_pre_run_gpu_report,
+    )
+finally:
+    if _RADIAL_BOOTSTRAP_RECEIPT is not None:
+        _RADIAL_BOOTSTRAP_EVIDENCE["after_optional_imports"] = (
+            restore_radial_loader_after_preloaded_optional_imports(
+                _RADIAL_BOOTSTRAP_RECEIPT,
+                allowed_prepend_paths=(
+                    Path(sys.prefix)
+                    / "lib"
+                    / f"python{sys.version_info.major}.{sys.version_info.minor}"
+                    / "lib64",
+                ),
+            )
+        )
 
 
 def _command_output(command):
@@ -169,6 +223,11 @@ def _collect_environment(config, config_file, engine_load_seconds, text_prompts)
         ),
         "radial_block_size": int(config.get("radial_block_size", 128)),
         "radial_model_type": str(config.get("radial_model_type", "wan")),
+        "radial_loader_bootstrap": (
+            _RADIAL_BOOTSTRAP_EVIDENCE
+            if config.get("attention_method", "dense") == "radial"
+            else None
+        ),
         "sample_steps": int(config.get("sample_steps", 50)),
         "slg_layer": int(config.get("slg_layer", 11)),
         "prompts_sha256": prompt_sequence_sha256(text_prompts),
@@ -298,6 +357,25 @@ def _init_logging(rank):
 
 
 def main(config, args): 
+
+    configured_attention_method = str(
+        config.get("attention_method", "dense")
+    ).lower()
+    declared_attention_method = os.environ.get("FASTA2V_ATTENTION_METHOD")
+    if configured_attention_method == "radial":
+        if (
+            declared_attention_method != "radial"
+            or _RADIAL_BOOTSTRAP_RECEIPT is None
+            or _RADIAL_BOOTSTRAP_EVIDENCE is None
+        ):
+            raise RuntimeError(
+                "Radial inference requires scripts/radial_env.sh and an "
+                "early audited FlashInfer preload"
+            )
+    elif declared_attention_method == "radial":
+        raise RuntimeError(
+            "FASTA2V_ATTENTION_METHOD=radial disagrees with the YAML config"
+        )
 
     world_size = get_world_size()
     global_rank = get_global_rank()

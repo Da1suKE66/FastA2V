@@ -32,6 +32,67 @@ def fixed_environment(profile, *, smoke):
 
 
 class RadialRunProtocolTests(unittest.TestCase):
+    def test_runtime_loader_evidence_is_bound_to_receipt_and_opencv_path(self):
+        receipt = {
+            "runtime_loaded_dependencies": {
+                "flashinfer_kernels.abi3.so": [
+                    {
+                        "path": "/fixed/flashinfer_kernels.abi3.so",
+                        "bytes": 2,
+                        "sha256": "a" * 64,
+                    }
+                ],
+                "libcudart.so.12": [
+                    {
+                        "path": "/fixed/libcudart.so.12",
+                        "bytes": 3,
+                        "sha256": "b" * 64,
+                    },
+                    {
+                        "path": "/other/libcudart.so.12.8.90",
+                        "bytes": 4,
+                        "sha256": "c" * 64,
+                    },
+                ],
+            }
+        }
+        expected = VERIFIER.expected_radial_runtime_dependency_evidence(receipt)
+        self.assertEqual(expected["aliases"], 2)
+        self.assertEqual(expected["mapped_files"], 3)
+        optional_imports = {
+            "status": "ok",
+            "restored": True,
+            "removed_prepend_paths": [
+                "/cache/liluchen/FastA2V/envs/ovi/lib/python3.11/"
+                "site-packages/cv2/../../lib64"
+            ],
+            "runtime_dependencies": dict(expected),
+        }
+        errors = []
+        VERIFIER.validate_radial_optional_import_loader_evidence(
+            optional_imports,
+            expected,
+            "/cache/liluchen/FastA2V/envs/ovi/lib/python3.11/lib64",
+            "test",
+            errors,
+        )
+        self.assertEqual(errors, [])
+
+        optional_imports["runtime_dependencies"]["inventory_sha256"] = "0" * 64
+        optional_imports["removed_prepend_paths"] = [
+            "/cache/liluchen/FastA2V/envs/ovi/lib64"
+        ]
+        errors = []
+        VERIFIER.validate_radial_optional_import_loader_evidence(
+            optional_imports,
+            expected,
+            "/cache/liluchen/FastA2V/envs/ovi/lib/python3.11/lib64",
+            "test",
+            errors,
+        )
+        self.assertTrue(any("copied receipt" in error for error in errors))
+        self.assertTrue(any("fixed env lib64" in error for error in errors))
+
     def test_all_four_fixed_profiles_and_run_tiers_are_accepted(self):
         for profile in ("conservative", "aggressive"):
             for smoke in (False, True):
@@ -143,6 +204,12 @@ class RadialRunProtocolTests(unittest.TestCase):
 
     def test_dispatcher_validator_requires_real_radial_calls_and_tail_audit(self):
         calls = 2950
+        runtime_dependencies = {
+            "status": "ok",
+            "aliases": 26,
+            "mapped_files": 31,
+            "inventory_sha256": "a" * 64,
+        }
         dispatcher = {
             "calls_total": calls,
             "calls_by_method": {
@@ -180,7 +247,12 @@ class RadialRunProtocolTests(unittest.TestCase):
                 "last_mask_audit": dict(
                     VERIFIER.RADIAL_PROFILE_AUDITS["conservative"]
                 ),
-                "install_receipt": {},
+                "install_receipt": {
+                    "runtime_dependencies": dict(runtime_dependencies)
+                },
+                "runtime_dependencies_after_first_cuda": dict(
+                    runtime_dependencies
+                ),
             },
         }
         errors = []
@@ -193,6 +265,17 @@ class RadialRunProtocolTests(unittest.TestCase):
         VERIFIER.validate_radial_dispatcher(dispatcher, errors)
         self.assertTrue(any("tail_strategy" in error for error in errors))
         self.assertTrue(any("calls_by_method" in error for error in errors))
+
+        dispatcher["backend_details"]["tail_strategy"] = (
+            "dense_lse_merge_no_padding"
+        )
+        dispatcher["calls_by_method"]["dense"] = 0
+        dispatcher["backend_details"][
+            "runtime_dependencies_after_first_cuda"
+        ] = None
+        errors = []
+        VERIFIER.validate_radial_dispatcher(dispatcher, errors)
+        self.assertTrue(any("after first CUDA" in error for error in errors))
 
 
 class RadialPinAndInstallerTests(unittest.TestCase):
@@ -252,7 +335,9 @@ class RadialPinAndInstallerTests(unittest.TestCase):
             '[str(ldd_executable), str(installed_path)]',
             'source "${REPO_ROOT}/scripts/radial_env.sh"',
             'metadata_value["ldd_dependency_paths"] = dependency_paths',
+            'metadata_value["ldd_dependency_libraries"] = dependency_libraries',
             '"ldd_dependencies": ldd_dependencies',
+            '"runtime_loaded_dependencies": runtime_loaded_dependencies',
             '"runtime_loader_environment": runtime_loader_environment',
             '"flashinfer_manifest": fingerprint(flashinfer_manifest_path)',
             '"cuda_kernel_launched": False',
@@ -272,6 +357,56 @@ class RadialPinAndInstallerTests(unittest.TestCase):
             'export LD_LIBRARY_PATH="${RADIAL_TORCH_LIB}:${RADIAL_CUDA_LIB}"',
             radial_env,
         )
+        self.assertIn('export FASTA2V_ATTENTION_METHOD="radial"', radial_env)
+
+    def test_radial_runtime_bootstrap_precedes_optional_native_imports(self):
+        inference_source = (REPO_ROOT / "inference.py").read_text()
+        bootstrap = inference_source.index(
+            'if os.environ.get("FASTA2V_ATTENTION_METHOD") == "radial":'
+        )
+        runtime_check = inference_source.index(
+            '"before_optional_imports": verify_radial_runtime_loaded_dependencies',
+            bootstrap,
+        )
+        third_party_import = inference_source.index("    import torch\n", bootstrap)
+        self.assertLess(bootstrap, runtime_check)
+        self.assertLess(runtime_check, third_party_import)
+        self.assertIn(
+            "restore_radial_loader_after_preloaded_optional_imports",
+            inference_source,
+        )
+        self.assertIn('"radial_loader_bootstrap": (', inference_source)
+
+        preflight_source = (
+            REPO_ROOT / "scripts" / "preflight_ovi.py"
+        ).read_text()
+        preflight_bootstrap = preflight_source.index(
+            'if attention_method == "radial":'
+        )
+        preflight_runtime_check = preflight_source.index(
+            "verify_radial_runtime_loaded_dependencies(receipt)",
+            preflight_bootstrap,
+        )
+        generic_torch_import = preflight_source.index(
+            "            import torch\n", preflight_bootstrap
+        )
+        self.assertLess(preflight_runtime_check, generic_torch_import)
+        self.assertIn(
+            '"runtime_dependencies_before_optional_imports"',
+            preflight_source,
+        )
+        self.assertIn('"optional_import_loader_evidence"', preflight_source)
+
+        verifier_source = (
+            REPO_ROOT / "scripts" / "verify_ovi_output.py"
+        ).read_text()
+        for marker in (
+            "expected_radial_runtime_dependency_evidence",
+            "validate_radial_optional_import_loader_evidence",
+            'f"runtime_dependencies_{phase}"',
+            'environment.get("radial_loader_bootstrap")',
+        ):
+            self.assertIn(marker, verifier_source)
 
     def test_backend_has_no_custom_cuda_or_dense_fallback(self):
         source = (

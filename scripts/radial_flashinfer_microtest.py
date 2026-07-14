@@ -16,6 +16,7 @@ from ovi.modules.radial_attention_backend import (
     load_flashinfer_api,
     load_official_radial_mask_module,
     verify_radial_install_receipt,
+    verify_radial_runtime_loaded_dependencies,
     verify_radial_runtime_loader_environment,
 )
 from ovi.radial_evidence import (
@@ -74,6 +75,9 @@ def run_microtest(device_index=0):
     flashinfer = load_flashinfer_api(
         receipt["installed_flashinfer_package_root"]
     )
+    runtime_dependencies_before_cuda = (
+        verify_radial_runtime_loaded_dependencies(receipt)
+    )
     source_module = load_official_radial_mask_module(
         receipt["derived_module"]["path"]
     )
@@ -119,6 +123,9 @@ def run_microtest(device_index=0):
         None,
     )
     torch.cuda.synchronize(device)
+    runtime_dependencies_after_cuda = (
+        verify_radial_runtime_loaded_dependencies(receipt)
+    )
     if tuple(output.shape) != (1, RADIAL_SEQUENCE, RADIAL_HEADS * RADIAL_HEAD_DIM):
         raise RadialAttentionDependencyError(
             f"Radial microtest returned incompatible shape {tuple(output.shape)}"
@@ -189,6 +196,8 @@ def run_microtest(device_index=0):
         "plan_cache_hits": metrics["plan_cache_hits"],
         "mask_audit": metrics["last_mask_audit"],
         "finite": finite,
+        "runtime_dependencies_before_cuda": runtime_dependencies_before_cuda,
+        "runtime_dependencies_after_cuda": runtime_dependencies_after_cuda,
         "output_abs_mean": output_abs_mean,
         "output_abs_max": output_abs_max,
     }

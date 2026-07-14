@@ -25,12 +25,14 @@ from ovi.radial_evidence import (
     expected_flashinfer_manifest,
     deterministic_ldd_environment,
     flashinfer_manifest_evidence_errors,
+    ldd_resolved_libraries,
     ldd_resolved_library_paths,
     normalize_ldd_output,
     radial_profile,
     radial_ldd_search_paths,
     radial_microtest_evidence_errors,
     radial_receipt_evidence_errors,
+    radial_runtime_loader_environment,
 )
 
 
@@ -162,11 +164,20 @@ class FakeHostTensor:
         return copy.deepcopy(self.values)
 
 
+class FakeCuda:
+    def __init__(self):
+        self.synchronize_calls = []
+
+    def synchronize(self, device):
+        self.synchronize_calls.append(str(device))
+
+
 class FakeTorch:
     uint8 = "torch.uint8"
 
     def __init__(self):
         self.empty_calls = []
+        self.cuda = FakeCuda()
 
     def empty(self, size, *, device, dtype):
         self.empty_calls.append((size, str(device), dtype))
@@ -311,6 +322,22 @@ def complete_receipt():
                 "sha256": "c" * 64,
             }
         },
+        "runtime_loaded_dependencies": {
+            "flashinfer_kernels.so": [
+                {
+                    "path": f"{flashinfer_root}/flashinfer_kernels.so",
+                    "bytes": 2,
+                    "sha256": "a" * 64,
+                }
+            ],
+            "libtorch.so": [
+                {
+                    "path": "/fixed/libtorch.so",
+                    "bytes": 1,
+                    "sha256": "c" * 64,
+                }
+            ],
+        },
         "runtime_loader_environment": {
             "LD_LIBRARY_PATH": (
                 ":".join(ldd_search_paths)
@@ -335,6 +362,9 @@ def complete_receipt():
                     native_ldd_normalized.encode("utf-8")
                 ).hexdigest(),
                 "ldd_dependency_paths": ["/fixed/libtorch.so"],
+                "ldd_dependency_libraries": [
+                    {"name": "libtorch.so", "path": "/fixed/libtorch.so"}
+                ],
             },
         },
         "flashinfer_manifest": {
@@ -504,6 +534,77 @@ class RadialMaskAuditTests(unittest.TestCase):
                         )
                     os.environ.pop(variable)
 
+    def test_runtime_mappings_are_hashed_and_post_cuda_alias_drift_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            search_a = root / "search-a"
+            search_b = root / "search-b"
+            allowed = root / "allowed"
+            for path in (search_a, search_b, allowed):
+                path.mkdir()
+            dependency = root / "libfoo.so.1"
+            conflict = root / "libfoo.so.1.9"
+            dependency.write_bytes(b"fixed")
+            conflict.write_bytes(b"conflict")
+
+            def metadata(path):
+                payload = path.read_bytes()
+                return {
+                    "path": str(path),
+                    "bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+
+            search_paths = [str(search_a), str(search_b)]
+            receipt = {
+                "ldd_search_paths": search_paths,
+                "runtime_loader_environment": (
+                    radial_runtime_loader_environment(search_paths)
+                ),
+                "runtime_loaded_dependencies": {
+                    "libfoo.so.1": [metadata(dependency)]
+                },
+            }
+            with mock.patch.object(
+                BACKEND_MODULE,
+                "loaded_shared_object_paths",
+                return_value=(str(dependency),),
+            ):
+                evidence = (
+                    BACKEND_MODULE.verify_radial_runtime_loaded_dependencies(
+                        receipt
+                    )
+                )
+                self.assertEqual(evidence["status"], "ok")
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "LD_LIBRARY_PATH": (
+                            f"{allowed}:{':'.join(search_paths)}"
+                        )
+                    },
+                    clear=True,
+                ):
+                    restored = (
+                        BACKEND_MODULE.restore_radial_loader_after_preloaded_optional_imports(
+                            receipt,
+                            allowed_prepend_paths=(allowed,),
+                        )
+                    )
+                    self.assertTrue(restored["restored"])
+                    self.assertEqual(
+                        os.environ["LD_LIBRARY_PATH"], ":".join(search_paths)
+                    )
+            with mock.patch.object(
+                BACKEND_MODULE,
+                "loaded_shared_object_paths",
+                return_value=(str(dependency), str(conflict)),
+            ):
+                with self.assertRaises(RadialAttentionDependencyError):
+                    BACKEND_MODULE.verify_radial_runtime_loaded_dependencies(
+                        receipt
+                    )
+
     def test_ldd_helpers_reject_ambiguous_search_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             canonical = str(Path(directory).resolve())
@@ -529,6 +630,17 @@ class RadialMaskAuditTests(unittest.TestCase):
                 "/lib64/ld-linux-x86-64.so.2 (0x3)\n"
             ),
             ("/fixed/libtorch.so", "/lib64/ld-linux-x86-64.so.2"),
+        )
+        self.assertEqual(
+            ldd_resolved_libraries(
+                "linux-vdso.so.1 (0x1)\n"
+                "libtorch.so => /fixed/libtorch.so (0x2)\n"
+                "/lib64/ld-linux-x86-64.so.2 (0x3)\n"
+            ),
+            (
+                ("libtorch.so", "/fixed/libtorch.so"),
+                ("ld-linux-x86-64.so.2", "/lib64/ld-linux-x86-64.so.2"),
+            ),
         )
 
     def test_cpu_fixtures_bind_hash_count_and_official_empty_rows(self):
@@ -625,6 +737,18 @@ class RadialMaskAuditTests(unittest.TestCase):
                 RADIAL_PROFILE_AUDITS["conservative"]
             ),
             "finite": True,
+            "runtime_dependencies_before_cuda": {
+                "status": "ok",
+                "aliases": 2,
+                "mapped_files": 3,
+                "inventory_sha256": "b" * 64,
+            },
+            "runtime_dependencies_after_cuda": {
+                "status": "ok",
+                "aliases": 2,
+                "mapped_files": 3,
+                "inventory_sha256": "b" * 64,
+            },
             "output_abs_mean": 0.5,
             "output_abs_max": 4.0,
         }
@@ -644,7 +768,11 @@ class RadialMaskAuditTests(unittest.TestCase):
 
 
 class RadialBackendExecutionTests(unittest.TestCase):
-    def make_backend(self, profile="aggressive"):
+    def make_backend(
+        self,
+        profile="aggressive",
+        runtime_dependency_verifier=None,
+    ):
         torch_module = FakeTorch()
         flashinfer = FakeFlashInfer()
         mask_calls = []
@@ -671,8 +799,49 @@ class RadialBackendExecutionTests(unittest.TestCase):
             get_indices_from_mask=lambda mask, query: object(),
             rope_apply_fn=rope_apply,
             profile=profile,
+            runtime_dependency_verifier=runtime_dependency_verifier,
         )
         return backend, torch_module, flashinfer, mask_calls, rope_calls
+
+    def test_first_cuda_dependency_audit_persists_across_metric_resets(self):
+        evidence = {
+            "status": "ok",
+            "aliases": 26,
+            "mapped_files": 31,
+            "inventory_sha256": "a" * 64,
+        }
+        verifier_calls = []
+
+        def verify_runtime():
+            verifier_calls.append(True)
+            return dict(evidence)
+
+        backend, torch_module, _flashinfer, _mask_calls, _rope_calls = (
+            self.make_backend(runtime_dependency_verifier=verify_runtime)
+        )
+        inputs = (
+            RecordingAttention(),
+            FakeTensor("hidden", (1, 15004, 3072)),
+            FakeHostTensor([15004]),
+            FakeHostTensor([[31, 22, 22]]),
+            object(),
+        )
+        backend(*inputs)
+        self.assertEqual(verifier_calls, [True])
+        self.assertEqual(torch_module.cuda.synchronize_calls, ["cuda:0"])
+        self.assertEqual(
+            backend.metrics()["runtime_dependencies_after_first_cuda"],
+            evidence,
+        )
+
+        backend.reset_metrics()
+        backend(*inputs)
+        self.assertEqual(verifier_calls, [True])
+        self.assertEqual(torch_module.cuda.synchronize_calls, ["cuda:0"])
+        self.assertEqual(
+            backend.metrics()["runtime_dependencies_after_first_cuda"],
+            evidence,
+        )
 
     def test_exact_prefix_tail_protocol_reuses_ovi_components(self):
         backend, torch_module, flashinfer, mask_calls, rope_calls = self.make_backend()

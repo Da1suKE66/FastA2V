@@ -50,6 +50,8 @@ from ovi.radial_evidence import (
     flashinfer_manifest_evidence_errors,
     deterministic_ldd_environment,
     ldd_resolved_library_paths,
+    loaded_shared_object_paths,
+    mapped_library_paths_by_alias,
     normalize_ldd_output,
     radial_profile,
     radial_receipt_evidence_errors,
@@ -260,6 +262,142 @@ def verify_radial_runtime_loader_environment(receipt):
             f"{forbidden}"
         )
     return expected
+
+
+def verify_radial_runtime_loaded_dependencies(receipt):
+    """Verify the actual ELF mappings selected by torch and FlashInfer."""
+
+    expected_inventory = receipt.get("runtime_loaded_dependencies")
+    if not isinstance(expected_inventory, dict) or not expected_inventory:
+        raise RadialAttentionDependencyError(
+            "Radial receipt lacks runtime loaded dependency fingerprints"
+        )
+    mapped_paths = loaded_shared_object_paths()
+    actual_paths_by_alias = mapped_library_paths_by_alias(
+        expected_inventory, mapped_paths
+    )
+    mismatches = []
+    expected_metadata_by_path = {}
+    for alias, fingerprints in sorted(expected_inventory.items()):
+        if not isinstance(fingerprints, list) or not fingerprints:
+            mismatches.append(f"runtime dependency metadata missing: {alias}")
+            continue
+        expected_paths = sorted(
+            metadata.get("path")
+            for metadata in fingerprints
+            if isinstance(metadata, dict)
+            and isinstance(metadata.get("path"), str)
+        )
+        actual_paths = actual_paths_by_alias.get(alias, [])
+        if expected_paths != actual_paths:
+            mismatches.append(
+                f"runtime dependency paths differ: {alias}: "
+                f"expected={expected_paths} actual={actual_paths}"
+            )
+        for metadata in fingerprints:
+            if isinstance(metadata, dict) and isinstance(
+                metadata.get("path"), str
+            ):
+                previous = expected_metadata_by_path.get(metadata["path"])
+                if previous is not None and previous != metadata:
+                    mismatches.append(
+                        "runtime dependency path has inconsistent fingerprints: "
+                        f"{metadata['path']}"
+                    )
+                expected_metadata_by_path[metadata["path"]] = metadata
+    for path_text, metadata in sorted(expected_metadata_by_path.items()):
+        path = Path(path_text).resolve()
+        if str(path) != path_text or not path.is_file():
+            mismatches.append(f"runtime dependency is missing: {path_text}")
+            continue
+        if (
+            path.stat().st_size != metadata.get("bytes")
+            or _sha256_file(path) != metadata.get("sha256")
+        ):
+            mismatches.append(
+                f"runtime dependency fingerprint mismatch: {path_text}"
+            )
+    if mismatches:
+        raise RadialAttentionDependencyError(
+            f"Loaded Radial dependencies differ from receipt: {mismatches}"
+        )
+    canonical_inventory = json.dumps(
+        expected_inventory,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        "status": "ok",
+        "aliases": len(expected_inventory),
+        "mapped_files": len(expected_metadata_by_path),
+        "inventory_sha256": hashlib.sha256(canonical_inventory).hexdigest(),
+    }
+
+
+def restore_radial_loader_after_preloaded_optional_imports(
+    receipt,
+    *,
+    allowed_prepend_paths,
+):
+    """Remove only an explicitly allowed prefix after FlashInfer was mapped."""
+
+    runtime_evidence = verify_radial_runtime_loaded_dependencies(receipt)
+    expected = radial_runtime_loader_environment(
+        receipt.get("ldd_search_paths", ())
+    )
+    if receipt.get("runtime_loader_environment") != expected:
+        raise RadialAttentionDependencyError(
+            "Radial receipt runtime loader contract is invalid"
+        )
+    forbidden = sorted(
+        name
+        for name in os.environ
+        if (
+            name != "LD_LIBRARY_PATH"
+            and any(
+                name.startswith(prefix)
+                for prefix in RADIAL_FORBIDDEN_LOADER_PREFIXES
+            )
+        )
+        or name in RADIAL_FORBIDDEN_LOADER_VARIABLES
+    )
+    if forbidden:
+        raise RadialAttentionDependencyError(
+            "Optional imports introduced forbidden loader variables: "
+            f"{forbidden}"
+        )
+    actual = os.environ.get("LD_LIBRARY_PATH", "")
+    expected_paths = expected["LD_LIBRARY_PATH"].split(os.pathsep)
+    actual_paths = actual.split(os.pathsep) if actual else []
+    removed_paths = []
+    if actual_paths != expected_paths:
+        if (
+            len(actual_paths) <= len(expected_paths)
+            or actual_paths[-len(expected_paths) :] != expected_paths
+        ):
+            raise RadialAttentionDependencyError(
+                "Optional imports replaced the audited LD_LIBRARY_PATH tail: "
+                f"{actual!r}"
+            )
+        removed_paths = actual_paths[: -len(expected_paths)]
+        resolved_removed = [str(Path(path).resolve()) for path in removed_paths]
+        resolved_allowed = [
+            str(Path(path).resolve()) for path in allowed_prepend_paths
+        ]
+        if resolved_removed != resolved_allowed:
+            raise RadialAttentionDependencyError(
+                "Optional imports prepended an unaudited loader path: "
+                f"{removed_paths}"
+            )
+    os.environ["LD_LIBRARY_PATH"] = expected["LD_LIBRARY_PATH"]
+    verify_radial_runtime_loader_environment(receipt)
+    return {
+        "status": "ok",
+        "restored": bool(removed_paths),
+        "removed_prepend_paths": removed_paths,
+        "runtime_dependencies": runtime_evidence,
+    }
 
 
 def _verify_flashinfer_manifest(receipt):
@@ -555,6 +693,7 @@ class RadialVideoSelfAttentionBackend:
         rope_apply_fn,
         profile,
         install_receipt=None,
+        runtime_dependency_verifier=None,
     ):
         dependencies = {
             "mask_generator": mask_generator,
@@ -565,6 +704,11 @@ class RadialVideoSelfAttentionBackend:
         missing = [name for name, value in dependencies.items() if not callable(value)]
         if missing:
             raise TypeError(f"Radial backend dependencies are not callable: {missing}")
+        if (
+            runtime_dependency_verifier is not None
+            and not callable(runtime_dependency_verifier)
+        ):
+            raise TypeError("Radial runtime dependency verifier is not callable")
         self._torch = torch_module
         self._flashinfer = flashinfer_module
         self._mask_generator = mask_generator
@@ -574,6 +718,8 @@ class RadialVideoSelfAttentionBackend:
         self.profile_name = str(profile).strip().lower()
         self.profile = radial_profile(self.profile_name)
         self.install_receipt = dict(install_receipt or {})
+        self._runtime_dependency_verifier = runtime_dependency_verifier
+        self._runtime_dependencies_after_first_cuda = None
         self._plan_cache = {}
         self.reset_metrics()
 
@@ -621,6 +767,11 @@ class RadialVideoSelfAttentionBackend:
             "last_dtype": self._last_dtype,
             "last_mask_audit": last_mask_audit,
             "install_receipt": dict(self.install_receipt),
+            "runtime_dependencies_after_first_cuda": (
+                dict(self._runtime_dependencies_after_first_cuda)
+                if self._runtime_dependencies_after_first_cuda is not None
+                else None
+            ),
         }
 
     def _validate_inputs(self, q, k, v, seq_lens, grid_sizes):
@@ -852,6 +1003,24 @@ class RadialVideoSelfAttentionBackend:
             or str(getattr(output, "dtype", None)) != self._last_dtype
         ):
             raise RuntimeError("Radial output changed BF16 dtype or CUDA device")
+        if (
+            self._runtime_dependency_verifier is not None
+            and self._runtime_dependencies_after_first_cuda is None
+        ):
+            synchronize = getattr(
+                getattr(self._torch, "cuda", None), "synchronize", None
+            )
+            if not callable(synchronize):
+                raise RuntimeError(
+                    "Radial runtime dependency audit requires torch.cuda.synchronize"
+                )
+            synchronize(q.device)
+            runtime_evidence = self._runtime_dependency_verifier()
+            if not isinstance(runtime_evidence, dict):
+                raise RuntimeError(
+                    "Radial runtime dependency verifier returned invalid evidence"
+                )
+            self._runtime_dependencies_after_first_cuda = dict(runtime_evidence)
         self._calls += 1
         return output_projection(output.flatten(2))
 
@@ -888,6 +1057,16 @@ def build_radial_video_backend(config):
     flashinfer = load_flashinfer_api(
         receipt["installed_flashinfer_package_root"]
     )
+    runtime_dependencies = verify_radial_runtime_loaded_dependencies(receipt)
+
+    def verify_after_first_cuda():
+        evidence = verify_radial_runtime_loaded_dependencies(receipt)
+        if evidence != runtime_dependencies:
+            raise RadialAttentionDependencyError(
+                "Radial runtime dependency inventory changed after first CUDA call"
+            )
+        return evidence
+
     module = load_official_radial_mask_module(receipt["derived_module"]["path"])
     import torch
     from ovi.modules.model import rope_apply
@@ -897,6 +1076,7 @@ def build_radial_video_backend(config):
         "commit": receipt["commit"],
         "derived_module_sha256": receipt["derived_module"]["sha256"],
         "flashinfer_version": receipt["flashinfer_version"],
+        "runtime_dependencies": runtime_dependencies,
     }
     return RadialVideoSelfAttentionBackend(
         torch_module=torch,
@@ -907,4 +1087,5 @@ def build_radial_video_backend(config):
         rope_apply_fn=rope_apply,
         profile=profile_name,
         install_receipt=receipt_summary,
+        runtime_dependency_verifier=verify_after_first_cuda,
     )

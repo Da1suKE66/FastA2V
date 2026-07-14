@@ -24,6 +24,20 @@ def package_version(name):
         return None
 
 
+def finish_report(report, output_path=None):
+    rendered = json.dumps(
+        report,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+        allow_nan=False,
+    ) + "\n"
+    if output_path is not None:
+        Path(output_path).write_text(rendered, encoding="utf-8")
+    print(rendered, end="")
+    return 1 if report["errors"] else 0
+
+
 def main(output_path=None, attention_method="dense"):
     report = {
         "python": sys.version.split()[0],
@@ -53,37 +67,138 @@ def main(output_path=None, attention_method="dense"):
     ):
         report["packages"][package] = package_version(package)
 
-    try:
-        import torch
-
-        report["cuda_available"] = torch.cuda.is_available()
-        report["torch_cuda"] = torch.version.cuda
-        if torch.cuda.is_available():
-            report["gpu"] = torch.cuda.get_device_name(0)
-            report["compute_capability"] = list(torch.cuda.get_device_capability(0))
-        else:
-            report["errors"].append("CUDA is not available to PyTorch")
-    except Exception as exc:
-        report["errors"].append(f"torch import failed: {exc!r}")
-
-    for module in (
-        "cv2",
-        "diffusers",
-        "einops",
-        "flash_attn",
-        "moviepy",
-        "numpy",
-        "omegaconf",
-        "optimum.quanto",
-        "pandas",
-        "safetensors",
-        "scipy",
-        "transformers",
-    ):
+    radial_state = None
+    if attention_method == "radial":
         try:
-            importlib.import_module(module)
+            from ovi.gpu_process_monitor import validate_pre_run_gpu_report
+            from ovi.modules.radial_attention_backend import (
+                load_flashinfer_api,
+                load_official_radial_mask_module,
+                restore_radial_loader_after_preloaded_optional_imports,
+                verify_radial_install_receipt,
+                verify_radial_runtime_loaded_dependencies,
+                verify_radial_runtime_loader_environment,
+            )
+            from ovi.radial_evidence import RADIAL_COMMIT, RADIAL_MASK_API
+
+            run_dir = os.environ.get("FASTA2V_RUN_DIR")
+            pre_run_path = Path(run_dir or "") / "pre_run_gpu.json"
+            if not run_dir or not pre_run_path.is_file():
+                raise RuntimeError(
+                    "Radial preflight requires runner-created pre_run_gpu.json"
+                )
+            pre_run_gpu = json.loads(pre_run_path.read_text(encoding="utf-8"))
+            pre_run_errors = validate_pre_run_gpu_report(pre_run_gpu)
+            if pre_run_errors:
+                raise RuntimeError(
+                    "invalid Radial pre-run GPU evidence: "
+                    + "; ".join(pre_run_errors)
+                )
+            receipt_path, receipt = verify_radial_install_receipt()
+            verify_radial_runtime_loader_environment(receipt)
+            cached_flashinfer_manifest = Path(
+                receipt["flashinfer_manifest"]["path"]
+            )
+            copied_flashinfer_manifest = (
+                Path(run_dir) / "radial-flashinfer-manifest.json"
+            )
+            if (
+                not copied_flashinfer_manifest.is_file()
+                or copied_flashinfer_manifest.read_bytes()
+                != cached_flashinfer_manifest.read_bytes()
+            ):
+                raise RuntimeError(
+                    "runner-copied FlashInfer manifest differs from audited "
+                    "cache manifest"
+                )
+            flashinfer = load_flashinfer_api(
+                receipt["installed_flashinfer_package_root"]
+            )
+            runtime_dependencies_before_optional_imports = (
+                verify_radial_runtime_loaded_dependencies(receipt)
+            )
+            source_module = load_official_radial_mask_module(
+                receipt["derived_module"]["path"]
+            )
+            radial_state = {
+                "run_dir": run_dir,
+                "pre_run_gpu": pre_run_gpu,
+                "receipt_path": receipt_path,
+                "receipt": receipt,
+                "flashinfer": flashinfer,
+                "source_module": source_module,
+                "commit": RADIAL_COMMIT,
+                "mask_api": RADIAL_MASK_API,
+                "runtime_dependencies_before_optional_imports": (
+                    runtime_dependencies_before_optional_imports
+                ),
+            }
         except Exception as exc:
-            report["errors"].append(f"{module} import failed: {exc!r}")
+            report["errors"].append(
+                f"official Radial Attention early dependency check failed: {exc!r}"
+            )
+            return finish_report(report, output_path)
+
+    radial_restore_failed = False
+    try:
+        try:
+            import torch
+
+            report["cuda_available"] = torch.cuda.is_available()
+            report["torch_cuda"] = torch.version.cuda
+            if torch.cuda.is_available():
+                report["gpu"] = torch.cuda.get_device_name(0)
+                report["compute_capability"] = list(
+                    torch.cuda.get_device_capability(0)
+                )
+            else:
+                report["errors"].append("CUDA is not available to PyTorch")
+        except Exception as exc:
+            report["errors"].append(f"torch import failed: {exc!r}")
+
+        for module in (
+            "cv2",
+            "diffusers",
+            "einops",
+            "flash_attn",
+            "moviepy",
+            "numpy",
+            "omegaconf",
+            "optimum.quanto",
+            "pandas",
+            "safetensors",
+            "scipy",
+            "transformers",
+        ):
+            try:
+                importlib.import_module(module)
+            except Exception as exc:
+                report["errors"].append(f"{module} import failed: {exc!r}")
+    finally:
+        if radial_state is not None:
+            try:
+                radial_state["optional_import_loader_evidence"] = (
+                    restore_radial_loader_after_preloaded_optional_imports(
+                        radial_state["receipt"],
+                        allowed_prepend_paths=(
+                            Path(sys.prefix)
+                            / "lib"
+                            / (
+                                f"python{sys.version_info.major}."
+                                f"{sys.version_info.minor}"
+                            )
+                            / "lib64",
+                        ),
+                    )
+                )
+            except Exception as exc:
+                radial_restore_failed = True
+                report["errors"].append(
+                    "official Radial Attention optional import loader check "
+                    f"failed: {exc!r}"
+                )
+    if radial_restore_failed:
+        return finish_report(report, output_path)
 
     if attention_method == "sparge":
         try:
@@ -139,65 +254,28 @@ def main(output_path=None, attention_method="dense"):
 
     if attention_method == "radial":
         try:
-            from ovi.gpu_process_monitor import validate_pre_run_gpu_report
-            from ovi.modules.radial_attention_backend import (
-                load_flashinfer_api,
-                load_official_radial_mask_module,
-                verify_radial_install_receipt,
-                verify_radial_runtime_loader_environment,
-            )
-            from ovi.radial_evidence import (
-                RADIAL_COMMIT,
-                RADIAL_MASK_API,
-            )
             from scripts.radial_flashinfer_microtest import run_microtest
 
-            run_dir = os.environ.get("FASTA2V_RUN_DIR")
-            pre_run_path = Path(run_dir or "") / "pre_run_gpu.json"
-            if not run_dir or not pre_run_path.is_file():
-                raise RuntimeError(
-                    "Radial preflight requires runner-created pre_run_gpu.json"
-                )
-            pre_run_gpu = json.loads(pre_run_path.read_text(encoding="utf-8"))
-            pre_run_errors = validate_pre_run_gpu_report(pre_run_gpu)
-            if pre_run_errors:
-                raise RuntimeError(
-                    "invalid Radial pre-run GPU evidence: "
-                    + "; ".join(pre_run_errors)
-                )
-
-            receipt_path, receipt = verify_radial_install_receipt()
-            verify_radial_runtime_loader_environment(receipt)
-            cached_flashinfer_manifest = Path(
-                receipt["flashinfer_manifest"]["path"]
-            )
-            copied_flashinfer_manifest = (
-                Path(run_dir) / "radial-flashinfer-manifest.json"
-            )
-            if (
-                not copied_flashinfer_manifest.is_file()
-                or copied_flashinfer_manifest.read_bytes()
-                != cached_flashinfer_manifest.read_bytes()
-            ):
-                raise RuntimeError(
-                    "runner-copied FlashInfer manifest differs from audited "
-                    "cache manifest"
-                )
-            flashinfer = load_flashinfer_api(
-                receipt["installed_flashinfer_package_root"]
-            )
-            source_module = load_official_radial_mask_module(
-                receipt["derived_module"]["path"]
-            )
+            receipt_path = radial_state["receipt_path"]
+            receipt = radial_state["receipt"]
+            flashinfer = radial_state["flashinfer"]
+            source_module = radial_state["source_module"]
+            pre_run_gpu = radial_state["pre_run_gpu"]
             report["radialattn"] = {
-                "pinned_commit": RADIAL_COMMIT,
-                "mask_api": RADIAL_MASK_API,
+                "pinned_commit": radial_state["commit"],
+                "mask_api": radial_state["mask_api"],
                 "install_receipt": str(receipt_path),
                 "install_receipt_contents": receipt,
                 "source_files_verified": True,
                 "flashinfer_files_verified": True,
                 "flashinfer_manifest_verified": True,
                 "runtime_loader_environment_verified": True,
+                "runtime_dependencies_before_optional_imports": radial_state[
+                    "runtime_dependencies_before_optional_imports"
+                ],
+                "optional_import_loader_evidence": radial_state[
+                    "optional_import_loader_evidence"
+                ],
                 "cpu_mask_audits_verified": True,
                 "flashinfer_version": package_version("flashinfer-python"),
                 "flashinfer_apis": {
@@ -209,7 +287,7 @@ def main(output_path=None, attention_method="dense"):
                     )
                 },
                 "derived_mask_api_callable": callable(
-                    getattr(source_module, RADIAL_MASK_API, None)
+                    getattr(source_module, radial_state["mask_api"], None)
                 ),
                 "install_cuda_kernel_launched": False,
                 "preflight_cuda_microtest_required": True,
@@ -276,17 +354,7 @@ def main(output_path=None, attention_method="dense"):
         except Exception as exc:
             report["errors"].append(f"FlashAttention microtest failed: {exc!r}")
 
-    rendered = json.dumps(
-        report,
-        ensure_ascii=False,
-        indent=2,
-        sort_keys=True,
-        allow_nan=False,
-    ) + "\n"
-    if output_path is not None:
-        Path(output_path).write_text(rendered, encoding="utf-8")
-    print(rendered, end="")
-    return 1 if report["errors"] else 0
+    return finish_report(report, output_path)
 
 
 if __name__ == "__main__":

@@ -194,7 +194,10 @@ from ovi.radial_evidence import (
     RADIAL_PROFILE_AUDITS,
     RADIAL_SEQUENCE,
     deterministic_ldd_environment,
+    ldd_resolved_libraries,
     ldd_resolved_library_paths,
+    loaded_shared_object_paths,
+    mapped_library_paths_by_alias,
     normalize_ldd_output,
     radial_ldd_search_paths,
     radial_runtime_loader_environment,
@@ -293,6 +296,7 @@ if unexpected_ld_variables:
         f"{unexpected_ld_variables}"
     )
 ldd_dependencies = {}
+ldd_dependency_aliases = set()
 for installed_path in sorted(flashinfer_package_root.rglob("*")):
     if (
         not installed_path.is_file()
@@ -334,6 +338,14 @@ for installed_path in sorted(flashinfer_package_root.rglob("*")):
                 f"FlashInfer native library resolved no file-backed dependencies: {installed_path}"
             )
         metadata_value["ldd_dependency_paths"] = dependency_paths
+        dependency_libraries = [
+            {"name": alias, "path": path}
+            for alias, path in ldd_resolved_libraries(ldd_output)
+        ]
+        metadata_value["ldd_dependency_libraries"] = dependency_libraries
+        ldd_dependency_aliases.update(
+            item["name"] for item in dependency_libraries
+        )
         for reported_path in dependency_paths:
             dependency_fingerprint = fingerprint(reported_path)
             previous = ldd_dependencies.get(reported_path)
@@ -354,6 +366,31 @@ if not native_flashinfer_files:
 if not ldd_dependencies:
     raise RuntimeError("fixed FlashInfer candidate exposes no file-backed dependencies")
 
+runtime_aliases = ldd_dependency_aliases | {
+    Path(name).name for name in native_flashinfer_files
+}
+mapped_runtime_paths = loaded_shared_object_paths()
+runtime_paths_by_alias = mapped_library_paths_by_alias(
+    runtime_aliases, mapped_runtime_paths
+)
+missing_runtime_aliases = [
+    alias for alias, paths in runtime_paths_by_alias.items() if not paths
+]
+if missing_runtime_aliases:
+    raise RuntimeError(
+        "imported FlashInfer runtime did not map fixed dependency aliases: "
+        f"{missing_runtime_aliases}"
+    )
+runtime_fingerprint_cache = {}
+runtime_loaded_dependencies = {}
+for alias, paths in runtime_paths_by_alias.items():
+    fingerprints = []
+    for mapped_path in paths:
+        if mapped_path not in runtime_fingerprint_cache:
+            runtime_fingerprint_cache[mapped_path] = fingerprint(mapped_path)
+        fingerprints.append(runtime_fingerprint_cache[mapped_path])
+    runtime_loaded_dependencies[alias] = fingerprints
+
 flashinfer_manifest = {
     "schema": FLASHINFER_MANIFEST_SCHEMA,
     "distribution": "flashinfer-python",
@@ -366,6 +403,7 @@ flashinfer_manifest = {
     "ldd_executable": fingerprint(ldd_executable),
     "ldd_search_paths": list(ldd_search_paths),
     "ldd_dependencies": ldd_dependencies,
+    "runtime_loaded_dependencies": runtime_loaded_dependencies,
     "runtime_loader_environment": runtime_loader_environment,
     "package_root": str(flashinfer_package_root),
     "module": fingerprint(flashinfer_module_path),
@@ -408,6 +446,7 @@ receipt = {
     "ldd_executable": fingerprint(ldd_executable),
     "ldd_search_paths": list(ldd_search_paths),
     "ldd_dependencies": ldd_dependencies,
+    "runtime_loaded_dependencies": runtime_loaded_dependencies,
     "runtime_loader_environment": runtime_loader_environment,
     "installed_flashinfer_package_root": str(flashinfer_package_root),
     "flashinfer_module": fingerprint(flashinfer_module_path),

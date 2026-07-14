@@ -132,6 +132,108 @@ def as_int(value):
         return None
 
 
+def expected_radial_runtime_dependency_evidence(receipt):
+    """Summarize the exact runtime ELF inventory bound by a Radial receipt."""
+
+    if not isinstance(receipt, dict):
+        return None
+    inventory = receipt.get("runtime_loaded_dependencies")
+    if not isinstance(inventory, dict) or not inventory:
+        return None
+    mapped_paths = set()
+    for fingerprints in inventory.values():
+        if not isinstance(fingerprints, list) or not fingerprints:
+            return None
+        for metadata in fingerprints:
+            if not isinstance(metadata, dict):
+                return None
+            path = metadata.get("path")
+            if not isinstance(path, str) or not path:
+                return None
+            mapped_paths.add(path)
+    canonical = json.dumps(
+        inventory,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        "status": "ok",
+        "aliases": len(inventory),
+        "mapped_files": len(mapped_paths),
+        "inventory_sha256": hashlib.sha256(canonical).hexdigest(),
+    }
+
+
+def validate_radial_runtime_dependency_evidence(
+    evidence,
+    expected,
+    context,
+    errors,
+):
+    """Require one runtime mapping summary to equal the copied receipt."""
+
+    if not isinstance(evidence, dict):
+        errors.append(f"{context}: runtime dependency evidence is missing")
+        return
+    if set(evidence) != {
+        "status",
+        "aliases",
+        "mapped_files",
+        "inventory_sha256",
+    }:
+        errors.append(f"{context}: runtime dependency fields are invalid")
+    if expected is None:
+        errors.append(f"{context}: copied receipt has no runtime inventory")
+    elif evidence != expected:
+        errors.append(
+            f"{context}: runtime dependency evidence differs from copied receipt"
+        )
+
+
+def validate_radial_optional_import_loader_evidence(
+    evidence,
+    expected_runtime,
+    expected_removed_path,
+    context,
+    errors,
+):
+    """Validate the only loader mutation permitted for the fixed OpenCV build."""
+
+    if not isinstance(evidence, dict):
+        errors.append(f"{context}: optional-import loader evidence is missing")
+        return
+    if set(evidence) != {
+        "status",
+        "restored",
+        "removed_prepend_paths",
+        "runtime_dependencies",
+    }:
+        errors.append(f"{context}: optional-import loader fields are invalid")
+    if evidence.get("status") != "ok" or evidence.get("restored") is not True:
+        errors.append(f"{context}: audited loader environment was not restored")
+    validate_radial_runtime_dependency_evidence(
+        evidence.get("runtime_dependencies"),
+        expected_runtime,
+        f"{context}.runtime_dependencies",
+        errors,
+    )
+    removed = evidence.get("removed_prepend_paths")
+    if not isinstance(removed, list) or len(removed) != 1:
+        errors.append(
+            f"{context}: expected exactly one OpenCV loader prepend path"
+        )
+        return
+    removed_path = removed[0]
+    if not isinstance(removed_path, str) or not removed_path:
+        errors.append(f"{context}: removed loader prepend path is invalid")
+        return
+    if str(Path(removed_path).resolve()) != str(Path(expected_removed_path).resolve()):
+        errors.append(
+            f"{context}: removed loader prepend path is not the fixed env lib64"
+        )
+
+
 def validate_pre_run_gpu(report, environment, errors):
     """Validate idle evidence and return its physical-GPU identity tuple."""
     if not isinstance(report, dict):
@@ -458,7 +560,16 @@ def validate_radial_dispatcher(
     receipt_summary = details.get("install_receipt")
     if not isinstance(receipt_summary, dict):
         errors.append(f"{context}: Radial backend receipt summary is missing")
-    elif expected_receipt is not None:
+    else:
+        runtime_after_cuda = details.get(
+            "runtime_dependencies_after_first_cuda"
+        )
+        if runtime_after_cuda != receipt_summary.get("runtime_dependencies"):
+            errors.append(
+                f"{context}: Radial runtime dependencies after first CUDA "
+                "call differ from the build-time receipt inventory"
+            )
+    if isinstance(receipt_summary, dict) and expected_receipt is not None:
         expected_summary = {
             "path": str(Path(expected_receipt["_copied_path"]).resolve()),
             "commit": expected_receipt.get("commit"),
@@ -466,6 +577,9 @@ def validate_radial_dispatcher(
                 "derived_module", {}
             ).get("sha256"),
             "flashinfer_version": expected_receipt.get("flashinfer_version"),
+            "runtime_dependencies": (
+                expected_radial_runtime_dependency_evidence(expected_receipt)
+            ),
         }
         # The backend reads the cache receipt rather than the copied evidence;
         # bind immutable contents but allow its original cache path.
@@ -1093,6 +1207,12 @@ def verify_run_protocol(run_dir, reports):
             errors.append(f"invalid copied Radial receipt: {exc}")
         for error in radial_receipt_evidence_errors(copied_receipt):
             errors.append(f"copied Radial receipt: {error}")
+        expected_runtime_dependencies = (
+            expected_radial_runtime_dependency_evidence(copied_receipt)
+        )
+        expected_optional_import_path = (
+            "/cache/liluchen/FastA2V/envs/ovi/lib/python3.11/lib64"
+        )
 
         copied_artifacts = {
             "source_module": run_dir / "radial-attention-source.py",
@@ -1176,16 +1296,81 @@ def verify_run_protocol(run_dir, reports):
                     )
             if preflight_radial.get("install_receipt_contents") != copied_receipt:
                 errors.append("preflight Radial receipt differs from copied receipt")
+            validate_radial_runtime_dependency_evidence(
+                preflight_radial.get(
+                    "runtime_dependencies_before_optional_imports"
+                ),
+                expected_runtime_dependencies,
+                "preflight Radial before optional imports",
+                errors,
+            )
+            validate_radial_optional_import_loader_evidence(
+                preflight_radial.get("optional_import_loader_evidence"),
+                expected_runtime_dependencies,
+                expected_optional_import_path,
+                "preflight Radial optional imports",
+                errors,
+            )
         expected_gpu_uuid = (
             expected_gpu_identity[1]
             if expected_gpu_identity is not None
             else None
         )
+        preflight_microtest = preflight.get("radialattn_microtest")
         for error in radial_microtest_evidence_errors(
-            preflight.get("radialattn_microtest"),
+            preflight_microtest,
             expected_gpu_uuid=expected_gpu_uuid,
         ):
             errors.append(f"Radial preflight microtest: {error}")
+        if isinstance(preflight_microtest, dict):
+            for phase in ("before_cuda", "after_cuda"):
+                validate_radial_runtime_dependency_evidence(
+                    preflight_microtest.get(
+                        f"runtime_dependencies_{phase}"
+                    ),
+                    expected_runtime_dependencies,
+                    f"Radial preflight microtest {phase}",
+                    errors,
+                )
+
+        inference_bootstrap = environment.get("radial_loader_bootstrap")
+        if not isinstance(inference_bootstrap, dict):
+            errors.append(
+                "environment is missing Radial inference loader bootstrap evidence"
+            )
+        else:
+            if set(inference_bootstrap) != {
+                "status",
+                "receipt_path",
+                "before_optional_imports",
+                "after_optional_imports",
+            }:
+                errors.append(
+                    "environment Radial loader bootstrap fields are invalid"
+                )
+            if inference_bootstrap.get("status") != "ok":
+                errors.append(
+                    "environment Radial loader bootstrap status is not ok"
+                )
+            if inference_bootstrap.get("receipt_path") != (
+                "/cache/liluchen/FastA2V/radialattn-install.json"
+            ):
+                errors.append(
+                    "environment Radial loader bootstrap used the wrong receipt"
+                )
+            validate_radial_runtime_dependency_evidence(
+                inference_bootstrap.get("before_optional_imports"),
+                expected_runtime_dependencies,
+                "environment Radial before optional imports",
+                errors,
+            )
+            validate_radial_optional_import_loader_evidence(
+                inference_bootstrap.get("after_optional_imports"),
+                expected_runtime_dependencies,
+                expected_optional_import_path,
+                "environment Radial optional imports",
+                errors,
+            )
 
         expected_settings = {
             "profile": environment.get("radial_profile"),
