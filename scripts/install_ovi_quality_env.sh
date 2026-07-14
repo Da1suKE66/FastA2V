@@ -343,6 +343,8 @@ EVAL_PIP_CACHE_DIR="${PIP_CACHE_DIR}" \
 EVAL_PIP_NETWORK_TIMEOUT_SECONDS="${PIP_NETWORK_TIMEOUT_SECONDS}" \
 EVAL_PIP_NETWORK_RETRIES="${PIP_NETWORK_RETRIES}" \
 "${EVAL_ENV}/bin/python" -I -B - <<'PY'
+import base64
+import csv
 import hashlib
 import importlib
 import importlib.metadata
@@ -354,6 +356,7 @@ import re
 import subprocess
 import sys
 from urllib.parse import unquote, urlparse
+import zipfile
 
 from pip._vendor.packaging.utils import canonicalize_name, parse_wheel_filename
 
@@ -603,10 +606,113 @@ for distribution in sorted(archive_receipts):
         )
     packages.append(package)
 
-pyc_files = [path for path in site_packages.rglob("*.pyc") if path.is_file()]
+def authenticated_wheel_bytecode(package):
+    archive_path = Path(package["archive_path"])
+    context = f"retained wheel for {package['distribution']}"
+    try:
+        with zipfile.ZipFile(archive_path) as wheel:
+            record_names = [
+                name
+                for name in wheel.namelist()
+                if name.endswith(".dist-info/RECORD")
+            ]
+            if len(record_names) != 1:
+                raise SystemExit(
+                    f"{context} contains {len(record_names)} RECORD files"
+                )
+            rows = list(
+                csv.reader(
+                    wheel.read(record_names[0]).decode("utf-8").splitlines()
+                )
+            )
+    except (OSError, zipfile.BadZipFile, KeyError, UnicodeDecodeError, csv.Error) as exc:
+        raise SystemExit(f"cannot audit bytecode ownership in {context}: {exc}") from exc
+    owned = set()
+    for row_number, row in enumerate(rows, start=1):
+        if len(row) != 3:
+            raise SystemExit(
+                f"{context} RECORD row {row_number} does not have three fields"
+            )
+        relative_path, encoded_hash, size_text = row
+        member_path = Path(relative_path)
+        if member_path.suffix not in {".pyc", ".pyo"}:
+            continue
+        components = member_path.parts
+        if len(components) >= 3 and components[0].endswith(".data"):
+            if components[1] not in {"purelib", "platlib"}:
+                raise SystemExit(
+                    f"{context} contains executable bytecode outside site-packages: "
+                    f"{relative_path}"
+                )
+            installed_path = (site_packages / Path(*components[2:])).resolve()
+        else:
+            installed_path = (site_packages / member_path).resolve()
+        try:
+            installed_path.relative_to(site_packages)
+        except ValueError as exc:
+            raise SystemExit(
+                f"{context} bytecode escapes fixed site-packages: {relative_path}"
+            ) from exc
+        if not encoded_hash or not size_text:
+            raise SystemExit(
+                f"{context} bytecode is not hash-bound: {relative_path}"
+            )
+        try:
+            algorithm, encoded_digest = encoded_hash.split("=", 1)
+            expected_size = int(size_text)
+            padding = "=" * (-len(encoded_digest) % 4)
+            expected_hash = base64.urlsafe_b64decode(
+                encoded_digest + padding
+            ).hex()
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(
+                f"{context} bytecode RECORD is malformed: {relative_path}"
+            ) from exc
+        if algorithm != "sha256" or expected_size < 0:
+            raise SystemExit(
+                f"{context} bytecode RECORD is unsupported: {relative_path}"
+            )
+        if installed_path.is_symlink() or not installed_path.is_file():
+            raise SystemExit(
+                f"{context} bytecode is missing or non-regular: {installed_path}"
+            )
+        if installed_path.stat().st_size != expected_size:
+            raise SystemExit(
+                f"{context} bytecode size drifted: {installed_path}"
+            )
+        if sha256(installed_path) != expected_hash:
+            raise SystemExit(
+                f"{context} bytecode SHA256 drifted: {installed_path}"
+            )
+        if installed_path in owned:
+            raise SystemExit(
+                f"{context} claims duplicate bytecode: {installed_path}"
+            )
+        owned.add(installed_path)
+    return owned
+
+
+expected_bytecode = set()
+for package in packages:
+    package_bytecode = authenticated_wheel_bytecode(package)
+    overlap = expected_bytecode.intersection(package_bytecode)
+    if overlap:
+        raise SystemExit(
+            f"two retained wheels claim the same bytecode: {sorted(overlap)[:3]}"
+        )
+    expected_bytecode.update(package_bytecode)
+actual_bytecode = {
+    path.resolve()
+    for path in site_packages.rglob("*")
+    if path.is_file() and path.suffix in {".pyc", ".pyo"}
+}
 symlinks = [path for path in site_packages.rglob("*") if path.is_symlink()]
-if pyc_files:
-    raise SystemExit(f"--no-compile invariant failed; found bytecode: {pyc_files[:3]}")
+if actual_bytecode != expected_bytecode:
+    raise SystemExit(
+        "fixed eval bytecode differs from the exact hash-bound wheel members; "
+        f"missing={sorted(expected_bytecode - actual_bytecode)[:3]}, "
+        f"extra={sorted(actual_bytecode - expected_bytecode)[:3]}"
+    )
 if symlinks:
     raise SystemExit(f"site-packages symlinks are forbidden: {symlinks[:3]}")
 

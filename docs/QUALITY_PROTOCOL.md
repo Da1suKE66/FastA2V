@@ -125,8 +125,9 @@ the same fixed cache, `--no-index`, and `--no-deps`; it verifies every full
 hash, then asks pip to install the retained wheels with a hash-required
 requirements file. The comparator then checks the exact installed
 distribution set, every retained wheel and `RECORD`, all files in
-site-packages (including rejection of `.pyc`, unowned files, and symlinks), the
-fixed direct module paths/versions, and both weights before and after scoring.
+site-packages (including rejection of unowned bytecode, other unowned files,
+and symlinks), the fixed direct module paths/versions, and both weights before
+and after scoring.
 
 Validate the reproduced environment without computing a metric:
 
@@ -165,8 +166,11 @@ median.quality.json
 
 `-I -S -B` is mandatory: user site and environment variables are ignored,
 automatic site processing is disabled until the complete tree passes its
-pre-import audit, and Python bytecode is neither read from nor written to the
-fixed environment. Each pair sidecar binds both artifacts and both run identities, including
+pre-import audit. Python never reads generated or unowned bytecode and never
+writes bytecode. A bytecode member already present in an exact retained wheel
+is accepted only when both wheel and installed `RECORD` bind its size and full
+SHA256; NumPy 1.26.4 contains one such reviewed member.
+Each pair sidecar binds both artifacts and both run identities, including
 commit, checkpoint hashes, prompt, seed, shapes, steps, acceleration environment,
 `environment.json`, dependency receipt, evaluator commit/matrix/script hashes,
 and absolute FFmpeg/FFprobe paths and hashes. Every paired MP4, its metrics

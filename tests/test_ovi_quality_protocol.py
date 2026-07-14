@@ -1240,6 +1240,9 @@ class QualityProtocolTests(unittest.TestCase):
         wheel = wheelhouse / "record_probe-1.0-py3-none-any.whl"
         files = {
             "record_probe/__init__.py": b"VALUE = 1\n",
+            "record_probe/__pycache__/trusted.cpython-311.pyc": (
+                b"hash-bound-wheel-bytecode"
+            ),
             "record_probe-1.0.dist-info/METADATA": (
                 b"Metadata-Version: 2.1\nName: record-probe\nVersion: 1.0\n"
             ),
@@ -1302,6 +1305,27 @@ class QualityProtocolTests(unittest.TestCase):
                 environment_root.resolve(),
             ),
             [],
+        )
+        extra_pyc = (
+            site_packages
+            / "record_probe"
+            / "__pycache__"
+            / "extra.cpython-311.pyc"
+        )
+        extra_pyc.write_bytes(b"unowned-bytecode")
+        self.assertTrue(
+            any(
+                "unowned compiled bytecode" in error
+                for error in QUALITY._site_packages_tree_errors(
+                    [
+                        {
+                            "archive_path": str(wheel),
+                            "record_path": str(installed_record),
+                        }
+                    ],
+                    environment_root.resolve(),
+                )
+            )
         )
 
     def test_run_validator_source_is_hash_bound(self):
@@ -1370,6 +1394,8 @@ class QualityProtocolTests(unittest.TestCase):
         self.assertIn('"--no-deps",\n        "--only-binary=:all:",\n        "--no-index",', source)
         self.assertIn("materialized wheelhouse differs from the exact pip reports", source)
         self.assertIn("materialized wheel hash differs from pip report", source)
+        self.assertIn("authenticated_wheel_bytecode", source)
+        self.assertIn("exact hash-bound wheel members", source)
         self.assertIn(
             "materialized pinned wheelhouse differs from the reviewed lock",
             source,

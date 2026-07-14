@@ -754,10 +754,17 @@ def _site_packages_tree_errors(
         if path.is_dir():
             continue
         resolved = path.resolve()
-        if resolved.suffix == ".pyc" or "__pycache__" in resolved.parts:
-            errors.append(f"compiled bytecode is forbidden in fixed eval env: {resolved}")
-            continue
         if resolved in allowed:
+            # Some reviewed upstream wheels (notably NumPy 1.26.4) ship a
+            # precompiled module as a hashed wheel member.  It is executable
+            # code, but it is not the unauthenticated bytecode that --no-compile
+            # and -B are intended to exclude: the retained wheel SHA, wheel
+            # RECORD, installed RECORD, size, and file SHA all bind it exactly.
+            continue
+        if resolved.suffix in {".pyc", ".pyo"} or "__pycache__" in resolved.parts:
+            errors.append(
+                f"unowned compiled bytecode is forbidden in fixed eval env: {resolved}"
+            )
             continue
         expected_bytes = generated_metadata.get(resolved)
         if expected_bytes is None:
