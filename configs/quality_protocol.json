@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "protocol_id": "ovi_720x720_5s_dense_pair_quality_v1",
+  "description": "Pair each formal candidate measurement with the same-index formal dense artifact and compute decoded-media metrics without inventing acceptance thresholds.",
+  "reference_method_id": "dense",
+  "measurement_indices": [
+    0,
+    1,
+    2
+  ],
+  "pairing_key": "measurement_index",
+  "require_artifact_sha256_before_and_after_metrics": true,
+  "required_same_across_runs": [
+    "git_commit",
+    "checkpoint_fingerprint_sha256",
+    "gpu_identity",
+    "prompt",
+    "seed",
+    "requested_shape",
+    "actual_shape",
+    "generated_video_shape",
+    "generated_audio_shape",
+    "sample_steps"
+  ],
+  "media_metrics": {
+    "implementation": "scripts/compare_media.py",
+    "frame_policy": "exact_all_decoded_frames",
+    "video_filters": [
+      "psnr",
+      "ssim"
+    ],
+    "audio_decode": {
+      "channels": 1,
+      "sample_rate_hz": 16000,
+      "sample_format": "f32le",
+      "sample_count_policy": "exact"
+    },
+    "audio_metrics": [
+      "rmse",
+      "max_abs_difference",
+      "snr_db",
+      "correlation"
+    ],
+    "automatic_acceptance_thresholds": null
+  },
+  "lpips": {
+    "implementation": "lpips.LPIPS",
+    "network": "alex",
+    "model_version": "0.1",
+    "device": "cpu",
+    "spatial": false,
+    "batch_size": 1,
+    "torch_num_threads": 1,
+    "torch_num_interop_threads": 1,
+    "torch_deterministic_algorithms": true,
+    "torch_mkldnn_enabled": false,
+    "input_range": "[-1,1]",
+    "frame_policy": "exact_all_decoded_rgb24_frames",
+    "python_executable": "/cache/liluchen/FastA2V/envs/eval/bin/python",
+    "environment_root": "/cache/liluchen/FastA2V/envs/eval",
+    "torch_home": "/cache/liluchen/FastA2V/checkpoints/eval/torch",
+    "receipt_path": "/cache/liluchen/FastA2V/checkpoints/eval/lpips_alex_v0.1_receipt.json",
+    "trusted_lock_status": "bootstrap_unpinned",
+    "trusted_environment_lock_sha256": null,
+    "trusted_environment_packages": null,
+    "packages": [
+      {
+        "distribution": "torch",
+        "version": "2.6.0+cpu",
+        "module": "torch",
+        "module_path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/torch/__init__.py",
+        "source_index": "https://download.pytorch.org/whl/cpu",
+        "trusted_archive_sha256": null
+      },
+      {
+        "distribution": "torchvision",
+        "version": "0.21.0+cpu",
+        "module": "torchvision",
+        "module_path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/torchvision/__init__.py",
+        "source_index": "https://download.pytorch.org/whl/cpu",
+        "trusted_archive_sha256": null
+      },
+      {
+        "distribution": "lpips",
+        "version": "0.1.4",
+        "module": "lpips",
+        "module_path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/lpips/__init__.py",
+        "source_index": "https://pypi.org/simple",
+        "trusted_archive_sha256": null
+      },
+      {
+        "distribution": "numpy",
+        "version": "1.26.4",
+        "module": "numpy",
+        "module_path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/numpy/__init__.py",
+        "source_index": "https://pypi.org/simple",
+        "trusted_archive_sha256": null
+      },
+      {
+        "distribution": "scipy",
+        "version": "1.13.1",
+        "module": "scipy",
+        "module_path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/scipy/__init__.py",
+        "source_index": "https://pypi.org/simple",
+        "trusted_archive_sha256": null
+      },
+      {
+        "distribution": "tqdm",
+        "version": "4.67.1",
+        "module": "tqdm",
+        "module_path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/tqdm/__init__.py",
+        "source_index": "https://pypi.org/simple",
+        "trusted_archive_sha256": null
+      },
+      {
+        "distribution": "pillow",
+        "version": "11.1.0",
+        "module": "PIL",
+        "module_path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/PIL/__init__.py",
+        "source_index": "https://pypi.org/simple",
+        "trusted_archive_sha256": null
+      }
+    ],
+    "weights": [
+      {
+        "weight_id": "lpips_alex_v0.1_linear",
+        "path": "/cache/liluchen/FastA2V/envs/eval/lib/python3.11/site-packages/lpips/weights/v0.1/alex.pth",
+        "source_type": "installed_package",
+        "source": "https://pypi.org/project/lpips/0.1.4/",
+        "source_distribution": "lpips",
+        "source_version": "0.1.4",
+        "trusted_sha256": null
+      },
+      {
+        "weight_id": "torchvision_alexnet_owt",
+        "path": "/cache/liluchen/FastA2V/checkpoints/eval/torch/hub/checkpoints/alexnet-owt-7be5be79.pth",
+        "source_type": "url",
+        "source": "https://download.pytorch.org/models/alexnet-owt-7be5be79.pth",
+        "sha256_prefix": "7be5be79",
+        "trusted_sha256": null
+      }
+    ]
+  },
+  "manual_reviews": {
+    "template": "eval/manual_sync_reviews.csv",
+    "fields": [
+      "measurement_index",
+      "dense_artifact_sha256",
+      "candidate_artifact_sha256",
+      "reviewer",
+      "reviewed_at_utc",
+      "sync_rating",
+      "notes"
+    ],
+    "required_human_fields": [
+      "reviewer",
+      "reviewed_at_utc",
+      "sync_rating"
+    ],
+    "allowed_sync_ratings": [
+      "pass",
+      "fail",
+      "uncertain"
+    ],
+    "row_policy": "zero_rows_or_all_measurements",
+    "candidate_hash_binding_required": true,
+    "automatic_population_forbidden": true
+  }
+}

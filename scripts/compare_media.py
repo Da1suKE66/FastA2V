@@ -20,10 +20,10 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def decode_audio(path):
+def decode_audio(path, *, ffmpeg="ffmpeg"):
     process = subprocess.run(
         [
-            "ffmpeg",
+            str(ffmpeg),
             "-v",
             "error",
             "-i",
@@ -45,10 +45,10 @@ def decode_audio(path):
     return np.frombuffer(process.stdout, dtype="<f4").astype(np.float64)
 
 
-def probe_video(path):
+def probe_video(path, *, ffprobe="ffprobe"):
     process = subprocess.run(
         [
-            "ffprobe",
+            str(ffprobe),
             "-v",
             "error",
             "-count_frames",
@@ -81,11 +81,11 @@ def probe_video(path):
     }
 
 
-def decode_tail_gray(path, frame_count):
+def decode_tail_gray(path, frame_count, *, ffmpeg="ffmpeg"):
     start = max(frame_count - 2, 0)
     process = subprocess.run(
         [
-            "ffmpeg",
+            str(ffmpeg),
             "-v",
             "error",
             "-i",
@@ -115,13 +115,21 @@ def decode_tail_gray(path, frame_count):
     return raw.reshape(2, 64, 64).astype(np.float64)
 
 
-def tail_psnr(path, frame_count):
-    frames = decode_tail_gray(path, frame_count)
+def tail_psnr(path, frame_count, *, ffmpeg="ffmpeg"):
+    frames = decode_tail_gray(path, frame_count, ffmpeg=ffmpeg)
     mse = float(np.mean(np.square(frames[0] - frames[1])))
     return math.inf if mse == 0.0 else float(10.0 * math.log10(255.0**2 / mse))
 
 
-def ffmpeg_metric(reference, candidate, frame_count, filter_name, pattern):
+def ffmpeg_metric(
+    reference,
+    candidate,
+    frame_count,
+    filter_name,
+    pattern,
+    *,
+    ffmpeg="ffmpeg",
+):
     filter_graph = (
         f"[0:v:0]trim=end_frame={frame_count},setpts=PTS-STARTPTS[reference];"
         f"[1:v:0]trim=end_frame={frame_count},setpts=PTS-STARTPTS[candidate];"
@@ -129,7 +137,7 @@ def ffmpeg_metric(reference, candidate, frame_count, filter_name, pattern):
     )
     process = subprocess.run(
         [
-            "ffmpeg",
+            str(ffmpeg),
             "-v",
             "info",
             "-i",
