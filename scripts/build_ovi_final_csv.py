@@ -907,12 +907,12 @@ def _validate_lpips_disk_receipt(
     )
 
     installer_reports = raw.get("installer_reports")
+    expected_report_path = receipt_path.parent / "quality-pinned-pip-report.json"
     _require(
-        isinstance(installer_reports, list) and len(installer_reports) == 3,
+        isinstance(installer_reports, list) and len(installer_reports) == 1,
         context,
-        "receipt must bind the three fixed pip reports",
+        "formal final receipt must bind exactly one pinned pip report",
     )
-    report_paths: set[Path] = set()
     for offset, report in enumerate(installer_reports):
         report_context = f"{context} installer report {offset}"
         _require(
@@ -921,8 +921,11 @@ def _validate_lpips_disk_receipt(
             "installer report binding changed",
         )
         report_snapshot = registry.file(report.get("path"), report_context)
-        _require(report_snapshot.path not in report_paths, report_context, "duplicate installer report")
-        report_paths.add(report_snapshot.path)
+        _require(
+            report_snapshot.path == expected_report_path,
+            report_context,
+            "installer report is not the fixed pinned pip report",
+        )
         _require(
             report_snapshot.sha256
             == _sha(report.get("sha256"), report_context, "sha256"),

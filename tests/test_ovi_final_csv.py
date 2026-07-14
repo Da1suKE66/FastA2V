@@ -87,11 +87,10 @@ def make_pinned_protocol_fixture(root: Path) -> tuple[Path, dict]:
         "source": "https://example.invalid/fake-weight.pth",
         "trusted_sha256": digest(weight_path),
     }
-    report_paths = []
-    for index in range(3):
-        report_path = cache_root / "reports" / f"pip-{index}.json"
-        write_json(report_path, {"version": "1", "install": []})
-        report_paths.append(report_path)
+    report_path = (
+        cache_root / "checkpoints" / "eval" / "quality-pinned-pip-report.json"
+    )
+    write_json(report_path, {"version": "1", "install": []})
     raw_package = {
         **lock[0],
         "archive_path": str(archive_path),
@@ -124,7 +123,7 @@ def make_pinned_protocol_fixture(root: Path) -> tuple[Path, dict]:
         },
         "environment_lock_sha256": lock_sha,
         "installer_reports": [
-            {"path": str(path), "sha256": digest(path)} for path in report_paths
+            {"path": str(report_path), "sha256": digest(report_path)}
         ],
         "packages": [raw_package],
         "weights": [raw_weight],
@@ -753,6 +752,24 @@ class OviFinalCsvTests(unittest.TestCase):
             output=output or self.fixture.output_path,
         )
 
+    def validate_lpips_disk_receipt(self, inline: dict | None = None) -> dict:
+        protocol = json.loads(self.protocol_path.read_text(encoding="utf-8"))
+        return FINAL._validate_lpips_disk_receipt(
+            inline if inline is not None else dict(self.lpips_inline),
+            protocol["lpips"],
+            FINAL.SnapshotRegistry(),
+            "test LPIPS receipt",
+        )
+
+    def rewrite_raw_lpips_receipt(self, installer_reports: list[dict]) -> dict:
+        receipt_path = Path(self.lpips_inline["receipt_path"])
+        raw = json.loads(receipt_path.read_text(encoding="utf-8"))
+        raw["installer_reports"] = installer_reports
+        write_json(receipt_path, raw)
+        inline = dict(self.lpips_inline)
+        inline["receipt_sha256"] = digest(receipt_path)
+        return inline
+
     def test_complete_real_schema_fixture_produces_exact_a_to_f(self):
         output = self.build()
         for patched in self.started_patches[2:]:
@@ -785,6 +802,69 @@ class OviFinalCsvTests(unittest.TestCase):
             candidate["manual_validation_sha256"],
             digest(self.fixture.manual_paths["dense_cfg_cache"]),
         )
+
+    def test_pinned_single_report_receipt_is_accepted(self):
+        self.assertEqual(
+            self.validate_lpips_disk_receipt(),
+            self.lpips_inline,
+        )
+
+    def test_bootstrap_three_report_receipt_is_rejected_for_formal_final(self):
+        receipt_path = Path(self.lpips_inline["receipt_path"])
+        reports = []
+        for name in (
+            "quality-bootstrap-pip-report.json",
+            "quality-core-pip-report.json",
+            "quality-lpips-pip-report.json",
+        ):
+            path = receipt_path.parent / name
+            write_json(path, {"version": "1", "install": []})
+            reports.append({"path": str(path), "sha256": digest(path)})
+        inline = self.rewrite_raw_lpips_receipt(reports)
+        with self.assertRaisesRegex(
+            FINAL.FinalCsvError,
+            "exactly one pinned pip report",
+        ):
+            self.validate_lpips_disk_receipt(inline)
+
+    def test_pinned_report_wrong_path_is_rejected_even_with_valid_hash(self):
+        wrong_path = self.root / "wrong-pinned-pip-report.json"
+        write_json(wrong_path, {"version": "1", "install": []})
+        inline = self.rewrite_raw_lpips_receipt(
+            [{"path": str(wrong_path), "sha256": digest(wrong_path)}]
+        )
+        with self.assertRaisesRegex(
+            FINAL.FinalCsvError,
+            "not the fixed pinned pip report",
+        ):
+            self.validate_lpips_disk_receipt(inline)
+
+    def test_pinned_report_hash_drift_is_rejected(self):
+        receipt_path = Path(self.lpips_inline["receipt_path"])
+        raw = json.loads(receipt_path.read_text(encoding="utf-8"))
+        report_path = Path(raw["installer_reports"][0]["path"])
+        write_json(report_path, {"version": "1", "install": ["drift"]})
+        with self.assertRaisesRegex(
+            FINAL.FinalCsvError,
+            "installer report SHA256 drifted",
+        ):
+            self.validate_lpips_disk_receipt()
+
+    def test_missing_or_extra_pinned_reports_are_rejected(self):
+        receipt_path = Path(self.lpips_inline["receipt_path"])
+        canonical = receipt_path.parent / "quality-pinned-pip-report.json"
+        extra = receipt_path.parent / "quality-pinned-pip-report-extra.json"
+        write_json(extra, {"version": "1", "install": []})
+        canonical_binding = {"path": str(canonical), "sha256": digest(canonical)}
+        extra_binding = {"path": str(extra), "sha256": digest(extra)}
+        for reports in ([], [canonical_binding, extra_binding]):
+            with self.subTest(report_count=len(reports)):
+                inline = self.rewrite_raw_lpips_receipt(reports)
+                with self.assertRaisesRegex(
+                    FINAL.FinalCsvError,
+                    "exactly one pinned pip report",
+                ):
+                    self.validate_lpips_disk_receipt(inline)
 
     def test_refuses_to_overwrite_complete_output(self):
         self.build()

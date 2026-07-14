@@ -137,7 +137,10 @@ requirements file. The comparator then checks the exact installed
 distribution set, every retained wheel and `RECORD`, all files in
 site-packages (including rejection of unowned bytecode, other unowned files,
 and symlinks), the fixed direct module paths/versions, and both weights before
-and after scoring.
+and after scoring. The formal final-table merger additionally requires the raw
+dependency receipt to bind exactly the fixed
+`quality-pinned-pip-report.json`; the three bootstrap reports are promotion
+evidence only and cannot be used for formal final publication.
 
 Validate the reproduced environment without computing a metric:
 
