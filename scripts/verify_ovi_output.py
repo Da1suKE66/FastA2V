@@ -5,9 +5,13 @@ import argparse
 import hashlib
 import json
 import math
+import os
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -62,6 +66,267 @@ SPARGE_PROVENANCE = {
     "tensor_layout": "NHD",
     "return_sparsity": False,
 }
+
+
+class EvidenceSnapshotError(ValueError):
+    """Raised when a persisted evidence file cannot be read immutably."""
+
+
+class _StableFileSnapshot:
+    """One no-follow regular-file read plus identity for final revalidation."""
+
+    __slots__ = (
+        "path",
+        "data",
+        "sha256",
+        "device",
+        "inode",
+        "size",
+        "mtime_ns",
+        "ctime_ns",
+    )
+
+    def __init__(self, path, data, metadata):
+        self.path = Path(path)
+        self.data = data
+        self.sha256 = hashlib.sha256(data).hexdigest()
+        self.device = metadata.st_dev
+        self.inode = metadata.st_ino
+        self.size = metadata.st_size
+        self.mtime_ns = metadata.st_mtime_ns
+        self.ctime_ns = metadata.st_ctime_ns
+
+
+class _AbsentPathGuard:
+    """Publication guard requiring a path to remain absent."""
+
+    __slots__ = ("path",)
+
+    def __init__(self, path):
+        self.path = _canonical_leaf_path(path)
+
+
+def _snapshot_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _stable_file_snapshot(path):
+    """Read one regular file without following symlinks or accepting replacement."""
+
+    path = Path(path)
+    try:
+        initial_entry = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise EvidenceSnapshotError(
+            f"cannot stat evidence file {path}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(initial_entry.st_mode):
+        raise EvidenceSnapshotError(f"evidence file must not be a symlink: {path}")
+    if not stat.S_ISREG(initial_entry.st_mode):
+        raise EvidenceSnapshotError(f"evidence file must be a regular file: {path}")
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise EvidenceSnapshotError(
+            f"cannot open no-follow evidence file {path}: {exc}"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise EvidenceSnapshotError(
+                f"opened evidence is not a regular file: {path}"
+            )
+        if _snapshot_identity(before) != _snapshot_identity(initial_entry):
+            raise EvidenceSnapshotError(f"evidence file changed before read: {path}")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+
+    if _snapshot_identity(after) != _snapshot_identity(before):
+        raise EvidenceSnapshotError(f"evidence file changed while being read: {path}")
+    if len(data) != after.st_size:
+        raise EvidenceSnapshotError(
+            f"evidence byte count changed while being read: {path}"
+        )
+    try:
+        final_entry = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise EvidenceSnapshotError(
+            f"cannot re-stat evidence file {path}: {exc}"
+        ) from exc
+    if (
+        not stat.S_ISREG(final_entry.st_mode)
+        or _snapshot_identity(final_entry) != _snapshot_identity(after)
+    ):
+        raise EvidenceSnapshotError(
+            f"evidence file was replaced while being read: {path}"
+        )
+    return _StableFileSnapshot(path, data, after)
+
+
+def _revalidate_snapshot(snapshot):
+    try:
+        current = os.stat(snapshot.path, follow_symlinks=False)
+    except OSError as exc:
+        raise EvidenceSnapshotError(
+            f"cannot revalidate evidence file {snapshot.path}: {exc}"
+        ) from exc
+    expected = (
+        snapshot.device,
+        snapshot.inode,
+        snapshot.size,
+        snapshot.mtime_ns,
+        snapshot.ctime_ns,
+    )
+    if not stat.S_ISREG(current.st_mode) or _snapshot_identity(current) != expected:
+        raise EvidenceSnapshotError(
+            "evidence file changed after its stable byte snapshot: "
+            f"{snapshot.path}"
+        )
+
+
+def _revalidate_publication_guard(guard):
+    if isinstance(guard, _AbsentPathGuard):
+        if os.path.lexists(guard.path):
+            raise EvidenceSnapshotError(
+                f"guarded absent evidence path appeared: {guard.path}"
+            )
+        return
+    _revalidate_snapshot(guard)
+
+
+def _snapshot_jsonl(path):
+    snapshot = _stable_file_snapshot(path)
+    try:
+        lines = snapshot.data.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise EvidenceSnapshotError(
+            f"cannot decode UTF-8 JSONL from {path}: {exc}"
+        ) from exc
+    records = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            raise EvidenceSnapshotError(
+                f"blank JSONL record at {path}:{line_number}"
+            )
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise EvidenceSnapshotError(
+                f"invalid JSON at {path}:{line_number}: {exc}"
+            ) from exc
+        if not isinstance(record, dict):
+            raise EvidenceSnapshotError(
+                f"record at {path}:{line_number} is not an object"
+            )
+        records.append(record)
+    return snapshot, records
+
+
+def _canonical_leaf_path(path):
+    """Canonicalize the parent while deliberately not following the leaf."""
+
+    path = Path(path)
+    return path.parent.resolve(strict=True) / path.name
+
+
+def _json_from_snapshot(snapshot, context=None):
+    context = context or str(snapshot.path)
+    try:
+        payload = json.loads(snapshot.data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EvidenceSnapshotError(
+            f"invalid JSON evidence file {context}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise EvidenceSnapshotError(
+            f"JSON evidence file is not an object: {context}"
+        )
+    return payload
+
+
+def _snapshot_json(path):
+    snapshot = _stable_file_snapshot(path)
+    payload = _json_from_snapshot(snapshot, path)
+    return snapshot, payload
+
+
+def _file_binding(snapshot):
+    return {
+        "path": str(_canonical_leaf_path(snapshot.path)),
+        "bytes": snapshot.size,
+        "sha256": snapshot.sha256,
+    }
+
+
+def _jsonl_binding(snapshot, records):
+    binding = _file_binding(snapshot)
+    binding["record_count"] = len(records)
+    return binding
+
+
+def _warmup_timings_binding(snapshot, records):
+    # Kept as a named compatibility helper for callers and tests.
+    return _jsonl_binding(snapshot, records)
+
+
+def _materialize_snapshot(snapshot, suffix):
+    """Materialize immutable bytes for external decoders without reopening source."""
+
+    descriptor, name = tempfile.mkstemp(prefix="fasta2v-verify-", suffix=suffix)
+    try:
+        offset = 0
+        while offset < len(snapshot.data):
+            offset += os.write(descriptor, snapshot.data[offset:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return Path(name)
+
+
+def _binding_shape_errors(binding, expected_keys, context):
+    errors = []
+    if not isinstance(binding, dict):
+        return [f"{context} must be a JSON object"]
+    if set(binding) != set(expected_keys):
+        errors.append(
+            f"{context} fields {sorted(binding)} != {sorted(expected_keys)}"
+        )
+    if not isinstance(binding.get("path"), str) or not binding.get("path"):
+        errors.append(f"{context} path must be a non-empty string")
+    if not is_json_int(binding.get("bytes")) or binding.get("bytes") < 0:
+        errors.append(f"{context} bytes must be a nonnegative JSON integer")
+    digest = binding.get("sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        errors.append(f"{context} sha256 must be a lowercase SHA256 digest")
+    if "record_count" in expected_keys and (
+        not is_json_int(binding.get("record_count"))
+        or binding.get("record_count") < 0
+    ):
+        errors.append(
+            f"{context} record_count must be a nonnegative JSON integer"
+        )
+    return errors
+
 
 def run(command):
     return subprocess.check_output(command, stderr=subprocess.STDOUT)
@@ -182,6 +447,270 @@ def strict_json_equal(actual, expected):
             )
         )
     return type(actual) is type(expected) and actual == expected
+
+
+def _nonnegative_json_int(value, default=-1):
+    return value if is_json_int(value) and value >= 0 else default
+
+
+def measurement_record_protocol_errors(timings, environment):
+    """Validate the exact measurement/prompt/sample Cartesian product.
+
+    Inference writes records in measurement-major, prompt-major, sample-major
+    order.  The first measurement's sample-zero records bind the ordered prompt
+    sequence to ``environment.prompts_sha256``; every repeat must then retain the
+    same prompt at each prompt index.  Seeds are fixed to ``base + sample_index``.
+    """
+
+    errors = []
+    if not isinstance(timings, list):
+        return ["timings.jsonl records must be a list"], []
+    if not isinstance(environment, dict):
+        return ["measurement environment must be a JSON object"], []
+
+    measurement_runs = _nonnegative_json_int(environment.get("measurement_runs"))
+    prompt_count = _nonnegative_json_int(environment.get("prompt_count"))
+    sample_count = _nonnegative_json_int(environment.get("each_example_n_times"))
+    expected_record_count = _nonnegative_json_int(
+        environment.get("expected_measurement_records")
+    )
+    base_seed = environment.get("seed")
+    if measurement_runs < 1:
+        errors.append("measurement_runs must be a positive JSON integer")
+    if prompt_count < 1:
+        errors.append("prompt_count must be a positive JSON integer")
+    if sample_count < 1:
+        errors.append("each_example_n_times must be a positive JSON integer")
+    if expected_record_count < 0:
+        errors.append(
+            "expected_measurement_records must be a non-negative JSON integer"
+        )
+    if not is_json_int(base_seed):
+        errors.append("seed must be a JSON integer")
+
+    if errors:
+        return errors, []
+
+    expected_keys = [
+        (measurement_index, prompt_index, sample_index)
+        for measurement_index in range(measurement_runs)
+        for prompt_index in range(prompt_count)
+        for sample_index in range(sample_count)
+    ]
+    if expected_record_count != len(expected_keys):
+        errors.append(
+            "expected_measurement_records does not equal measurement_runs * "
+            "prompt_count * each_example_n_times"
+        )
+    actual_keys = []
+    records_by_key = {}
+    for record_offset, record in enumerate(timings):
+        context = f"measurement record[{record_offset}]"
+        if not isinstance(record, dict):
+            errors.append(f"{context} must be a JSON object")
+            continue
+        values = []
+        for field in ("measurement_index", "prompt_index", "sample_index"):
+            value = record.get(field)
+            if not is_json_int(value):
+                errors.append(f"{context} {field} must be a JSON integer")
+                values.append(None)
+            else:
+                values.append(value)
+        key = tuple(values)
+        actual_keys.append(key)
+        if None not in key:
+            if key in records_by_key:
+                errors.append(f"duplicate measurement/prompt/sample key {key}")
+            else:
+                records_by_key[key] = record
+
+        prompt = record.get("prompt")
+        if not isinstance(prompt, str) or not prompt:
+            errors.append(f"{context} prompt must be a non-empty string")
+        seed = record.get("seed")
+        if not is_json_int(seed):
+            errors.append(f"{context} seed must be a JSON integer")
+        elif is_json_int(record.get("sample_index")):
+            expected_seed = base_seed + record["sample_index"]
+            if seed != expected_seed:
+                errors.append(
+                    f"{context} seed={seed!r} != fixed seed {expected_seed}"
+                )
+
+    expected_key_set = set(expected_keys)
+    actual_valid_keys = {key for key in actual_keys if None not in key}
+    if actual_valid_keys != expected_key_set or len(actual_keys) != len(expected_keys):
+        missing = sorted(expected_key_set - actual_valid_keys)
+        unexpected = sorted(actual_valid_keys - expected_key_set)
+        errors.append(
+            "measurement/prompt/sample Cartesian product is incomplete or invalid: "
+            f"missing={missing} unexpected={unexpected} "
+            f"records={len(actual_keys)} expected={len(expected_keys)}"
+        )
+    if actual_keys != expected_keys:
+        errors.append(
+            "timings.jsonl record order must be measurement-major, prompt-major, "
+            "sample-major"
+        )
+
+    ordered_prompts = []
+    for prompt_index in range(prompt_count):
+        record = records_by_key.get((0, prompt_index, 0))
+        prompt = record.get("prompt") if isinstance(record, dict) else None
+        if not isinstance(prompt, str) or not prompt:
+            errors.append(
+                "cannot bind ordered prompt sequence from measurement 0, "
+                f"prompt {prompt_index}, sample 0"
+            )
+            ordered_prompts.append(None)
+        else:
+            ordered_prompts.append(prompt)
+
+    if all(isinstance(prompt, str) for prompt in ordered_prompts):
+        actual_prompt_hash = prompt_sequence_sha256(ordered_prompts)
+        expected_prompt_hash = environment.get("prompts_sha256")
+        if not isinstance(expected_prompt_hash, str) or (
+            actual_prompt_hash != expected_prompt_hash
+        ):
+            errors.append(
+                "ordered measurement prompts do not match the fixed environment "
+                "prompt hash"
+            )
+        for key, record in records_by_key.items():
+            prompt_index = key[1]
+            if 0 <= prompt_index < prompt_count and (
+                record.get("prompt") != ordered_prompts[prompt_index]
+            ):
+                errors.append(
+                    f"measurement/prompt/sample key {key} changed prompt text"
+                )
+
+        for measurement_index in range(measurement_runs):
+            measurement_prompts = []
+            for prompt_index in range(prompt_count):
+                record = records_by_key.get((measurement_index, prompt_index, 0))
+                measurement_prompts.append(
+                    record.get("prompt") if isinstance(record, dict) else None
+                )
+            if measurement_prompts != ordered_prompts:
+                errors.append(
+                    f"measurement index {measurement_index} changed prompt order"
+                )
+            elif prompt_sequence_sha256(measurement_prompts) != actual_prompt_hash:
+                errors.append(
+                    f"measurement index {measurement_index} prompt hash changed"
+                )
+
+    return errors, ordered_prompts
+
+
+def warmup_record_protocol_errors(warmups, environment, ordered_prompts):
+    """Require every excluded warm-up to use only the first fixed prompt."""
+
+    errors = []
+    if not isinstance(warmups, list):
+        return ["warmup_timings.jsonl records must be a list"]
+    if not isinstance(environment, dict):
+        return ["warmup environment must be a JSON object"]
+
+    expected_warmups = _nonnegative_json_int(
+        environment.get("expected_warmup_records")
+    )
+    warmup_runs = _nonnegative_json_int(environment.get("warmup_runs"))
+    base_seed = environment.get("seed")
+    if expected_warmups < 0 or warmup_runs < 0:
+        errors.append("warmup counts must be non-negative JSON integers")
+        return errors
+    if expected_warmups != warmup_runs:
+        errors.append(
+            "expected_warmup_records must equal warmup_runs for the fixed protocol"
+        )
+    if len(warmups) != expected_warmups:
+        errors.append(
+            f"warmup count {len(warmups)} != expected {expected_warmups}"
+        )
+    if not is_json_int(base_seed):
+        errors.append("warmup seed must be a JSON integer")
+
+    first_prompt = ordered_prompts[0] if ordered_prompts else None
+    if expected_warmups and (not isinstance(first_prompt, str) or not first_prompt):
+        errors.append("warm-up cannot bind the first fixed prompt")
+
+    for record_offset, record in enumerate(warmups):
+        context = f"warmup[{record_offset}]"
+        if not isinstance(record, dict):
+            errors.append(f"{context} must be a JSON object")
+            continue
+        if record.get("status") != "ok" or record.get("record_type") != "warmup":
+            errors.append(f"{context} status/type is not ok/warmup")
+        warmup_index = record.get("warmup_index")
+        if not is_json_int(warmup_index) or warmup_index != record_offset:
+            errors.append(
+                f"{context} warmup_index must be integer {record_offset}"
+            )
+        if record.get("benchmark_valid") is not False:
+            errors.append(f"{context} benchmark_valid must be false")
+        if record.get("prompt") != first_prompt:
+            errors.append(f"{context} must use only the first fixed prompt")
+        if not is_json_int(record.get("seed")) or record.get("seed") != base_seed:
+            errors.append(f"{context} seed must equal the fixed base seed")
+    return errors
+
+
+def warmup_timings_binding_errors(path, binding, expected_warmups):
+    """Revalidate a persisted warm-up binding with strict JSON field types."""
+
+    errors = []
+    try:
+        path = _canonical_leaf_path(path)
+    except OSError as exc:
+        return [f"warmup timings path cannot be canonicalized: {exc}"]
+    if not is_json_int(expected_warmups) or expected_warmups < 0:
+        return ["expected warm-up count must be a non-negative JSON integer"]
+    if expected_warmups == 0:
+        if binding is not None:
+            errors.append("zero-warmup protocol must persist a null binding")
+        if os.path.lexists(path):
+            errors.append("zero-warmup protocol must not create warmup_timings.jsonl")
+        return errors
+
+    if not isinstance(binding, dict):
+        return ["warmup_timings_binding must be a JSON object"]
+    expected_fields = {"path", "bytes", "sha256", "record_count"}
+    if set(binding) != expected_fields:
+        errors.append("warmup_timings_binding fields are invalid")
+    if binding.get("path") != str(path):
+        errors.append("warmup_timings_binding path is not the canonical run path")
+    for field in ("bytes", "record_count"):
+        value = binding.get(field)
+        if not is_json_int(value) or value < 0:
+            errors.append(
+                f"warmup_timings_binding {field} must be a non-negative JSON integer"
+            )
+    digest = binding.get("sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        errors.append("warmup_timings_binding sha256 is invalid")
+
+    try:
+        snapshot, records = _snapshot_jsonl(path)
+    except EvidenceSnapshotError as exc:
+        errors.append(f"warmup_timings_binding cannot be revalidated: {exc}")
+        return errors
+    actual = _warmup_timings_binding(snapshot, records)
+    if not strict_json_equal(binding, actual):
+        errors.append(
+            "warmup_timings.jsonl bytes, hash, or record count changed"
+        )
+    if len(records) != expected_warmups:
+        errors.append(
+            "warmup_timings.jsonl record count differs from the fixed protocol"
+        )
+    return errors
 
 
 def expected_radial_runtime_dependency_evidence(receipt):
@@ -1048,11 +1577,54 @@ def validate_radial_dispatcher(
                     f"{context}: Radial setting {field}="
                     f"{details.get(field)!r} != environment {expected!r}"
                 )
-def verify(path, require_metrics=True, expected_video_frames=121):
-    info = probe(path)
-    artifact_sha256 = sha256(path)
-    videos = [stream for stream in info.get("streams", []) if stream.get("codec_type") == "video"]
-    audios = [stream for stream in info.get("streams", []) if stream.get("codec_type") == "audio"]
+
+
+def verify(
+    path,
+    require_metrics=True,
+    expected_video_frames=121,
+    run_dir=None,
+    evidence_snapshots=None,
+    metrics_payloads=None,
+):
+    run_dir = Path(run_dir or Path(path).parent).resolve(strict=True)
+    path = _canonical_leaf_path(path)
+    if path.parent != run_dir:
+        raise EvidenceSnapshotError(
+            f"artifact must be a direct child of run directory {run_dir}: {path}"
+        )
+    artifact_snapshot = _stable_file_snapshot(path)
+    artifact_sha256 = artifact_snapshot.sha256
+    materialized_path = _materialize_snapshot(artifact_snapshot, ".mp4")
+    try:
+        info = probe(materialized_path)
+        media_videos = [
+            stream
+            for stream in info.get("streams", [])
+            if stream.get("codec_type") == "video"
+        ]
+        media_audios = [
+            stream
+            for stream in info.get("streams", [])
+            if stream.get("codec_type") == "audio"
+        ]
+        samples = (
+            decode_audio(materialized_path)
+            if media_audios
+            else np.empty(0, dtype=np.float32)
+        )
+        gray = (
+            decode_video_gray(materialized_path)
+            if media_videos
+            else np.empty(0, dtype=np.uint8)
+        )
+    finally:
+        try:
+            materialized_path.unlink()
+        except FileNotFoundError:
+            pass
+    videos = media_videos
+    audios = media_audios
     errors = []
     if len(videos) != 1:
         errors.append(f"expected exactly one video stream, found {len(videos)}")
@@ -1075,7 +1647,6 @@ def verify(path, require_metrics=True, expected_video_frames=121):
     if not 4.5 <= duration <= 5.5:
         errors.append(f"expected about 5 seconds, found {duration:.6f}")
 
-    samples = decode_audio(path) if audios else np.empty(0, dtype=np.float32)
     rms = float(np.sqrt(np.mean(np.square(samples.astype(np.float64))))) if samples.size else 0.0
     peak = float(np.max(np.abs(samples))) if samples.size else 0.0
     active_ratio = float(np.mean(np.abs(samples) > 1e-3)) if samples.size else 0.0
@@ -1091,13 +1662,21 @@ def verify(path, require_metrics=True, expected_video_frames=121):
     if active_ratio <= 0.01:
         errors.append(f"audio active-sample ratio is too low: {active_ratio}")
 
-    gray = decode_video_gray(path) if videos else np.empty(0, dtype=np.uint8)
     video_std = float(gray.std()) if gray.size else 0.0
     if gray.size == 0 or video_std <= 2.0:
         errors.append(f"decoded video is blank or nearly constant: std={video_std}")
 
     metrics_path = path.with_suffix(".metrics.json")
-    metrics = json.loads(metrics_path.read_text()) if metrics_path.is_file() else None
+    if metrics_path.parent != run_dir:
+        raise EvidenceSnapshotError(
+            f"metrics must be a direct child of run directory {run_dir}: {metrics_path}"
+        )
+    metrics_snapshot = None
+    metrics = None
+    if os.path.lexists(metrics_path):
+        metrics_snapshot, metrics = _snapshot_json(metrics_path)
+        if metrics_payloads is not None:
+            metrics_payloads[str(path)] = metrics
     if metrics is None and require_metrics:
         errors.append(f"missing metrics sidecar: {metrics_path}")
     elif metrics is not None:
@@ -1116,7 +1695,13 @@ def verify(path, require_metrics=True, expected_video_frames=121):
             "artifact_ready_seconds",
             "output_hash_seconds",
             "measurement_index",
+            "prompt_index",
+            "sample_index",
+            "prompt",
+            "seed",
+            "output_path",
             "benchmark_candidate",
+            "benchmark_valid",
             "attention_method",
             "use_cfg_cache",
             "cfg_cache_hits",
@@ -1136,6 +1721,16 @@ def verify(path, require_metrics=True, expected_video_frames=121):
             )
         if metrics.get("benchmark_valid") is not False:
             errors.append("per-artifact benchmark_valid must remain false until run verification")
+        for field in ("benchmark_candidate", "use_cfg_cache", "use_block_cache"):
+            if type(metrics.get(field)) is not bool:
+                errors.append(f"metrics {field} must be a JSON boolean")
+        for field in ("measurement_index", "prompt_index", "sample_index"):
+            if not is_json_int(metrics.get(field)) or metrics.get(field) < 0:
+                errors.append(f"metrics {field} must be a nonnegative JSON integer")
+        if not isinstance(metrics.get("prompt"), str) or not metrics.get("prompt"):
+            errors.append("metrics prompt must be a non-empty string")
+        if not is_json_int(metrics.get("seed")):
+            errors.append("metrics seed must be a JSON integer")
         actual_hw = metrics.get("actual_video_frame_height_width")
         generated_shape = metrics.get("generated_video_shape")
         if actual_hw != [height, width]:
@@ -1149,7 +1744,11 @@ def verify(path, require_metrics=True, expected_video_frames=121):
             errors.append(
                 f"output SHA256 mismatch: metrics={metrics.get('output_sha256')} actual={artifact_sha256}"
             )
-        if Path(metrics.get("output_path", "")).resolve() != path.resolve():
+        try:
+            recorded_output_path = _canonical_leaf_path(metrics.get("output_path", ""))
+        except (OSError, TypeError, ValueError):
+            recorded_output_path = None
+        if recorded_output_path != path:
             errors.append(f"metrics output_path does not match artifact: {metrics.get('output_path')}")
 
         expected_cfg = metrics.get("expected_cfg_cache_metrics")
@@ -1167,7 +1766,7 @@ def verify(path, require_metrics=True, expected_video_frames=121):
         elif expected_cfg is not None:
             errors.append("expected_cfg_cache_metrics must be a JSON object")
 
-        block_cache_enabled = bool(metrics.get("use_block_cache"))
+        block_cache_enabled = metrics.get("use_block_cache") is True
         block_metric_fields = (
             "block_cache_start_block",
             "block_cache_end_block",
@@ -1334,9 +1933,30 @@ def verify(path, require_metrics=True, expected_video_frames=121):
         if gpu_monitor is not None and not isinstance(gpu_monitor, dict):
             errors.append("gpu_process_monitor must be a JSON object")
 
+    snapshots = [artifact_snapshot]
+    if metrics_snapshot is not None:
+        snapshots.append(metrics_snapshot)
+    for snapshot in snapshots:
+        try:
+            _revalidate_snapshot(snapshot)
+        except EvidenceSnapshotError as exc:
+            errors.append(f"stable evidence snapshot failed: {exc}")
+    if evidence_snapshots is not None:
+        evidence_snapshots.extend(snapshots)
+
     return {
-        "path": str(path.resolve()),
+        "path": str(path),
         "sha256": artifact_sha256,
+        "measurement_index": metrics.get("measurement_index") if metrics else None,
+        "prompt_index": metrics.get("prompt_index") if metrics else None,
+        "sample_index": metrics.get("sample_index") if metrics else None,
+        "prompt": metrics.get("prompt") if metrics else None,
+        "seed": metrics.get("seed") if metrics else None,
+        "metrics_path": str(metrics_path),
+        "artifact_binding": _file_binding(artifact_snapshot),
+        "metrics_binding": (
+            _file_binding(metrics_snapshot) if metrics_snapshot is not None else None
+        ),
         "status": "failed" if errors else "ok",
         "errors": errors,
         "video": {
@@ -1358,11 +1978,218 @@ def verify(path, require_metrics=True, expected_video_frames=121):
     }
 
 
-def verify_run_protocol(run_dir, reports):
+def artifact_report_protocol_errors(
+    reports, timings, run_dir, metrics_payloads=None
+):
+    """Bind every verified artifact/sidecar to exactly one timing record."""
+
+    run_dir = Path(run_dir).resolve(strict=True)
+    errors = []
+    timing_by_path = {}
+    timing_by_tuple = {}
+    identity_fields = (
+        "measurement_index",
+        "prompt_index",
+        "sample_index",
+        "prompt",
+        "seed",
+    )
+
+    for index, timing in enumerate(timings):
+        context = f"timing[{index}]"
+        if not isinstance(timing, dict):
+            errors.append(f"{context} must be a JSON object")
+            continue
+        raw_path = timing.get("output_path")
+        if not isinstance(raw_path, str) or not raw_path:
+            errors.append(f"{context} output_path must be a non-empty string")
+            continue
+        try:
+            canonical_path = _canonical_leaf_path(raw_path)
+        except (OSError, TypeError, ValueError) as exc:
+            errors.append(f"{context} output_path cannot be canonicalized: {exc}")
+            continue
+        if not Path(raw_path).is_absolute() or raw_path != str(canonical_path):
+            errors.append(f"{context} output_path is not canonical: {raw_path!r}")
+        if canonical_path.parent != run_dir:
+            errors.append(f"{context} output_path is outside run directory")
+        path_key = str(canonical_path)
+        if path_key in timing_by_path:
+            errors.append(f"duplicate timing output_path: {path_key}")
+        else:
+            timing_by_path[path_key] = timing
+        tuple_key = tuple(timing.get(field) for field in identity_fields[:3])
+        if not all(is_json_int(value) for value in tuple_key):
+            errors.append(f"{context} measurement/prompt/sample indexes must be JSON integers")
+        elif tuple_key in timing_by_tuple:
+            errors.append(f"duplicate timing measurement/prompt/sample tuple: {tuple_key}")
+        else:
+            timing_by_tuple[tuple_key] = timing
+
+    report_by_path = {}
+    report_by_tuple = {}
+    for index, report in enumerate(reports):
+        context = f"artifact[{index}]"
+        if not isinstance(report, dict):
+            errors.append(f"{context} must be a JSON object")
+            continue
+        raw_path = report.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            errors.append(f"{context} path must be a non-empty string")
+            continue
+        try:
+            canonical_path = _canonical_leaf_path(raw_path)
+        except (OSError, TypeError, ValueError) as exc:
+            errors.append(f"{context} path cannot be canonicalized: {exc}")
+            continue
+        path_key = str(canonical_path)
+        if not Path(raw_path).is_absolute() or raw_path != path_key:
+            errors.append(f"{context} path is not canonical: {raw_path!r}")
+        if canonical_path.parent != run_dir:
+            errors.append(f"{context} path is outside run directory")
+        if path_key in report_by_path:
+            errors.append(f"duplicate artifact report path: {path_key}")
+        else:
+            report_by_path[path_key] = report
+
+        expected_metrics_path = canonical_path.with_suffix(".metrics.json")
+        raw_metrics_path = report.get("metrics_path")
+        if (
+            not isinstance(raw_metrics_path, str)
+            or raw_metrics_path != str(expected_metrics_path)
+        ):
+            errors.append(
+                f"{context} metrics_path does not match canonical sidecar path"
+            )
+
+        artifact_binding = report.get("artifact_binding")
+        errors.extend(
+            _binding_shape_errors(
+                artifact_binding, {"path", "bytes", "sha256"},
+                f"{context} artifact_binding",
+            )
+        )
+        metrics_binding = report.get("metrics_binding")
+        errors.extend(
+            _binding_shape_errors(
+                metrics_binding, {"path", "bytes", "sha256"},
+                f"{context} metrics_binding",
+            )
+        )
+        if isinstance(artifact_binding, dict):
+            if artifact_binding.get("path") != path_key:
+                errors.append(f"{context} artifact_binding path mismatch")
+            if not strict_json_equal(
+                artifact_binding.get("sha256"), report.get("sha256")
+            ):
+                errors.append(f"{context} artifact SHA256 fields disagree")
+        if isinstance(metrics_binding, dict) and (
+            metrics_binding.get("path") != str(expected_metrics_path)
+        ):
+            errors.append(f"{context} metrics_binding path mismatch")
+
+        tuple_values = tuple(report.get(field) for field in identity_fields[:3])
+        if not all(is_json_int(value) for value in tuple_values):
+            errors.append(
+                f"{context} measurement/prompt/sample indexes must be JSON integers"
+            )
+        elif tuple_values in report_by_tuple:
+            errors.append(
+                f"duplicate artifact measurement/prompt/sample tuple: {tuple_values}"
+            )
+        else:
+            report_by_tuple[tuple_values] = report
+
+        timing = timing_by_path.get(path_key)
+        if timing is None:
+            errors.append(f"{context} has no timing record at the same canonical path")
+            continue
+        for field in identity_fields:
+            if not strict_json_equal(report.get(field), timing.get(field)):
+                errors.append(f"{context} {field} does not match timing record")
+        if isinstance(artifact_binding, dict) and not strict_json_equal(
+            artifact_binding.get("sha256"), timing.get("output_sha256")
+        ):
+            errors.append(
+                f"{context} artifact hash does not match same-path timing record"
+            )
+        metrics_payload = (
+            metrics_payloads.get(path_key)
+            if isinstance(metrics_payloads, dict)
+            else None
+        )
+        if not isinstance(metrics_payload, dict):
+            errors.append(
+                f"{context} parsed metrics sidecar payload is unavailable"
+            )
+        elif not strict_json_equal(metrics_payload, timing):
+            errors.append(
+                f"{context} metrics sidecar differs from same-path timing record"
+            )
+
+    if set(report_by_path) != set(timing_by_path):
+        errors.append("artifact and timing canonical path sets differ")
+    if set(report_by_tuple) != set(timing_by_tuple):
+        errors.append("artifact and timing measurement/prompt/sample tuple sets differ")
+    return errors
+
+
+def verify_run_protocol(
+    run_dir,
+    reports,
+    evidence_snapshots=None,
+    metrics_payloads=None,
+):
+    run_dir = Path(run_dir).resolve(strict=True)
     errors = []
     radial_claims = None
+    evidence_cache = {}
+    parsed_json_cache = {}
+    protocol_guards = []
+
+    def capture_evidence(path, context):
+        try:
+            canonical_path = _canonical_leaf_path(path)
+        except (OSError, TypeError, ValueError) as exc:
+            errors.append(f"invalid run evidence path {context}: {exc}")
+            return None
+        if canonical_path.parent != run_dir:
+            errors.append(f"run evidence path escaped run directory: {context}")
+            return None
+        key = str(canonical_path)
+        if key in evidence_cache:
+            return evidence_cache[key]
+        try:
+            snapshot = _stable_file_snapshot(canonical_path)
+        except EvidenceSnapshotError as exc:
+            evidence_cache[key] = None
+            errors.append(f"invalid run evidence file {context}: {exc}")
+            return None
+        evidence_cache[key] = snapshot
+        protocol_guards.append(snapshot)
+        if evidence_snapshots is not None:
+            evidence_snapshots.append(snapshot)
+        return snapshot
+
+    def parse_evidence_json(path, context):
+        canonical_path = _canonical_leaf_path(path)
+        key = str(canonical_path)
+        if key in parsed_json_cache:
+            return parsed_json_cache[key]
+        snapshot = capture_evidence(canonical_path, context)
+        if snapshot is None:
+            parsed_json_cache[key] = None
+            return None
+        try:
+            payload = _json_from_snapshot(snapshot, context)
+        except EvidenceSnapshotError as exc:
+            errors.append(str(exc))
+            payload = None
+        parsed_json_cache[key] = payload
+        return payload
+
     environment_path = run_dir / "environment.json"
-    environment = json.loads(environment_path.read_text()) if environment_path.is_file() else {}
+    environment = parse_evidence_json(environment_path, "environment.json") or {}
     validate_run_protocol(environment, errors)
     attention_method = environment.get("attention_method")
     required_files = [
@@ -1391,92 +2218,110 @@ def verify_run_protocol(run_dir, reports):
                 "radial-attention-optional-imports.patch",
             )
         )
-    for filename in required_files:
-        if not (run_dir / filename).is_file():
-            errors.append(f"missing run evidence file: {filename}")
+    required_snapshots = {
+        filename: capture_evidence(run_dir / filename, filename)
+        for filename in required_files
+    }
 
     pre_run_gpu_path = run_dir / "pre_run_gpu.json"
-    try:
-        pre_run_gpu = json.loads(pre_run_gpu_path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        pre_run_gpu = None
-        errors.append(f"invalid pre_run_gpu.json: {exc}")
+    pre_run_gpu = parse_evidence_json(pre_run_gpu_path, "pre_run_gpu.json")
     expected_gpu_identity = validate_pre_run_gpu(
         pre_run_gpu, environment, errors
     )
 
-    candidate = bool(environment.get("benchmark_eligible"))
-    expected_measurements = int(environment.get("expected_measurement_records", -1))
-    expected_warmups = int(environment.get("expected_warmup_records", -1))
-    measurement_runs = int(environment.get("measurement_runs", -1))
-    per_repeat = int(environment.get("prompt_count", 0)) * int(
-        environment.get("each_example_n_times", 0)
+    if type(environment.get("benchmark_eligible")) is not bool:
+        errors.append("environment benchmark_eligible must be a JSON boolean")
+    candidate = environment.get("benchmark_eligible") is True
+    for field in ("debug_forward", "git_dirty", "use_cfg_cache", "use_block_cache"):
+        if type(environment.get(field)) is not bool:
+            errors.append(f"environment {field} must be a JSON boolean")
+    expected_measurements = _nonnegative_json_int(
+        environment.get("expected_measurement_records")
     )
+    expected_warmups = _nonnegative_json_int(
+        environment.get("expected_warmup_records")
+    )
+    measurement_runs = _nonnegative_json_int(environment.get("measurement_runs"))
 
-    timings = read_jsonl(run_dir / "timings.jsonl")
-    warmups = read_jsonl(run_dir / "warmup_timings.jsonl")
+    timings_path = run_dir / "timings.jsonl"
+    timings_snapshot = None
+    timings_binding = None
+    try:
+        timings_snapshot, timings = _snapshot_jsonl(timings_path)
+        timings_binding = _jsonl_binding(timings_snapshot, timings)
+        if evidence_snapshots is not None:
+            evidence_snapshots.append(timings_snapshot)
+    except EvidenceSnapshotError as exc:
+        timings = []
+        errors.append(f"invalid timings.jsonl evidence: {exc}")
+    warmup_timings_path = run_dir / "warmup_timings.jsonl"
+    warmup_snapshot = None
+    if expected_warmups == 0:
+        warmups = []
+        warmup_binding = None
+        warmup_absence_guard = _AbsentPathGuard(warmup_timings_path)
+        protocol_guards.append(warmup_absence_guard)
+        if evidence_snapshots is not None:
+            evidence_snapshots.append(warmup_absence_guard)
+        if os.path.lexists(warmup_timings_path):
+            errors.append(
+                "zero-warmup protocol must not create warmup_timings.jsonl"
+            )
+    elif os.path.lexists(warmup_timings_path):
+        try:
+            warmup_snapshot, warmups = _snapshot_jsonl(warmup_timings_path)
+            warmup_binding = _warmup_timings_binding(warmup_snapshot, warmups)
+            if evidence_snapshots is not None:
+                evidence_snapshots.append(warmup_snapshot)
+        except EvidenceSnapshotError as exc:
+            errors.append(f"invalid warmup_timings.jsonl evidence: {exc}")
+            warmups = []
+            warmup_binding = None
+    else:
+        warmups = []
+        warmup_binding = None
     if len(reports) != expected_measurements:
         errors.append(f"MP4 count {len(reports)} != expected {expected_measurements}")
     if len(timings) != expected_measurements:
         errors.append(f"timings count {len(timings)} != expected {expected_measurements}")
-    if len(warmups) != expected_warmups:
-        errors.append(f"warmup count {len(warmups)} != expected {expected_warmups}")
-
-    expected_indices = {
-        index for index in range(max(measurement_runs, 0))
-        for _ in range(max(per_repeat, 0))
-    }
-    actual_indices = {item.get("measurement_index") for item in timings}
-    if actual_indices != expected_indices:
-        errors.append(
-            f"measurement indices {sorted(str(x) for x in actual_indices)} "
-            f"!= expected {sorted(expected_indices)}"
-        )
-    for index in range(max(measurement_runs, 0)):
-        count = sum(item.get("measurement_index") == index for item in timings)
-        if count != per_repeat:
-            errors.append(f"measurement index {index} has {count} records, expected {per_repeat}")
+    measurement_errors, ordered_prompts = measurement_record_protocol_errors(
+        timings, environment
+    )
+    errors.extend(measurement_errors)
     for item in timings:
         if item.get("status") != "ok" or item.get("record_type") != "measurement":
             errors.append("timings.jsonl contains a non-ok/non-measurement record")
             break
-    for item in warmups:
-        if item.get("status") != "ok" or item.get("record_type") != "warmup":
-            errors.append("warmup_timings.jsonl contains an invalid warm-up record")
-            break
-
-    expected_prompts_sha256 = environment.get("prompts_sha256")
-    for measurement_index in range(max(measurement_runs, 0)):
-        measurement_prompts = [
-            item.get("prompt")
-            for item in timings
-            if item.get("measurement_index") == measurement_index
-        ]
-        if not all(isinstance(prompt, str) for prompt in measurement_prompts):
-            errors.append(
-                f"measurement index {measurement_index} contains an invalid "
-                "prompt value"
-            )
-        elif prompt_sequence_sha256(measurement_prompts) != expected_prompts_sha256:
-            errors.append(
-                f"measurement index {measurement_index} prompt sequence does "
-                "not match the fixed environment prompt hash"
-            )
-    for warmup_index, item in enumerate(warmups):
-        warmup_prompt = item.get("prompt")
-        if not isinstance(warmup_prompt, str):
-            errors.append(
-                f"warmup index {warmup_index} has an invalid prompt value"
-            )
-        elif prompt_sequence_sha256([warmup_prompt]) != expected_prompts_sha256:
-            errors.append(
-                f"warmup index {warmup_index} prompt does not match the fixed "
-                "environment prompt hash"
-            )
+    errors.extend(
+        warmup_record_protocol_errors(warmups, environment, ordered_prompts)
+    )
 
     all_run_records = [*warmups, *timings]
-    if environment.get("use_block_cache") or any(
-        item.get("use_block_cache") for item in all_run_records
+    for record_type, records in (("warmup", warmups), ("measurement", timings)):
+        for index, item in enumerate(records):
+            for field in (
+                "benchmark_candidate",
+                "benchmark_valid",
+                "use_cfg_cache",
+                "use_block_cache",
+            ):
+                if type(item.get(field)) is not bool:
+                    errors.append(f"{record_type}[{index}] {field} must be a JSON boolean")
+            if item.get("benchmark_valid") is not False:
+                errors.append(
+                    f"{record_type}[{index}] benchmark_valid must remain false"
+                )
+            if not strict_json_equal(item.get("benchmark_candidate"), candidate):
+                errors.append(
+                    f"{record_type}[{index}] benchmark_candidate disagrees with environment.json"
+                )
+            for field in ("use_cfg_cache", "use_block_cache"):
+                if not strict_json_equal(item.get(field), environment.get(field)):
+                    errors.append(
+                        f"{record_type}[{index}] {field} disagrees with environment.json"
+                    )
+    if environment.get("use_block_cache") is True or any(
+        item.get("use_block_cache") is True for item in all_run_records
     ):
         schedule_fields = (
             "use_block_cache",
@@ -1498,7 +2343,7 @@ def verify_run_protocol(run_dir, reports):
         ):
             for index, item in enumerate(records):
                 for field in schedule_fields:
-                    if item.get(field) != environment.get(field):
+                    if not strict_json_equal(item.get(field), environment.get(field)):
                         errors.append(
                             f"{record_type}[{index}] {field}="
                             f"{item.get(field)!r} != environment "
@@ -1536,25 +2381,25 @@ def verify_run_protocol(run_dir, reports):
                 errors,
             )
 
-    artifact_hashes = {report["sha256"] for report in reports}
-    timing_hashes = {item.get("output_sha256") for item in timings}
-    if artifact_hashes != timing_hashes:
-        errors.append("timings.jsonl output hashes do not match the verified artifacts")
+    errors.extend(
+        artifact_report_protocol_errors(
+            reports, timings, run_dir, metrics_payloads=metrics_payloads
+        )
+    )
 
     preflight = {}
     preflight_path = run_dir / "preflight.json"
-    if preflight_path.is_file():
-        preflight = json.loads(preflight_path.read_text())
+    parsed_preflight = parse_evidence_json(preflight_path, "preflight.json")
+    if isinstance(parsed_preflight, dict):
+        preflight = parsed_preflight
         if preflight.get("errors"):
             errors.append(f"preflight contains errors: {preflight['errors']}")
 
     if attention_method == "sparge":
         receipt_path = run_dir / "spargeattn-install.json"
-        try:
-            copied_receipt = json.loads(receipt_path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
-            copied_receipt = None
-            errors.append(f"invalid copied SpargeAttn receipt: {exc}")
+        copied_receipt = parse_evidence_json(
+            receipt_path, "copied SpargeAttn receipt"
+        )
         expected_gpu_uuid = (
             expected_gpu_identity[1]
             if expected_gpu_identity is not None
@@ -1568,33 +2413,45 @@ def verify_run_protocol(run_dir, reports):
         if isinstance(copied_receipt, dict):
             build_metadata = copied_receipt.get("build_log")
             build_log_path = run_dir / "spargeattn-build.log"
-            if isinstance(build_metadata, dict) and build_log_path.is_file():
+            build_log_snapshot = required_snapshots.get("spargeattn-build.log")
+            if isinstance(build_metadata, dict) and build_log_snapshot is not None:
                 if (
-                    build_log_path.stat().st_size != build_metadata.get("bytes")
-                    or sha256(build_log_path) != build_metadata.get("sha256")
+                    not strict_json_equal(
+                        build_log_snapshot.size, build_metadata.get("bytes")
+                    )
+                    or not strict_json_equal(
+                        build_log_snapshot.sha256, build_metadata.get("sha256")
+                    )
                 ):
                     errors.append(
                         "copied SpargeAttn build log differs from install receipt"
                     )
             install_gpu_metadata = copied_receipt.get("install_pre_run_gpu")
             install_gpu_path = run_dir / "spargeattn-install-pre_run_gpu.json"
-            if isinstance(install_gpu_metadata, dict) and install_gpu_path.is_file():
+            install_gpu_snapshot = required_snapshots.get(
+                "spargeattn-install-pre_run_gpu.json"
+            )
+            if (
+                isinstance(install_gpu_metadata, dict)
+                and install_gpu_snapshot is not None
+            ):
                 if (
-                    install_gpu_path.stat().st_size
-                    != install_gpu_metadata.get("bytes")
-                    or sha256(install_gpu_path)
-                    != install_gpu_metadata.get("sha256")
+                    not strict_json_equal(
+                        install_gpu_snapshot.size,
+                        install_gpu_metadata.get("bytes"),
+                    )
+                    or not strict_json_equal(
+                        install_gpu_snapshot.sha256,
+                        install_gpu_metadata.get("sha256"),
+                    )
                 ):
                     errors.append(
                         "copied SpargeAttn install GPU evidence differs from receipt"
                     )
-                try:
-                    install_gpu_report = json.loads(install_gpu_path.read_text())
-                except (OSError, json.JSONDecodeError) as exc:
-                    install_gpu_report = None
-                    errors.append(
-                        f"invalid SpargeAttn install GPU evidence: {exc}"
-                    )
+                install_gpu_report = parse_evidence_json(
+                    install_gpu_path,
+                    "SpargeAttn install GPU evidence",
+                )
                 if isinstance(install_gpu_report, dict):
                     if (
                         not is_json_int(
@@ -1672,11 +2529,9 @@ def verify_run_protocol(run_dir, reports):
 
     elif attention_method == "radial":
         receipt_path = run_dir / "radialattn-install.json"
-        try:
-            copied_receipt = json.loads(receipt_path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
-            copied_receipt = None
-            errors.append(f"invalid copied Radial receipt: {exc}")
+        copied_receipt = parse_evidence_json(
+            receipt_path, "copied Radial receipt"
+        )
         for error in radial_receipt_evidence_errors(copied_receipt):
             errors.append(f"copied Radial receipt: {error}")
         expected_runtime_dependencies = (
@@ -1696,14 +2551,15 @@ def verify_run_protocol(run_dir, reports):
         if isinstance(copied_receipt, dict):
             for field, path in copied_artifacts.items():
                 metadata = copied_receipt.get(field)
+                artifact_snapshot = required_snapshots.get(path.name)
                 if not isinstance(metadata, dict):
                     errors.append(f"copied Radial receipt lacks {field}")
-                elif path.is_file() and (
+                elif artifact_snapshot is not None and (
                     not strict_json_equal(
-                        metadata.get("bytes"), path.stat().st_size
+                        metadata.get("bytes"), artifact_snapshot.size
                     )
                     or not strict_json_equal(
-                        metadata.get("sha256"), sha256(path)
+                        metadata.get("sha256"), artifact_snapshot.sha256
                     )
                 ):
                     errors.append(
@@ -1713,25 +2569,24 @@ def verify_run_protocol(run_dir, reports):
         flashinfer_manifest_path = (
             run_dir / "radial-flashinfer-manifest.json"
         )
-        try:
-            copied_flashinfer_manifest = json.loads(
-                flashinfer_manifest_path.read_text()
-            )
-        except (OSError, json.JSONDecodeError) as exc:
-            copied_flashinfer_manifest = None
-            errors.append(f"invalid copied FlashInfer manifest: {exc}")
+        copied_flashinfer_manifest = parse_evidence_json(
+            flashinfer_manifest_path, "copied FlashInfer manifest"
+        )
+        flashinfer_manifest_snapshot = required_snapshots.get(
+            "radial-flashinfer-manifest.json"
+        )
         if isinstance(copied_receipt, dict):
             manifest_fingerprint = copied_receipt.get("flashinfer_manifest")
             if not isinstance(manifest_fingerprint, dict):
                 errors.append("copied Radial receipt lacks flashinfer_manifest")
-            elif flashinfer_manifest_path.is_file() and (
+            elif flashinfer_manifest_snapshot is not None and (
                 not strict_json_equal(
                     manifest_fingerprint.get("bytes"),
-                    flashinfer_manifest_path.stat().st_size,
+                    flashinfer_manifest_snapshot.size,
                 )
                 or not strict_json_equal(
                     manifest_fingerprint.get("sha256"),
-                    sha256(flashinfer_manifest_path),
+                    flashinfer_manifest_snapshot.sha256,
                 )
             ):
                 errors.append(
@@ -1785,11 +2640,11 @@ def verify_run_protocol(run_dir, reports):
             expected_gpu_uuid=expected_gpu_uuid,
             expected_pre_run_gpu=pre_run_gpu,
             expected_pre_run_gpu_sha256=(
-                sha256(pre_run_gpu_path)
-                if pre_run_gpu_path.is_file()
+                required_snapshots["pre_run_gpu.json"].sha256
+                if required_snapshots.get("pre_run_gpu.json") is not None
                 else None
             ),
-            expected_pre_run_gpu_path=str(pre_run_gpu_path.resolve()),
+            expected_pre_run_gpu_path=str(pre_run_gpu_path),
             expected_python_executable=preflight.get("python_executable"),
         )
         for error in radial_microtest_errors:
@@ -1910,31 +2765,83 @@ def verify_run_protocol(run_dir, reports):
     if missing_hashes:
         errors.append(f"environment is missing evidence hashes: {missing_hashes}")
     for filename, expected_hash in evidence_hashes.items():
-        path = run_dir / filename
-        actual_hash = sha256(path) if path.is_file() else None
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or Path(filename).name != filename
+        ):
+            errors.append(f"invalid evidence hash filename: {filename!r}")
+            continue
+        snapshot = capture_evidence(run_dir / filename, filename)
+        actual_hash = snapshot.sha256 if snapshot is not None else None
         if not expected_hash or expected_hash != actual_hash:
             errors.append(
                 f"evidence hash mismatch for {filename}: expected={expected_hash} actual={actual_hash}"
             )
+    pre_run_snapshot = required_snapshots.get("pre_run_gpu.json")
     actual_pre_run_hash = (
-        sha256(pre_run_gpu_path) if pre_run_gpu_path.is_file() else None
+        pre_run_snapshot.sha256 if pre_run_snapshot is not None else None
     )
     if environment.get("pre_run_gpu_sha256") != actual_pre_run_hash:
         errors.append("pre_run_gpu.json SHA256 does not match environment.json")
     run_config_path = run_dir / "run_config.yaml"
-    if run_config_path.is_file() and environment.get("run_config_sha256") != sha256(run_config_path):
+    run_config_snapshot = required_snapshots.get("run_config.yaml")
+    if run_config_snapshot is not None and (
+        environment.get("run_config_sha256") != run_config_snapshot.sha256
+    ):
         errors.append("run_config.yaml SHA256 does not match environment.json")
 
-    if any(item.get("benchmark_candidate") != candidate for item in timings):
-        errors.append("per-measurement benchmark_candidate disagrees with environment.json")
+    for guard in protocol_guards:
+        try:
+            _revalidate_publication_guard(guard)
+        except EvidenceSnapshotError as exc:
+            errors.append(f"run evidence stable snapshot failed: {exc}")
+
+    if timings_snapshot is not None:
+        try:
+            _revalidate_snapshot(timings_snapshot)
+        except EvidenceSnapshotError as exc:
+            errors.append(f"timings.jsonl stable snapshot failed: {exc}")
+    errors.extend(
+        _binding_shape_errors(
+            timings_binding,
+            {"path", "bytes", "sha256", "record_count"},
+            "timings_binding",
+        )
+    )
+    if isinstance(timings_binding, dict) and not strict_json_equal(
+        timings_binding.get("record_count"), expected_measurements
+    ):
+        errors.append("timings_binding record_count differs from protocol")
+    if warmup_snapshot is not None:
+        try:
+            _revalidate_snapshot(warmup_snapshot)
+        except EvidenceSnapshotError as exc:
+            errors.append(f"warmup_timings.jsonl stable snapshot failed: {exc}")
+    if expected_warmups == 0:
+        if warmup_binding is not None:
+            errors.append("zero-warmup protocol must persist a null warmup binding")
+    else:
+        errors.extend(
+            _binding_shape_errors(
+                warmup_binding,
+                {"path", "bytes", "sha256", "record_count"},
+                "warmup_timings_binding",
+            )
+        )
+        if isinstance(warmup_binding, dict) and not strict_json_equal(
+            warmup_binding.get("record_count"), expected_warmups
+        ):
+            errors.append("warmup_timings_binding record_count differs from protocol")
+
     benchmark_valid = bool(
         candidate
         and not errors
-        and not environment.get("debug_forward")
-        and not environment.get("git_dirty")
+        and environment.get("debug_forward") is False
+        and environment.get("git_dirty") is False
         and expected_warmups >= 1
         and measurement_runs >= 3
-        and all(not report["errors"] for report in reports)
+        and all(isinstance(report, dict) and not report.get("errors") for report in reports)
     )
     protocol = {
         "status": "failed" if errors else "ok",
@@ -1943,6 +2850,8 @@ def verify_run_protocol(run_dir, reports):
         "observed_warmup_records": len(warmups),
         "expected_measurement_records": expected_measurements,
         "observed_measurement_records": len(timings),
+        "timings_binding": timings_binding,
+        "warmup_timings_binding": warmup_binding,
         "benchmark_candidate": candidate,
         "benchmark_valid": benchmark_valid,
     }
@@ -1962,10 +2871,151 @@ def build_verification_summary(reports, protocol):
         "artifact_count": len(reports),
         "artifacts": reports,
         "protocol": protocol,
-        "benchmark_valid": bool(protocol and protocol["benchmark_valid"]),
+        "benchmark_valid": bool(
+            isinstance(protocol, dict) and protocol.get("benchmark_valid") is True
+        ),
     }
     if isinstance(protocol, dict) and "radial_evidence" in protocol:
         summary["radial_evidence"] = protocol["radial_evidence"]
+    return summary
+
+
+def _write_json_temp(output_path, payload):
+    """Write and fsync an O_EXCL candidate beside its final destination."""
+
+    output_path = Path(output_path)
+    encoded = (
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = None
+    temporary_path = None
+    for _attempt in range(128):
+        temporary_path = output_path.parent / (
+            f".{output_path.name}.{os.getpid()}.{secrets.token_hex(12)}.tmp"
+        )
+        try:
+            descriptor = os.open(temporary_path, flags, 0o600)
+            break
+        except FileExistsError:
+            continue
+    if descriptor is None or temporary_path is None:
+        raise FileExistsError(
+            f"cannot allocate exclusive verification temp beside {output_path}"
+        )
+    try:
+        offset = 0
+        while offset < len(encoded):
+            offset += os.write(descriptor, encoded[offset:])
+        os.fsync(descriptor)
+    except BaseException:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(descriptor)
+    return temporary_path
+
+
+def _replace_json_temp(temporary_path, output_path):
+    output_path = Path(output_path)
+    os.replace(temporary_path, output_path)
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_descriptor = os.open(output_path.parent, directory_flags)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
+def _atomic_publish_json(output_path, payload):
+    temporary_path = _write_json_temp(output_path, payload)
+    try:
+        _replace_json_temp(temporary_path, output_path)
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _failed_publication_summary(reason, reports=None, protocol=None):
+    rendered_reason = str(reason)
+    if isinstance(protocol, dict):
+        protocol = dict(protocol)
+        protocol["status"] = "failed"
+        protocol["benchmark_valid"] = False
+        protocol["errors"] = [
+            *list(protocol.get("errors") or []),
+            f"verification publication failed: {rendered_reason}",
+        ]
+    return {
+        "status": "failed",
+        "reason": rendered_reason,
+        "artifact_count": len(reports or []),
+        "artifacts": reports or [],
+        "protocol": protocol,
+        "benchmark_valid": False,
+    }
+
+
+def _publish_verified_summary(output_path, summary, evidence_snapshots):
+    """Revalidate before and immediately after publishing a successful summary."""
+
+    def revalidation_errors():
+        observed = []
+        for guard in evidence_snapshots:
+            try:
+                _revalidate_publication_guard(guard)
+            except EvidenceSnapshotError as exc:
+                observed.append(str(exc))
+        return observed
+
+    def failed_summary(source, phase, observed):
+        failed = json.loads(json.dumps(source, allow_nan=False))
+        failed["status"] = "failed"
+        failed["benchmark_valid"] = False
+        messages = [f"{phase}: {error}" for error in observed]
+        failed.setdefault("publication_errors", []).extend(messages)
+        protocol = failed.get("protocol")
+        if isinstance(protocol, dict):
+            protocol["status"] = "failed"
+            protocol["benchmark_valid"] = False
+            protocol.setdefault("errors", []).extend(
+                f"publication evidence revalidation: {message}"
+                for message in messages
+            )
+        return failed
+
+    candidate_path = _write_json_temp(output_path, summary)
+    drift_errors = revalidation_errors()
+    if drift_errors:
+        try:
+            candidate_path.unlink()
+        except FileNotFoundError:
+            pass
+        summary = failed_summary(summary, "pre-publish", drift_errors)
+        candidate_path = _write_json_temp(output_path, summary)
+    try:
+        _replace_json_temp(candidate_path, output_path)
+    finally:
+        try:
+            candidate_path.unlink()
+        except FileNotFoundError:
+            pass
+    if summary.get("status") == "ok":
+        drift_errors = revalidation_errors()
+        if drift_errors:
+            summary = failed_summary(summary, "post-publish", drift_errors)
+            _atomic_publish_json(output_path, summary)
     return summary
 
 
@@ -1987,33 +3037,93 @@ def main():
 
     if args.expected_video_frames < 1:
         parser.error("--expected-video-frames must be positive")
+    input_is_file = args.path.suffix.lower() == ".mp4"
+    run_dir = (
+        args.path.parent.resolve(strict=True)
+        if input_is_file
+        else args.path.resolve(strict=True)
+    )
+    output_path = (
+        _canonical_leaf_path(args.path.with_suffix(".verification.json"))
+        if input_is_file
+        else run_dir / "verification.json"
+    )
+    _atomic_publish_json(
+        output_path,
+        _failed_publication_summary("verification_in_progress"),
+    )
 
-    for executable in ("ffmpeg", "ffprobe"):
-        if shutil.which(executable) is None:
-            raise SystemExit(f"required executable not found: {executable}")
+    reports = []
+    protocol = None
+    evidence_snapshots = []
+    metrics_payloads = {}
+    try:
+        for executable in ("ffmpeg", "ffprobe"):
+            if shutil.which(executable) is None:
+                raise RuntimeError(f"required executable not found: {executable}")
 
-    paths = [args.path] if args.path.is_file() else sorted(args.path.glob("*.mp4"))
-    if not paths:
-        raise SystemExit(f"no MP4 artifacts found under {args.path}")
-    reports = [
-        verify(
-            path,
-            require_metrics=not args.media_only,
-            expected_video_frames=args.expected_video_frames,
+        if input_is_file:
+            paths = [args.path]
+        else:
+            paths = sorted(
+                path
+                for path in run_dir.iterdir()
+                if path.name.lower().endswith(".mp4")
+            )
+        if not paths:
+            raise RuntimeError(f"no MP4 artifacts found under {args.path}")
+        for path in paths:
+            try:
+                reports.append(
+                    verify(
+                        path,
+                        require_metrics=not args.media_only,
+                        expected_video_frames=args.expected_video_frames,
+                        run_dir=run_dir,
+                        evidence_snapshots=evidence_snapshots,
+                        metrics_payloads=metrics_payloads,
+                    )
+                )
+            except (EvidenceSnapshotError, OSError, ValueError, subprocess.SubprocessError) as exc:
+                try:
+                    failed_path = str(_canonical_leaf_path(path))
+                except OSError:
+                    failed_path = str(path)
+                reports.append(
+                    {
+                        "path": failed_path,
+                        "sha256": None,
+                        "measurement_index": None,
+                        "prompt_index": None,
+                        "sample_index": None,
+                        "prompt": None,
+                        "seed": None,
+                        "metrics_path": str(Path(failed_path).with_suffix(".metrics.json")),
+                        "artifact_binding": None,
+                        "metrics_binding": None,
+                        "status": "failed",
+                        "errors": [str(exc)],
+                        "video": {},
+                        "audio": {},
+                    }
+                )
+        protocol = (
+            verify_run_protocol(
+                run_dir,
+                reports,
+                evidence_snapshots=evidence_snapshots,
+                metrics_payloads=metrics_payloads,
+            )
+            if not input_is_file and not args.media_only
+            else None
         )
-        for path in paths
-    ]
-    run_dir = args.path if args.path.is_dir() else args.path.parent
-    protocol = (
-        verify_run_protocol(run_dir, reports)
-        if args.path.is_dir() and not args.media_only
-        else None
-    )
-    summary = build_verification_summary(reports, protocol)
-    output_path = args.path.with_suffix(".verification.json") if args.path.is_file() else args.path / "verification.json"
-    output_path.write_text(
-        json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n"
-    )
+        summary = build_verification_summary(reports, protocol)
+        summary = _publish_verified_summary(
+            output_path, summary, evidence_snapshots
+        )
+    except BaseException as exc:
+        summary = _failed_publication_summary(exc, reports, protocol)
+        _atomic_publish_json(output_path, summary)
     print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
     return 1 if summary["status"] == "failed" else 0
 

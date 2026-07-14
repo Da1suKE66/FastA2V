@@ -3,6 +3,7 @@
 
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -22,6 +23,57 @@ from ovi.modules.sparge_attention_backend import (
 from ovi.gpu_process_monitor import query_gpu_compute_processes
 
 
+_GPU_UUID_PATTERN = re.compile(
+    r"^(?:GPU-)?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+)
+
+
+def _normalize_runtime_gpu_uuid(properties):
+    """Return the CUDA runtime UUID in canonical nvidia-smi form."""
+
+    try:
+        raw_uuid = properties.uuid
+    except Exception as exc:
+        raise SpargeAttentionDependencyError(
+            "CUDA device properties do not expose a usable GPU UUID"
+        ) from exc
+    try:
+        uuid_text = str(raw_uuid)
+    except Exception as exc:
+        raise SpargeAttentionDependencyError(
+            "CUDA device properties GPU UUID cannot be converted to text"
+        ) from exc
+    match = _GPU_UUID_PATTERN.fullmatch(uuid_text)
+    if match is None:
+        raise SpargeAttentionDependencyError(
+            "CUDA device properties expose a malformed GPU UUID: "
+            f"{uuid_text!r}"
+        )
+    return "GPU-" + match.group(1).lower()
+
+
+def _validate_runtime_gpu_binding(properties, runtime_device_name, gpu_identity):
+    runtime_device_uuid = _normalize_runtime_gpu_uuid(properties)
+    if (
+        gpu_identity.get("available") is not True
+        or type(gpu_identity.get("device_index")) is not int
+        or gpu_identity.get("device_index") != 0
+        or gpu_identity.get("device_name") != runtime_device_name
+        or not isinstance(gpu_identity.get("device_uuid"), str)
+        or not gpu_identity.get("device_uuid", "").startswith("GPU-")
+        or gpu_identity.get("device_uuid") != runtime_device_uuid
+        or type(gpu_identity.get("process_count")) is not int
+        or gpu_identity.get("process_count") not in (0, 1)
+    ):
+        raise SpargeAttentionDependencyError(
+            "SpargeAttn CUDA microtest could not bind logical CUDA 0 to an "
+            "uncontended physical GPU 0 by UUID: "
+            f"runtime_uuid={runtime_device_uuid!r}, nvidia_smi={gpu_identity}"
+        )
+    return runtime_device_uuid
+
+
 def run_microtest(kernel=None, device_index=0):
     if not torch.cuda.is_available():
         raise SpargeAttentionDependencyError(
@@ -31,6 +83,8 @@ def run_microtest(kernel=None, device_index=0):
         kernel = load_official_sparge_kernel()
 
     device = torch.device("cuda", int(device_index))
+    properties = torch.cuda.get_device_properties(device)
+    runtime_device_uuid = _normalize_runtime_gpu_uuid(properties)
     compute_capability = tuple(torch.cuda.get_device_capability(device))
     if compute_capability != (8, 0):
         raise SpargeAttentionDependencyError(
@@ -111,22 +165,19 @@ def run_microtest(kernel=None, device_index=0):
         )
     gpu_identity = query_gpu_compute_processes(0)
     runtime_device_name = torch.cuda.get_device_name(device)
-    if (
-        gpu_identity.get("available") is not True
-        or gpu_identity.get("device_index") != 0
-        or gpu_identity.get("device_name") != runtime_device_name
-        or not isinstance(gpu_identity.get("device_uuid"), str)
-        or not gpu_identity.get("device_uuid", "").startswith("GPU-")
-        or gpu_identity.get("process_count") not in (0, 1)
-    ):
+    bound_device_uuid = _validate_runtime_gpu_binding(
+        properties,
+        runtime_device_name,
+        gpu_identity,
+    )
+    if bound_device_uuid != runtime_device_uuid:
         raise SpargeAttentionDependencyError(
-            "SpargeAttn CUDA microtest could not bind logical CUDA 0 to an "
-            f"uncontended physical GPU 0: {gpu_identity}"
+            "SpargeAttn CUDA microtest runtime GPU UUID changed during execution"
         )
     return {
         "status": "ok",
         "device": runtime_device_name,
-        "device_uuid": gpu_identity["device_uuid"],
+        "device_uuid": bound_device_uuid,
         "compute_capability": list(compute_capability),
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,

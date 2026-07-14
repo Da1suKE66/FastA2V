@@ -33,6 +33,14 @@ EXPECTED_RUN_KINDS = {
     "radial_conservative_diagnostic_smoke",
     "radial_aggressive_baseline",
     "radial_aggressive_diagnostic_smoke",
+    "sparge_topk50_cfg_benchmark",
+    "sparge_topk75_cfg_benchmark",
+    "radial_conservative_cfg_benchmark",
+    "radial_aggressive_cfg_benchmark",
+    "sparge_topk50_block_cache_benchmark",
+    "sparge_topk75_block_cache_benchmark",
+    "radial_conservative_block_cache_benchmark",
+    "radial_aggressive_block_cache_benchmark",
 }
 
 RUN_KIND_CONFIGS = {
@@ -59,6 +67,44 @@ RUN_KIND_CONFIGS = {
     "radial_aggressive_diagnostic_smoke": (
         "ovi_720x720_5s_radial_aggressive_smoke.yaml"
     ),
+    "sparge_topk50_cfg_benchmark": "ovi_720x720_5s_sparge_topk50_cfg.yaml",
+    "sparge_topk75_cfg_benchmark": "ovi_720x720_5s_sparge_topk75_cfg.yaml",
+    "radial_conservative_cfg_benchmark": (
+        "ovi_720x720_5s_radial_conservative_cfg.yaml"
+    ),
+    "radial_aggressive_cfg_benchmark": (
+        "ovi_720x720_5s_radial_aggressive_cfg.yaml"
+    ),
+    "sparge_topk50_block_cache_benchmark": (
+        "ovi_720x720_5s_sparge_topk50_block_cache.yaml"
+    ),
+    "sparge_topk75_block_cache_benchmark": (
+        "ovi_720x720_5s_sparge_topk75_block_cache.yaml"
+    ),
+    "radial_conservative_block_cache_benchmark": (
+        "ovi_720x720_5s_radial_conservative_block_cache.yaml"
+    ),
+    "radial_aggressive_block_cache_benchmark": (
+        "ovi_720x720_5s_radial_aggressive_block_cache.yaml"
+    ),
+}
+
+DEV6_RUN_KINDS = {
+    "dense_baseline",
+    "cfg_cache_benchmark",
+    "block_cache_benchmark",
+    "sparge_baseline",
+    "sparge_topk75_baseline",
+    "radial_conservative_baseline",
+    "radial_aggressive_baseline",
+    "sparge_topk50_cfg_benchmark",
+    "sparge_topk75_cfg_benchmark",
+    "radial_conservative_cfg_benchmark",
+    "radial_aggressive_cfg_benchmark",
+    "sparge_topk50_block_cache_benchmark",
+    "sparge_topk75_block_cache_benchmark",
+    "radial_conservative_block_cache_benchmark",
+    "radial_aggressive_block_cache_benchmark",
 }
 
 DERIVED_ENVIRONMENT_FIELDS = {
@@ -127,18 +173,121 @@ class ImmutableEvalProtocolTests(unittest.TestCase):
                     self.assertIn(field, config)
                     self.assertEqual(config[field], expected)
 
-    def test_fixed_prompt_hash_matches_the_checked_in_ordered_prompt_set(self):
-        with (REPO_ROOT / "prompts" / "ovi_smoke.csv").open(
-            newline="", encoding="utf-8"
-        ) as handle:
-            prompts = [
-                row["text_prompt"] for row in csv.DictReader(handle)
-            ]
-        expected_hash = prompt_sequence_sha256(prompts)
-        self.assertEqual(len(prompts), 1)
+    def test_fixed_prompt_hash_matches_each_checked_in_ordered_prompt_set(self):
+        prompt_sets = {}
+        for filename, expected_count in (
+            ("ovi_smoke.csv", 1),
+            ("ovi_dev6.csv", 6),
+        ):
+            with (REPO_ROOT / "prompts" / filename).open(
+                newline="", encoding="utf-8"
+            ) as handle:
+                prompts = [
+                    row["text_prompt"] for row in csv.DictReader(handle)
+                ]
+            self.assertEqual(len(prompts), expected_count)
+            self.assertEqual(len(set(prompts)), expected_count)
+            self.assertTrue(all(prompt.strip() for prompt in prompts))
+            prompt_sets[filename] = (
+                expected_count,
+                prompt_sequence_sha256(prompts),
+            )
+
         for run_kind, protocol in RUN_KIND_PROTOCOLS.items():
             with self.subTest(run_kind=run_kind):
+                filename = (
+                    "ovi_dev6.csv"
+                    if run_kind in DEV6_RUN_KINDS
+                    else "ovi_smoke.csv"
+                )
+                expected_count, expected_hash = prompt_sets[filename]
+                self.assertEqual(protocol["prompt_count"], expected_count)
                 self.assertEqual(protocol["prompts_sha256"], expected_hash)
+
+    def test_formal_configs_use_dev6_and_smoke_configs_stay_single_prompt(self):
+        self.assertEqual(
+            DEV6_RUN_KINDS,
+            {
+                run_kind
+                for run_kind, protocol in RUN_KIND_PROTOCOLS.items()
+                if protocol["sample_steps"] == 50
+            },
+        )
+        for run_kind, filename in RUN_KIND_CONFIGS.items():
+            if run_kind == "official_reference":
+                continue
+            expected_prompt_file = (
+                "ovi_dev6.csv"
+                if run_kind in DEV6_RUN_KINDS
+                else "ovi_smoke.csv"
+            )
+            source = (REPO_ROOT / "configs" / filename).read_text(
+                encoding="utf-8"
+            )
+            with self.subTest(run_kind=run_kind, filename=filename):
+                self.assertIn(
+                    f"text_prompt: prompts/{expected_prompt_file}", source
+                )
+
+    def test_expected_measurement_records_cover_prompts_samples_and_repeats(self):
+        for run_kind, protocol in RUN_KIND_PROTOCOLS.items():
+            with self.subTest(run_kind=run_kind):
+                self.assertEqual(
+                    protocol["expected_measurement_records"],
+                    protocol["measurement_runs"]
+                    * protocol["prompt_count"]
+                    * protocol["each_example_n_times"],
+                )
+                expected_count = 6 if run_kind in DEV6_RUN_KINDS else 1
+                self.assertEqual(protocol["prompt_count"], expected_count)
+
+    def test_evaluation_matrix_uses_dev6_and_current_method_statuses(self):
+        matrix = json.loads(
+            (REPO_ROOT / "configs" / "ovi_eval_matrix.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        fixed = matrix["fixed_protocol"]
+        formal = RUN_KIND_PROTOCOLS["dense_baseline"]
+        self.assertEqual(fixed["prompt_count"], formal["prompt_count"])
+        self.assertEqual(fixed["prompts_sha256"], formal["prompts_sha256"])
+        methods = {method["method_id"]: method for method in matrix["methods"]}
+        for method_id in ("radial_conservative", "radial_aggressive"):
+            self.assertEqual(methods[method_id]["implementation_status"], "ready")
+            self.assertNotIn("pending_reason", methods[method_id])
+        selected_cfg = methods["best_sparse_cfg"]
+        self.assertEqual(selected_cfg["implementation_status"], "ready")
+        self.assertIs(selected_cfg["selection_required"], True)
+        self.assertEqual(
+            selected_cfg["allowed_run_kinds"],
+            [
+                "sparge_topk50_cfg_benchmark",
+                "sparge_topk75_cfg_benchmark",
+                "radial_conservative_cfg_benchmark",
+                "radial_aggressive_cfg_benchmark",
+            ],
+        )
+        self.assertNotIn("run_kind", selected_cfg["expected_environment"])
+        selected_block = methods["block_cache"]
+        self.assertEqual(
+            selected_block["label"], "Best sparse + simple block cache"
+        )
+        self.assertEqual(selected_block["implementation_status"], "ready")
+        self.assertIs(selected_block["selection_required"], True)
+        self.assertEqual(
+            selected_block["allowed_run_kinds"],
+            [
+                "sparge_topk50_block_cache_benchmark",
+                "sparge_topk75_block_cache_benchmark",
+                "radial_conservative_block_cache_benchmark",
+                "radial_aggressive_block_cache_benchmark",
+            ],
+        )
+        self.assertNotIn("run_kind", selected_block["expected_environment"])
+        self.assertEqual(
+            selected_block["expected_environment"]["block_cache_policy"],
+            "fixed",
+        )
 
     def test_every_fixed_field_mutation_is_rejected(self):
         for run_kind in sorted(EXPECTED_RUN_KINDS):
@@ -276,6 +425,16 @@ class ImmutableEvalProtocolTests(unittest.TestCase):
             "debug_forward: false",
         ):
             self.assertIn(line, source)
+        self.assertIn(
+            "text_prompt: ${oc.env:FASTA2V_PROMPT_FILE}", source
+        )
+        runner = (
+            REPO_ROOT / "scripts" / "run_ovi_official_reference.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'FASTA2V_PROMPT_FILE="${REPO_ROOT}/prompts/ovi_smoke.csv"',
+            runner,
+        )
 
 
 if __name__ == "__main__":

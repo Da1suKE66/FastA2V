@@ -421,7 +421,73 @@ class RunnerOrderingTests(unittest.TestCase):
         "run_ovi_radial_conservative_baseline.sh",
         "run_ovi_radial_aggressive_smoke.sh",
         "run_ovi_radial_aggressive_baseline.sh",
+        "run_ovi_sparse_combo_baseline.sh",
     )
+
+    SPARGE_CUDA_BOUND_SCRIPTS = (
+        "install_sparge_attn.sh",
+        "run_ovi_sparge_smoke.sh",
+        "run_ovi_sparge_baseline.sh",
+        "run_ovi_sparge_topk75_smoke.sh",
+        "run_ovi_sparge_topk75_baseline.sh",
+        "run_ovi_sparse_combo_baseline.sh",
+    )
+
+    def test_sparge_scripts_bind_physical_zero_uuid_before_any_python(self):
+        for filename in self.SPARGE_CUDA_BOUND_SCRIPTS:
+            source = (REPO_ROOT / "scripts" / filename).read_text(
+                encoding="utf-8"
+            )
+            with self.subTest(filename=filename):
+                query_offset = source.index(
+                    "/usr/bin/nvidia-smi --id 0 --query-gpu=uuid"
+                )
+                case_offset = source.index(
+                    'case "${CUDA_VISIBLE_DEVICES:-}" in'
+                )
+                export_offset = source.index(
+                    'export CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU_ZERO_UUID}"'
+                )
+                first_python_offset = source.index(
+                    '"${FASTA2V_OVI_ENV}/bin/python"'
+                )
+                self.assertLess(query_offset, case_offset)
+                self.assertLess(case_offset, export_offset)
+                self.assertLess(export_offset, first_python_offset)
+                self.assertIn(
+                    '  ""|"0"|"${PHYSICAL_GPU_ZERO_UUID}") ;;',
+                    source,
+                )
+                self.assertIn(
+                    "CUDA_VISIBLE_DEVICES does not select physical GPU 0",
+                    source,
+                )
+                self.assertIn(
+                    "^GPU-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-"
+                    "[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+                    "[0-9A-Fa-f]{12}$",
+                    source,
+                )
+                self.assertEqual(
+                    source.count(
+                        'export CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU_ZERO_UUID}"'
+                    ),
+                    1,
+                )
+
+        combo_source = (
+            REPO_ROOT / "scripts" / "run_ovi_sparse_combo_baseline.sh"
+        ).read_text(encoding="utf-8")
+        self.assertLess(
+            combo_source.index(
+                'export CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU_ZERO_UUID}"'
+            ),
+            combo_source.index('source "${REPO_ROOT}/scripts/radial_env.sh"'),
+        )
+        self.assertNotIn(
+            'if [[ "${ATTENTION_METHOD}" == "radial" ]]; then',
+            combo_source,
+        )
 
     def test_idle_check_precedes_all_cuda_preflight_and_inference(self):
         for filename in self.RUNNERS:

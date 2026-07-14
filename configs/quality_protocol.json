@@ -1,21 +1,29 @@
 {
-  "schema_version": 1,
-  "protocol_id": "ovi_720x720_5s_dense_pair_quality_v1",
-  "description": "Pair each formal candidate measurement with the same-index formal dense artifact and compute decoded-media metrics without inventing acceptance thresholds.",
+  "schema_version": 2,
+  "protocol_id": "ovi_720x720_5s_dense_pair_quality_v2",
+  "description": "Pair each formal candidate artifact with the dense artifact having the same measurement, prompt, and sample identity and compute decoded-media metrics without inventing acceptance thresholds.",
   "reference_method_id": "dense",
   "measurement_indices": [
     0,
     1,
     2
   ],
-  "pairing_key": "measurement_index",
+  "pairing_key": [
+    "measurement_index",
+    "prompt_index",
+    "sample_index"
+  ],
   "require_artifact_sha256_before_and_after_metrics": true,
   "required_same_across_runs": [
     "git_commit",
     "checkpoint_fingerprint_sha256",
     "gpu_identity",
-    "prompt",
-    "seed",
+    "prompt_set_sha256",
+    "prompt_count",
+    "prompts",
+    "base_seed",
+    "sample_count",
+    "sample_seeds",
     "requested_shape",
     "actual_shape",
     "generated_video_shape",
@@ -145,6 +153,8 @@
     "template": "eval/manual_sync_reviews.csv",
     "fields": [
       "measurement_index",
+      "prompt_index",
+      "sample_index",
       "dense_artifact_sha256",
       "candidate_artifact_sha256",
       "reviewer",
@@ -162,7 +172,7 @@
       "fail",
       "uncertain"
     ],
-    "row_policy": "zero_rows_or_all_measurements",
+    "row_policy": "zero_rows_or_all_artifacts",
     "candidate_hash_binding_required": true,
     "automatic_population_forbidden": true
   }

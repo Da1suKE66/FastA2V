@@ -4,6 +4,23 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/scripts/env.sh"
 
+PHYSICAL_GPU_ZERO_UUID="$(
+  /usr/bin/nvidia-smi --id 0 --query-gpu=uuid --format=csv,noheader,nounits \
+    | awk 'NF {print $1; exit}'
+)"
+if [[ ! "${PHYSICAL_GPU_ZERO_UUID}" =~ ^GPU-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+  echo "Could not resolve physical GPU 0 UUID" >&2
+  exit 2
+fi
+case "${CUDA_VISIBLE_DEVICES:-}" in
+  ""|"0"|"${PHYSICAL_GPU_ZERO_UUID}") ;;
+  *)
+    echo "CUDA_VISIBLE_DEVICES does not select physical GPU 0" >&2
+    exit 2
+    ;;
+esac
+export CUDA_VISIBLE_DEVICES="${PHYSICAL_GPU_ZERO_UUID}"
+
 RUN_TAG="${FASTA2V_RUN_TAG:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 if [[ ! "${RUN_TAG}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
   echo "Invalid FASTA2V_RUN_TAG: ${RUN_TAG}" >&2

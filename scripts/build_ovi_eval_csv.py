@@ -20,7 +20,7 @@ import stat
 import statistics
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +28,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from ovi.gpu_process_monitor import (
+    GPU_EVIDENCE_SCHEMA_VERSION,
     GPU_PROCESS_MONITOR_SCHEMA_VERSION,
     GPU_QUERY_CADENCE_TOLERANCE_SECONDS,
     gpu_compute_snapshot_maximum_gap_seconds,
@@ -36,6 +37,15 @@ from ovi.gpu_process_monitor import (
     gpu_compute_snapshot_errors,
     trusted_nvidia_smi_metadata_errors,
     validate_pre_run_gpu_report,
+)
+from ovi.eval_protocol import prompt_sequence_sha256
+from ovi.sparge_evidence import (
+    SPARGEATTN_API,
+    SPARGEATTN_CLONE_URL,
+    SPARGEATTN_COMMIT,
+    SPARGEATTN_REPOSITORY,
+    sparge_microtest_evidence_errors,
+    sparge_receipt_evidence_errors,
 )
 from ovi.radial_evidence import (
     FLASHINFER_VERSION,
@@ -67,6 +77,112 @@ REQUIRED_METHOD_IDS = (
     "best_sparse_cfg",
 )
 OPTIONAL_METHOD_IDS = ("block_cache",)
+BEST_SPARSE_CFG_RUN_KINDS = (
+    "sparge_topk50_cfg_benchmark",
+    "sparge_topk75_cfg_benchmark",
+    "radial_conservative_cfg_benchmark",
+    "radial_aggressive_cfg_benchmark",
+)
+BLOCK_CACHE_RUN_KINDS = (
+    "sparge_topk50_block_cache_benchmark",
+    "sparge_topk75_block_cache_benchmark",
+    "radial_conservative_block_cache_benchmark",
+    "radial_aggressive_block_cache_benchmark",
+)
+SPARSE_COMBO_RUN_KIND_CONTRACTS = {
+    "sparge_topk50_cfg_benchmark": {
+        "attention_method": "sparge",
+        "sparge_topk": 0.5,
+        "sparge_pvthreshd": 50.0,
+        "sparge_smooth_k": True,
+        "use_cfg_cache": True,
+        "use_block_cache": False,
+        "block_cache_policy": "fixed",
+    },
+    "sparge_topk75_cfg_benchmark": {
+        "attention_method": "sparge",
+        "sparge_topk": 0.75,
+        "sparge_pvthreshd": 50.0,
+        "sparge_smooth_k": True,
+        "use_cfg_cache": True,
+        "use_block_cache": False,
+        "block_cache_policy": "fixed",
+    },
+    "radial_conservative_cfg_benchmark": {
+        "attention_method": "radial",
+        "radial_profile": "conservative",
+        "radial_decay_factor": 4.0,
+        "radial_model_type": "wan",
+        "radial_block_size": 128,
+        "use_cfg_cache": True,
+        "use_block_cache": False,
+        "block_cache_policy": "fixed",
+    },
+    "radial_aggressive_cfg_benchmark": {
+        "attention_method": "radial",
+        "radial_profile": "aggressive",
+        "radial_decay_factor": 1.0,
+        "radial_model_type": "wan",
+        "radial_block_size": 128,
+        "use_cfg_cache": True,
+        "use_block_cache": False,
+        "block_cache_policy": "fixed",
+    },
+    "sparge_topk50_block_cache_benchmark": {
+        "attention_method": "sparge",
+        "sparge_topk": 0.5,
+        "sparge_pvthreshd": 50.0,
+        "sparge_smooth_k": True,
+        "use_cfg_cache": False,
+        "use_block_cache": True,
+        "block_cache_policy": "fixed",
+    },
+    "sparge_topk75_block_cache_benchmark": {
+        "attention_method": "sparge",
+        "sparge_topk": 0.75,
+        "sparge_pvthreshd": 50.0,
+        "sparge_smooth_k": True,
+        "use_cfg_cache": False,
+        "use_block_cache": True,
+        "block_cache_policy": "fixed",
+    },
+    "radial_conservative_block_cache_benchmark": {
+        "attention_method": "radial",
+        "radial_profile": "conservative",
+        "radial_decay_factor": 4.0,
+        "radial_model_type": "wan",
+        "radial_block_size": 128,
+        "use_cfg_cache": False,
+        "use_block_cache": True,
+        "block_cache_policy": "fixed",
+    },
+    "radial_aggressive_block_cache_benchmark": {
+        "attention_method": "radial",
+        "radial_profile": "aggressive",
+        "radial_decay_factor": 1.0,
+        "radial_model_type": "wan",
+        "radial_block_size": 128,
+        "use_cfg_cache": False,
+        "use_block_cache": True,
+        "block_cache_policy": "fixed",
+    },
+}
+SPARSE_PROFILE_BY_RUN_KIND = {
+    run_kind: (
+        "sparge_topk50"
+        if run_kind.startswith("sparge_topk50_")
+        else "sparge_topk75"
+        if run_kind.startswith("sparge_topk75_")
+        else "radial_conservative"
+        if run_kind.startswith("radial_conservative_")
+        else "radial_aggressive"
+    )
+    for run_kind in SPARSE_COMBO_RUN_KIND_CONTRACTS
+}
+COMBO_METHOD_RUN_KINDS = {
+    "best_sparse_cfg": BEST_SPARSE_CFG_RUN_KINDS,
+    "block_cache": BLOCK_CACHE_RUN_KINDS,
+}
 MEASUREMENT_COUNT = 3
 GIB = 1024 ** 3
 HEX_SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -94,6 +210,15 @@ REQUIRED_PREFLIGHT_CHECKPOINTS = (
     "MMAudio/ext_weights/v1-16.pth",
     "Wan2.2-TI2V-5B/google/umt5-xxl/spiece.model",
 )
+SPARGE_PROVENANCE = {
+    "backend": "official_spargeattn",
+    "repository": SPARGEATTN_REPOSITORY,
+    "clone_url": SPARGEATTN_CLONE_URL,
+    "pinned_commit": SPARGEATTN_COMMIT,
+    "api": SPARGEATTN_API,
+    "tensor_layout": "NHD",
+    "return_sparsity": False,
+}
 
 CSV_FIELDS = (
     "method_id",
@@ -107,7 +232,14 @@ CSV_FIELDS = (
     "run_id",
     "verification_sha256",
     "preflight_sha256",
+    "timings_path",
+    "timings_bytes",
     "timings_sha256",
+    "timings_record_count",
+    "warmup_timings_path",
+    "warmup_timings_bytes",
+    "warmup_timings_sha256",
+    "warmup_record_count",
     "git_commit",
     "checkpoint_manifest_sha256",
     "checkpoint_fingerprint_sha256",
@@ -121,7 +253,12 @@ CSV_FIELDS = (
     "radial_mps_status",
     "prompt_sha256",
     "prompt",
+    "prompt_set_sha256",
+    "prompt_count",
+    "selected_sparse_profile",
     "seed",
+    "seed_count",
+    "seeds",
     "requested_height",
     "requested_width",
     "actual_height",
@@ -129,6 +266,7 @@ CSV_FIELDS = (
     "sample_steps",
     "measurement_count",
     "measurement_indices",
+    "artifact_count",
     "denoise_seconds_median",
     "total_generation_seconds_median",
     "artifact_ready_seconds_median",
@@ -343,6 +481,85 @@ def _snapshot_jsonl(
     return snapshot, records
 
 
+def _validate_jsonl_binding(
+    binding: Any,
+    *,
+    path: Path,
+    snapshot: _StableFileSnapshot,
+    record_count: int,
+    context: str,
+    label: str,
+) -> None:
+    """Cross-bind a verifier receipt to one stable canonical JSONL snapshot."""
+
+    _require(
+        isinstance(binding, dict)
+        and set(binding) == {"path", "bytes", "sha256", "record_count"},
+        context,
+        f"verification protocol {label} has invalid fields",
+    )
+    _require(
+        binding.get("path") == str(path),
+        context,
+        f"{label} path is not the canonical selected-run path",
+    )
+    _require(
+        _is_json_int(binding.get("bytes"))
+        and binding.get("bytes") == snapshot.size,
+        context,
+        f"{label} byte count differs from the stable snapshot",
+    )
+    _require(
+        isinstance(binding.get("sha256"), str)
+        and HEX_SHA256.fullmatch(binding["sha256"]) is not None
+        and binding.get("sha256") == snapshot.sha256,
+        context,
+        f"{label} SHA256 differs from the stable snapshot",
+    )
+    _require(
+        _is_json_int(binding.get("record_count"))
+        and binding.get("record_count") == record_count,
+        context,
+        f"{label} record count differs from the stable snapshot",
+    )
+
+
+def _validate_file_binding(
+    binding: Any,
+    *,
+    path: Path,
+    snapshot: _StableFileSnapshot,
+    context: str,
+    label: str,
+) -> None:
+    """Cross-bind a verifier artifact receipt to one stable file snapshot."""
+
+    _require(
+        isinstance(binding, dict)
+        and set(binding) == {"path", "bytes", "sha256"},
+        context,
+        f"verification artifact {label} has invalid fields",
+    )
+    _require(
+        binding.get("path") == str(path),
+        context,
+        f"{label} path is not the canonical selected-run path",
+    )
+    _require(
+        _is_json_int(binding.get("bytes"))
+        and binding.get("bytes") == snapshot.size,
+        context,
+        f"{label} byte count differs from the stable snapshot",
+    )
+    _require(
+        isinstance(binding.get("sha256"), str)
+        and HEX_SHA256.fullmatch(binding["sha256"]) is not None
+        and binding.get("sha256") == snapshot.sha256,
+        context,
+        f"{label} SHA256 differs from the stable snapshot",
+    )
+
+
 def _read_json(path: Path, context: str) -> Any:
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -417,6 +634,33 @@ def _validate_expected_fields(
             )
 
 
+def _validate_combo_run_environment(
+    method: Mapping[str, Any],
+    environment: Mapping[str, Any],
+    context: str,
+) -> None:
+    """Bind a selection slot to one of its four immutable sparse profiles."""
+
+    method_id = method.get("method_id")
+    allowed_run_kinds = COMBO_METHOD_RUN_KINDS.get(method_id)
+    if allowed_run_kinds is None:
+        return
+    run_kind = environment.get("run_kind")
+    _require(
+        isinstance(run_kind, str) and run_kind in allowed_run_kinds,
+        context,
+        f"run_kind={run_kind!r} is not allowed for selected slot {method_id}",
+    )
+    contract = SPARSE_COMBO_RUN_KIND_CONTRACTS[run_kind]
+    for field, expected in contract.items():
+        _require(
+            _values_equal(environment.get(field), expected),
+            context,
+            f"{run_kind} requires {field}={expected!r}, found "
+            f"{environment.get(field)!r}",
+        )
+
+
 def load_manifest(path: Path = DEFAULT_MANIFEST) -> dict[str, Any]:
     path = Path(path)
     manifest = _read_json(path, "evaluation manifest")
@@ -454,6 +698,49 @@ def load_manifest(path: Path = DEFAULT_MANIFEST) -> dict[str, Any]:
             context,
             "expected_environment must be an object",
         )
+        combo_run_kinds = COMBO_METHOD_RUN_KINDS.get(method_id)
+        if combo_run_kinds is not None:
+            _require(
+                method.get("implementation_status") == "ready",
+                context,
+                "sparse combination slot implementation must be ready",
+            )
+            _require(
+                method.get("selection_required") is True,
+                context,
+                "sparse combination slot must require an explicit selection",
+            )
+            _require(
+                isinstance(method.get("allowed_run_kinds"), list)
+                and tuple(method["allowed_run_kinds"]) == combo_run_kinds,
+                context,
+                "allowed_run_kinds differ from the four fixed sparse profiles",
+            )
+            expected_environment = (
+                {
+                    "use_block_cache": False,
+                    "use_cfg_cache": True,
+                }
+                if method_id == "best_sparse_cfg"
+                else {
+                    "block_cache_policy": "fixed",
+                    "use_block_cache": True,
+                    "use_cfg_cache": False,
+                }
+            )
+            _require(
+                method.get("expected_environment") == expected_environment,
+                context,
+                "selection-slot expected_environment differs from the fixed "
+                "cache contract",
+            )
+        else:
+            _require(
+                "allowed_run_kinds" not in method
+                and "selection_required" not in method,
+                context,
+                "only sparse combination slots may declare selection metadata",
+            )
 
     _require(
         tuple(ids) == REQUIRED_METHOD_IDS + OPTIONAL_METHOD_IDS,
@@ -933,11 +1220,239 @@ def _radial_loader_bootstrap_errors(
     return errors
 
 
+def _sparge_static_evidence_errors(
+    preflight: Any,
+    receipt: Any,
+    build_log_snapshot: _StableFileSnapshot,
+    install_gpu: Any,
+    install_gpu_snapshot: _StableFileSnapshot,
+    pre_run_gpu: Mapping[str, Any],
+) -> list[str]:
+    """Revalidate copied Sparge originals and their receipt/preflight chain."""
+
+    errors: list[str] = []
+    expected_gpu_uuid = pre_run_gpu.get("device_uuid")
+    errors.extend(
+        f"copied SpargeAttn receipt: {error}"
+        for error in sparge_receipt_evidence_errors(
+            receipt,
+            expected_gpu_uuid=expected_gpu_uuid,
+        )
+    )
+    if not isinstance(receipt, dict):
+        return errors
+
+    build_metadata = receipt.get("build_log")
+    if not isinstance(build_metadata, dict):
+        errors.append("SpargeAttn receipt build_log fingerprint is missing")
+    elif (
+        not _is_json_int(build_metadata.get("bytes"))
+        or build_metadata.get("bytes") != build_log_snapshot.size
+        or build_metadata.get("sha256") != build_log_snapshot.sha256
+    ):
+        errors.append("copied SpargeAttn build log differs from install receipt")
+
+    install_metadata = receipt.get("install_pre_run_gpu")
+    if not isinstance(install_metadata, dict):
+        errors.append("SpargeAttn receipt install GPU fingerprint is missing")
+    elif (
+        not _is_json_int(install_metadata.get("bytes"))
+        or install_metadata.get("bytes") != install_gpu_snapshot.size
+        or install_metadata.get("sha256") != install_gpu_snapshot.sha256
+        or install_metadata.get("device_uuid") != expected_gpu_uuid
+    ):
+        errors.append(
+            "copied SpargeAttn install GPU evidence differs from install receipt"
+        )
+
+    if not isinstance(install_gpu, dict):
+        errors.append("SpargeAttn install GPU evidence must be a JSON object")
+    else:
+        install_gpu_errors = validate_pre_run_gpu_report(
+            install_gpu,
+            cuda_visible_devices=install_gpu.get("cuda_visible_devices"),
+        )
+        if install_gpu_errors:
+            errors.append(
+                "SpargeAttn install GPU evidence is invalid: "
+                + "; ".join(install_gpu_errors)
+            )
+        if (
+            not _is_json_int(install_gpu.get("schema_version"))
+            or install_gpu.get("schema_version") != GPU_EVIDENCE_SCHEMA_VERSION
+            or install_gpu.get("check_type") != "pre_run_idle"
+            or install_gpu.get("valid_for_run") is not True
+            or install_gpu.get("idle") is not True
+            or not _is_json_int(install_gpu.get("process_count"))
+            or install_gpu.get("process_count") != 0
+            or install_gpu.get("processes") != []
+            or install_gpu.get("errors") != []
+            or install_gpu.get("device_uuid") != expected_gpu_uuid
+        ):
+            errors.append(
+                "SpargeAttn install GPU evidence is not a schema-2 idle "
+                "record for the benchmark GPU UUID"
+            )
+
+    if not isinstance(preflight, dict):
+        errors.append("Sparge preflight must be a JSON object")
+        return errors
+    if preflight.get("errors") != []:
+        errors.append("Sparge preflight errors must be an explicit empty list")
+    if preflight.get("attention_method") != "sparge":
+        errors.append("Sparge preflight attention_method must be sparge")
+    preflight_sparge = preflight.get("spargeattn")
+    if not isinstance(preflight_sparge, dict):
+        errors.append("Sparge preflight is missing spargeattn evidence")
+    else:
+        expected_fields = {
+            "package_version": receipt.get("package_version"),
+            "pinned_commit": SPARGEATTN_COMMIT,
+            "api": SPARGEATTN_API,
+            "install_receipt": "/cache/liluchen/FastA2V/spargeattn-install.json",
+            "install_receipt_contents": receipt,
+            "installed_files_verified": True,
+        }
+        for field, expected in expected_fields.items():
+            if not _strict_json_equal(preflight_sparge.get(field), expected):
+                errors.append(
+                    f"Sparge preflight {field} differs from fixed install evidence"
+                )
+    errors.extend(
+        f"Sparge preflight microtest: {error}"
+        for error in sparge_microtest_evidence_errors(
+            preflight.get("spargeattn_microtest"),
+            expected_gpu_uuid=expected_gpu_uuid,
+        )
+    )
+    return errors
+
+
+def _sparge_dispatcher_errors(
+    dispatcher: Any,
+    environment: Mapping[str, Any],
+    copied_receipt: Any,
+    expected_gpu_uuid: Any,
+    context: str,
+    *,
+    block_cache_saved_calls: Any = None,
+) -> list[str]:
+    """Revalidate one formal Sparge dispatcher without trusting verifier JSON."""
+
+    if not isinstance(dispatcher, dict):
+        return [f"{context}: video_self_attention_dispatcher is missing"]
+    errors: list[str] = []
+    calls = dispatcher.get("calls_total")
+    expected_calls = dispatcher.get("expected_calls")
+    expected_without = dispatcher.get("expected_calls_without_block_cache")
+    if not _is_json_int(calls) or calls <= 0:
+        errors.append(f"{context}: dispatcher calls_total must be positive")
+    if not _is_json_int(expected_calls) or expected_calls <= 0:
+        errors.append(f"{context}: dispatcher expected_calls must be positive")
+    if calls != expected_calls:
+        errors.append(f"{context}: dispatcher calls do not match expected_calls")
+    if not _is_json_int(expected_without) or expected_without <= 0:
+        errors.append(
+            f"{context}: expected_calls_without_block_cache must be a positive "
+            "JSON integer"
+        )
+    elif environment.get("use_block_cache") is True:
+        if (
+            not _is_json_int(block_cache_saved_calls)
+            or block_cache_saved_calls < 0
+        ):
+            errors.append(
+                f"{context}: block-cache saved calls must be a nonnegative "
+                "JSON integer"
+            )
+        elif (
+            _is_json_int(expected_calls)
+            and expected_without != expected_calls + block_cache_saved_calls
+        ):
+            errors.append(
+                f"{context}: expected_calls_without_block_cache does not equal "
+                "expected_calls plus block-cache savings"
+            )
+    elif _is_json_int(expected_calls) and expected_without != expected_calls:
+        errors.append(
+            f"{context}: non-block expected_calls_without_block_cache differs "
+            "from expected_calls"
+        )
+
+    expected_top = {
+        "configured_method": "sparge",
+        "active_method": "sparge",
+        "backend_ready": True,
+        "fallback_allowed": False,
+        "fallback_used": False,
+        "fallback_count": 0,
+        "fallback_reason": None,
+        "calls_match_expected": True,
+        "calls_by_method": {
+            "dense": 0,
+            "sparge": calls,
+            "radial": 0,
+            "svg": 0,
+        },
+        "errors_by_method": {
+            "dense": 0,
+            "sparge": 0,
+            "radial": 0,
+            "svg": 0,
+        },
+    }
+    for field, expected in expected_top.items():
+        if not _strict_json_equal(dispatcher.get(field), expected):
+            errors.append(f"{context}: dispatcher {field} differs from fixed evidence")
+
+    details = dispatcher.get("backend_details")
+    if not isinstance(details, dict):
+        errors.append(f"{context}: Sparge backend_details is missing")
+        return errors
+    for field, expected in SPARGE_PROVENANCE.items():
+        if not _strict_json_equal(details.get(field), expected):
+            errors.append(
+                f"{context}: Sparge backend {field} differs from fixed provenance"
+            )
+    backend_calls = details.get("calls")
+    if not _is_json_int(backend_calls) or backend_calls != calls:
+        errors.append(f"{context}: Sparge backend calls differ from dispatcher")
+    expected_backend = {
+        "last_nhd_shape": [1, 15004, 24, 128],
+        "last_dtype": "torch.bfloat16",
+        "last_device": "cuda:0",
+        "topk": environment.get("sparge_topk"),
+        "pvthreshd": environment.get("sparge_pvthreshd"),
+        "smooth_k": environment.get("sparge_smooth_k"),
+    }
+    for field, expected in expected_backend.items():
+        if not _strict_json_equal(details.get(field), expected):
+            errors.append(
+                f"{context}: Sparge backend {field} differs from environment"
+            )
+    backend_receipt = details.get("install_receipt")
+    if not _strict_json_equal(backend_receipt, copied_receipt):
+        errors.append(
+            f"{context}: Sparge backend receipt differs from copied run receipt"
+        )
+    else:
+        errors.extend(
+            f"{context}: Sparge backend receipt: {error}"
+            for error in sparge_receipt_evidence_errors(
+                backend_receipt,
+                expected_gpu_uuid=expected_gpu_uuid,
+            )
+        )
+    return errors
+
+
 def _radial_dispatcher_errors(
     dispatcher: Any,
     environment: dict[str, Any],
     copied_receipt: Any,
     context: str,
+    *,
+    block_cache_saved_calls: Any = None,
 ) -> list[str]:
     """Revalidate each formal Radial measurement's live dispatcher receipt."""
 
@@ -952,6 +1467,43 @@ def _radial_dispatcher_errors(
         errors.append(f"{context}: dispatcher expected_calls must be positive")
     if calls != expected_calls:
         errors.append(f"{context}: dispatcher calls do not match expected_calls")
+    expected_without_block_cache = dispatcher.get(
+        "expected_calls_without_block_cache"
+    )
+    if (
+        not _is_json_int(expected_without_block_cache)
+        or expected_without_block_cache <= 0
+    ):
+        errors.append(
+            f"{context}: dispatcher expected_calls_without_block_cache "
+            "must be a positive JSON integer"
+        )
+    elif environment.get("use_block_cache") is True:
+        if (
+            not _is_json_int(block_cache_saved_calls)
+            or block_cache_saved_calls < 0
+        ):
+            errors.append(
+                f"{context}: block-cache saved calls must be a nonnegative "
+                "JSON integer"
+            )
+        elif (
+            _is_json_int(expected_calls)
+            and expected_without_block_cache
+            != expected_calls + block_cache_saved_calls
+        ):
+            errors.append(
+                f"{context}: dispatcher expected_calls_without_block_cache "
+                "does not equal expected_calls plus recorded block-cache savings"
+            )
+    elif (
+        _is_json_int(expected_calls)
+        and expected_without_block_cache != expected_calls
+    ):
+        errors.append(
+            f"{context}: non-block dispatcher expected_calls_without_block_cache "
+            "differs from expected_calls"
+        )
     expected_top = {
         "configured_method": "radial",
         "active_method": "radial",
@@ -973,7 +1525,6 @@ def _radial_dispatcher_errors(
             "radial": 0,
             "svg": 0,
         },
-        "expected_calls_without_block_cache": expected_calls,
     }
     for field, expected in expected_top.items():
         if not _strict_json_equal(dispatcher.get(field), expected):
@@ -1293,6 +1844,7 @@ def validate_run(
     environment_path = run_dir / "environment.json"
     verification_path = run_dir / "verification.json"
     timings_path = run_dir / "timings.jsonl"
+    warmup_timings_path = run_dir / "warmup_timings.jsonl"
     checkpoint_path = run_dir / "checkpoint_manifest.json"
     pre_run_gpu_path = run_dir / "pre_run_gpu.json"
     preflight_path = run_dir / "preflight.json"
@@ -1300,6 +1852,10 @@ def validate_run(
     environment_snapshot, environment = _snapshot_json(environment_path, context)
     verification_snapshot, verification = _snapshot_json(verification_path, context)
     timings_snapshot, timings = _snapshot_jsonl(timings_path, context)
+    warmup_timings_snapshot, warmup_timings = _snapshot_jsonl(
+        warmup_timings_path,
+        context,
+    )
     checkpoint_snapshot, checkpoint_manifest = _snapshot_json(
         checkpoint_path, context
     )
@@ -1309,6 +1865,7 @@ def validate_run(
             environment_snapshot,
             verification_snapshot,
             timings_snapshot,
+            warmup_timings_snapshot,
             checkpoint_snapshot,
             pre_run_snapshot,
         )
@@ -1319,8 +1876,22 @@ def validate_run(
     flashinfer_manifest_snapshot = None
     copied_flashinfer_manifest = None
     copied_artifact_snapshots: dict[str, _StableFileSnapshot] = {}
-    if isinstance(environment, dict) and environment.get("attention_method") == "radial":
+    sparge_receipt_snapshot = None
+    sparge_receipt = None
+    sparge_build_log_snapshot = None
+    sparge_install_gpu_snapshot = None
+    sparge_install_gpu = None
+    attention_method = (
+        environment.get("attention_method")
+        if isinstance(environment, dict)
+        else None
+    )
+    if attention_method in {"radial", "sparge"}:
         preflight_snapshot, preflight = _snapshot_json(preflight_path, context)
+        stable_snapshots.append(preflight_snapshot)
+    else:
+        preflight = None
+    if attention_method == "radial":
         copied_receipt_snapshot, copied_receipt = _snapshot_json(
             run_dir / "radialattn-install.json", context
         )
@@ -1338,22 +1909,46 @@ def validate_run(
             )
         stable_snapshots.extend(
             (
-                preflight_snapshot,
                 copied_receipt_snapshot,
                 flashinfer_manifest_snapshot,
                 *copied_artifact_snapshots.values(),
             )
         )
-    else:
-        preflight = None
+    elif attention_method == "sparge":
+        sparge_receipt_snapshot, sparge_receipt = _snapshot_json(
+            run_dir / "spargeattn-install.json",
+            context,
+        )
+        sparge_build_log_snapshot = _stable_file_snapshot(
+            run_dir / "spargeattn-build.log",
+            context,
+        )
+        sparge_install_gpu_snapshot, sparge_install_gpu = _snapshot_json(
+            run_dir / "spargeattn-install-pre_run_gpu.json",
+            context,
+        )
+        stable_snapshots.extend(
+            (
+                sparge_receipt_snapshot,
+                sparge_build_log_snapshot,
+                sparge_install_gpu_snapshot,
+            )
+        )
     required_payloads = [
         ("environment.json", environment),
         ("verification.json", verification),
         ("checkpoint_manifest.json", checkpoint_manifest),
         ("pre_run_gpu.json", pre_run_gpu),
     ]
-    if environment.get("attention_method") == "radial":
+    if environment.get("attention_method") in {"radial", "sparge"}:
         required_payloads.append(("preflight.json", preflight))
+    if environment.get("attention_method") == "sparge":
+        required_payloads.extend(
+            (
+                ("spargeattn-install.json", sparge_receipt),
+                ("spargeattn-install-pre_run_gpu.json", sparge_install_gpu),
+            )
+        )
     for name, payload in required_payloads:
         _require(isinstance(payload, dict), context, f"{name} must contain an object")
 
@@ -1437,29 +2032,93 @@ def validate_run(
             f"{field} is missing",
         )
 
+    # Prompt and sample cardinalities are run-level dimensions.  Their current
+    # values remain fixed by the checked-in matrix, while the evidence model
+    # below deliberately derives the full Cartesian identity set so a future
+    # matrix revision can raise either cardinality without another schema
+    # redesign.
     _validate_expected_fields(environment, fixed_protocol, context)
     _validate_expected_fields(environment, method["expected_environment"], context)
-    _require(environment.get("measurement_runs") == MEASUREMENT_COUNT, context, "measurement_runs must equal three")
-    _require(environment.get("expected_measurement_records") == MEASUREMENT_COUNT, context, "expected_measurement_records must equal three")
+    _validate_combo_run_environment(method, environment, context)
+    measurement_runs = environment.get("measurement_runs")
+    prompt_count = environment.get("prompt_count")
+    sample_count = environment.get("each_example_n_times")
+    warmup_runs = environment.get("warmup_runs")
+    for field, value in (
+        ("measurement_runs", measurement_runs),
+        ("prompt_count", prompt_count),
+        ("each_example_n_times", sample_count),
+        ("warmup_runs", warmup_runs),
+    ):
+        _require(
+            _is_json_int(value) and value > 0,
+            context,
+            f"{field} must be a positive integer",
+        )
     _require(
-        protocol.get("expected_measurement_records") == MEASUREMENT_COUNT
-        and protocol.get("observed_measurement_records") == MEASUREMENT_COUNT,
+        measurement_runs == MEASUREMENT_COUNT,
         context,
-        "verification protocol does not contain exactly three measurements",
+        "measurement_runs must equal three",
+    )
+    expected_artifact_count = measurement_runs * prompt_count * sample_count
+    _require(
+        environment.get("expected_measurement_records")
+        == expected_artifact_count,
+        context,
+        "expected_measurement_records does not equal "
+        "measurement_runs * prompt_count * each_example_n_times",
     )
     _require(
-        protocol.get("expected_warmup_records") == 1
-        and protocol.get("observed_warmup_records") == 1,
+        environment.get("expected_warmup_records") == warmup_runs,
         context,
-        "verification protocol does not contain exactly one excluded warm-up",
+        "expected_warmup_records differs from warmup_runs",
     )
-    _require(len(timings) == MEASUREMENT_COUNT, context, "timings.jsonl must contain exactly three measurements")
+    _require(
+        protocol.get("expected_measurement_records") == expected_artifact_count
+        and protocol.get("observed_measurement_records")
+        == expected_artifact_count,
+        context,
+        "verification protocol does not contain the complete artifact matrix",
+    )
+    _require(
+        protocol.get("expected_warmup_records") == warmup_runs
+        and protocol.get("observed_warmup_records") == warmup_runs,
+        context,
+        "verification protocol does not contain the expected excluded warm-ups",
+    )
+    _require(
+        len(timings) == expected_artifact_count,
+        context,
+        "timings.jsonl does not contain the complete artifact matrix",
+    )
+    _require(
+        len(warmup_timings) == warmup_runs,
+        context,
+        "warmup_timings.jsonl record count differs from warmup_runs",
+    )
+
+    _validate_jsonl_binding(
+        protocol.get("timings_binding"),
+        path=timings_path,
+        snapshot=timings_snapshot,
+        record_count=len(timings),
+        context=context,
+        label="timings_binding",
+    )
+    _validate_jsonl_binding(
+        protocol.get("warmup_timings_binding"),
+        path=warmup_timings_path,
+        snapshot=warmup_timings_snapshot,
+        record_count=len(warmup_timings),
+        context=context,
+        label="warmup_timings_binding",
+    )
 
     checkpoint_manifest_sha256 = checkpoint_snapshot.sha256
     pre_run_gpu_sha256 = pre_run_snapshot.sha256
     preflight_sha256 = (
         preflight_snapshot.sha256
-        if environment.get("attention_method") == "radial"
+        if environment.get("attention_method") in {"radial", "sparge"}
         else ""
     )
     evidence_hashes = environment.get("evidence_file_sha256")
@@ -1483,6 +2142,44 @@ def validate_run(
         "radial_host_pid_ownership": "",
         "radial_mps_status": "",
     }
+    if environment.get("attention_method") == "sparge":
+        sparge_original_snapshots = {
+            "preflight.json": preflight_snapshot,
+            "spargeattn-install.json": sparge_receipt_snapshot,
+            "spargeattn-build.log": sparge_build_log_snapshot,
+            "spargeattn-install-pre_run_gpu.json": sparge_install_gpu_snapshot,
+        }
+        for filename, snapshot in sparge_original_snapshots.items():
+            _require(
+                isinstance(snapshot, _StableFileSnapshot)
+                and evidence_hashes.get(filename) == snapshot.sha256,
+                context,
+                f"{filename} hash differs from environment evidence",
+            )
+        _require(
+            environment.get("spas_sage_attn")
+            == (
+                sparge_receipt.get("package_version")
+                if isinstance(sparge_receipt, dict)
+                else None
+            ),
+            context,
+            "environment SpargeAttn package version differs from install receipt",
+        )
+        sparge_static_errors = _sparge_static_evidence_errors(
+            preflight,
+            sparge_receipt,
+            sparge_build_log_snapshot,
+            sparge_install_gpu,
+            sparge_install_gpu_snapshot,
+            pre_run_gpu,
+        )
+        _require(
+            not sparge_static_errors,
+            context,
+            "Sparge original evidence is invalid: "
+            + "; ".join(sparge_static_errors),
+        )
     if environment.get("attention_method") == "radial":
         radial_original_snapshots = {
             "radialattn-install.json": copied_receipt_snapshot,
@@ -1588,67 +2285,148 @@ def validate_run(
         nonnegative=True,
     )
 
-    indices = [record.get("measurement_index") for record in timings]
+    identities: list[tuple[int, int, int]] = []
+    for record_index, record in enumerate(timings):
+        record_context = f"{context} measurement[{record_index}]"
+        identity = tuple(
+            record.get(field)
+            for field in (
+                "measurement_index",
+                "prompt_index",
+                "sample_index",
+            )
+        )
+        _require(
+            all(_is_json_int(value) and value >= 0 for value in identity),
+            record_context,
+            f"artifact identity must contain nonnegative integers, found {identity!r}",
+        )
+        identities.append(identity)
+    expected_identities = {
+        (measurement_index, prompt_index, sample_index)
+        for measurement_index in range(measurement_runs)
+        for prompt_index in range(prompt_count)
+        for sample_index in range(sample_count)
+    }
     _require(
-        all(isinstance(index, int) and not isinstance(index, bool) for index in indices),
+        len(set(identities)) == len(identities),
         context,
-        f"measurement indices must be integers, found {indices!r}",
+        "artifact identities are duplicated",
     )
     _require(
-        len(set(indices)) == MEASUREMENT_COUNT,
+        set(identities) == expected_identities,
         context,
-        f"measurement indices must not be duplicated, found {indices!r}",
+        "artifact identities do not form the complete "
+        "measurement_index,prompt_index,sample_index matrix",
     )
-    _require(
-        set(indices) == set(range(MEASUREMENT_COUNT)),
-        context,
-        f"measurement indices must be exactly 0,1,2, found {indices!r}",
-    )
-
     verified_artifacts = verification.get("artifacts")
     _require(
-        verification.get("artifact_count") == MEASUREMENT_COUNT
+        verification.get("artifact_count") == expected_artifact_count
         and isinstance(verified_artifacts, list)
-        and len(verified_artifacts) == MEASUREMENT_COUNT,
+        and len(verified_artifacts) == expected_artifact_count,
         context,
-        "verification must contain exactly three artifacts",
+        "verification must contain the complete artifact matrix",
     )
-    verified_by_path: dict[Path, str] = {}
+    verified_by_path: dict[Path, tuple[int, int, int]] = {}
+    verified_by_identity: dict[tuple[int, int, int], dict[str, Any]] = {}
     for report_index, report in enumerate(verified_artifacts):
         report_context = f"{context} verified artifact[{report_index}]"
         _require(isinstance(report, dict), report_context, "artifact report must be an object")
         _require(report.get("status") == "ok", report_context, "artifact status is not ok")
         _require(report.get("errors") == [], report_context, "artifact report contains errors")
+        report_identity = tuple(
+            report.get(field)
+            for field in (
+                "measurement_index",
+                "prompt_index",
+                "sample_index",
+            )
+        )
+        _require(
+            all(_is_json_int(value) and value >= 0 for value in report_identity),
+            report_context,
+            "artifact report identity must contain nonnegative JSON integers",
+        )
+        _require(
+            report_identity not in verified_by_identity,
+            report_context,
+            "artifact report identity is duplicated",
+        )
+        report_prompt = report.get("prompt")
+        report_seed = report.get("seed")
+        _require(
+            isinstance(report_prompt, str) and report_prompt,
+            report_context,
+            "artifact report prompt is missing",
+        )
+        _require(
+            _is_json_int(report_seed),
+            report_context,
+            "artifact report seed is invalid",
+        )
         report_path_value = report.get("path")
         _require(isinstance(report_path_value, str) and report_path_value, report_context, "artifact path is missing")
         report_path = Path(report_path_value)
         _require(report_path.is_absolute(), report_context, "artifact path must be absolute")
         _require(report_path.parent == run_dir, report_context, "artifact is outside the selected run directory")
+        _require(
+            report_path == run_dir / report_path.name,
+            report_context,
+            "artifact path is not canonical",
+        )
         report_hash = report.get("sha256")
         _require(
             isinstance(report_hash, str) and HEX_SHA256.fullmatch(report_hash) is not None,
             report_context,
             "artifact SHA256 is invalid",
         )
+        metrics_path_value = report.get("metrics_path")
+        _require(
+            isinstance(metrics_path_value, str) and metrics_path_value,
+            report_context,
+            "metrics sidecar path is missing",
+        )
+        metrics_path = Path(metrics_path_value)
+        _require(
+            metrics_path.is_absolute()
+            and metrics_path.parent == run_dir
+            and metrics_path == run_dir / metrics_path.name,
+            report_context,
+            "metrics sidecar path is outside the selected run directory or not canonical",
+        )
+        _require(
+            metrics_path == report_path.with_suffix(".metrics.json"),
+            report_context,
+            "metrics sidecar path does not match the artifact path",
+        )
         _require(report_path not in verified_by_path, report_context, "artifact path is duplicated")
-        verified_by_path[report_path] = report_hash
+        verified_by_path[report_path] = report_identity
+        verified_by_identity[report_identity] = report
+
+    _require(
+        set(verified_by_identity) == expected_identities,
+        context,
+        "verification artifact identities do not form the complete matrix",
+    )
 
     denoise_values = []
     total_values = []
     artifact_ready_values = []
     allocated_values = []
     reserved_values = []
-    prompts = set()
-    seeds = set()
+    prompt_by_index: dict[int, str] = {}
+    seed_by_sample_index: dict[int, int] = {}
     actual_shapes = set()
     generated_video_shapes = set()
     generated_audio_shapes = set()
     timing_paths = set()
-    artifact_hashes = []
-    metrics_sidecar_hashes = []
+    artifact_hashes: list[tuple[tuple[int, int, int], str]] = []
+    metrics_sidecar_hashes: list[tuple[tuple[int, int, int], str]] = []
 
     for record_index, record in enumerate(timings):
         record_context = f"{context} measurement[{record_index}]"
+        identity = identities[record_index]
+        measurement_index, prompt_index, sample_index = identity
         _require(record.get("status") == "ok", record_context, "status is not ok")
         _require(record.get("record_type") == "measurement", record_context, "record_type is not measurement")
         _require(record.get("benchmark_candidate") is True, record_context, "record is not a benchmark candidate")
@@ -1659,12 +2437,32 @@ def validate_run(
                 record_context,
                 f"{field} differs from environment",
             )
-        if environment.get("attention_method") == "radial":
+        if environment.get("attention_method") == "sparge":
+            dispatcher_errors = _sparge_dispatcher_errors(
+                record.get("video_self_attention_dispatcher"),
+                environment,
+                sparge_receipt,
+                pre_run_gpu.get("device_uuid"),
+                record_context,
+                block_cache_saved_calls=record.get(
+                    "block_cache_saved_video_self_attention_calls"
+                ),
+            )
+            _require(
+                not dispatcher_errors,
+                record_context,
+                "Sparge dispatcher evidence is invalid: "
+                + "; ".join(dispatcher_errors),
+            )
+        elif environment.get("attention_method") == "radial":
             dispatcher_errors = _radial_dispatcher_errors(
                 record.get("video_self_attention_dispatcher"),
                 environment,
                 copied_receipt,
                 record_context,
+                block_cache_saved_calls=record.get(
+                    "block_cache_saved_video_self_attention_calls"
+                ),
             )
             _require(
                 not dispatcher_errors,
@@ -1689,7 +2487,24 @@ def validate_run(
         seed = record.get("seed")
         _require(isinstance(prompt, str) and prompt, record_context, "prompt is missing")
         _require(isinstance(seed, int) and not isinstance(seed, bool), record_context, "seed is invalid")
-        _require(seed == environment.get("seed"), record_context, "seed differs from environment")
+        expected_seed = environment.get("seed") + sample_index
+        _require(
+            seed == expected_seed,
+            record_context,
+            "seed differs from the fixed base seed plus sample_index",
+        )
+        previous_prompt = prompt_by_index.setdefault(prompt_index, prompt)
+        _require(
+            previous_prompt == prompt,
+            record_context,
+            "prompt text is inconsistent for prompt_index",
+        )
+        previous_seed = seed_by_sample_index.setdefault(sample_index, seed)
+        _require(
+            previous_seed == seed,
+            record_context,
+            "seed is inconsistent for sample_index",
+        )
         record_requested = _shape(
             record.get("requested_video_frame_height_width"),
             record_context,
@@ -1737,6 +2552,11 @@ def validate_run(
         output_path = Path(output_path_value)
         _require(output_path.is_absolute(), record_context, "output artifact path must be absolute")
         _require(output_path.parent == run_dir, record_context, "output artifact is outside the selected run directory")
+        _require(
+            output_path == run_dir / output_path.name,
+            record_context,
+            "output artifact path is not canonical",
+        )
         _require(output_path not in timing_paths, record_context, "output artifact path is duplicated")
         metrics_path = output_path.with_suffix(".metrics.json")
         output_snapshot = _stable_file_snapshot(output_path, record_context)
@@ -1756,10 +2576,47 @@ def validate_run(
         )
         actual_hash = output_snapshot.sha256
         _require(actual_hash == output_hash, record_context, "output artifact SHA256 differs from timing record")
+        verified_report = verified_by_identity.get(identity)
         _require(
-            verified_by_path.get(output_path) == actual_hash,
+            isinstance(verified_report, dict),
+            record_context,
+            "artifact identity is missing from the verification report",
+        )
+        _require(
+            verified_report.get("path") == str(output_path)
+            and verified_by_path.get(output_path) == identity,
+            record_context,
+            "output artifact path is assigned to a different verification identity",
+        )
+        _require(
+            verified_report.get("sha256") == actual_hash,
             record_context,
             "output artifact SHA256 differs from verification report",
+        )
+        _require(
+            verified_report.get("prompt") == prompt
+            and _strict_json_equal(verified_report.get("seed"), seed),
+            record_context,
+            "prompt or seed differs from the verification report",
+        )
+        _require(
+            verified_report.get("metrics_path") == str(metrics_path),
+            record_context,
+            "metrics sidecar path differs from the verification report",
+        )
+        _validate_file_binding(
+            verified_report.get("artifact_binding"),
+            path=output_path,
+            snapshot=output_snapshot,
+            context=record_context,
+            label="artifact_binding",
+        )
+        _validate_file_binding(
+            verified_report.get("metrics_binding"),
+            path=metrics_path,
+            snapshot=metrics_snapshot,
+            context=record_context,
+            label="metrics_binding",
         )
 
         denoise_values.append(denoise)
@@ -1767,28 +2624,149 @@ def validate_run(
         artifact_ready_values.append(artifact_ready)
         allocated_values.append(allocated)
         reserved_values.append(reserved)
-        prompts.add(prompt)
-        seeds.add(seed)
         actual_shapes.add(actual_shape)
         generated_video_shapes.add(generated_video_shape)
         generated_audio_shapes.add(generated_audio_shape)
         timing_paths.add(output_path)
-        artifact_hashes.append(actual_hash)
-        metrics_sidecar_hashes.append(metrics_snapshot.sha256)
+        artifact_hashes.append((identity, actual_hash))
+        metrics_sidecar_hashes.append((identity, metrics_snapshot.sha256))
 
     _require(timing_paths == set(verified_by_path), context, "timing artifacts differ from verified artifacts")
-    _require(len(prompts) == 1, context, "measurements do not use exactly one prompt")
-    _require(len(seeds) == 1, context, "measurements do not use exactly one seed")
+    _require(
+        set(prompt_by_index) == set(range(prompt_count)),
+        context,
+        "prompt indices do not cover the declared prompt set",
+    )
+    _require(
+        set(seed_by_sample_index) == set(range(sample_count)),
+        context,
+        "sample indices do not cover the declared seed schedule",
+    )
+    ordered_prompts = tuple(
+        prompt_by_index[index] for index in range(prompt_count)
+    )
+    ordered_seeds = tuple(
+        seed_by_sample_index[index] for index in range(sample_count)
+    )
+    prompt_set_sha256 = prompt_sequence_sha256(ordered_prompts)
+    _require(
+        environment.get("prompts_sha256") == prompt_set_sha256,
+        context,
+        "ordered prompt set hash differs from environment prompts_sha256",
+    )
+
+    for warmup_index, warmup in enumerate(warmup_timings):
+        warmup_context = f"{context} warmup[{warmup_index}]"
+        _require(warmup.get("status") == "ok", warmup_context, "status is not ok")
+        _require(
+            warmup.get("record_type") == "warmup",
+            warmup_context,
+            "record_type is not warmup",
+        )
+        _require(
+            warmup.get("benchmark_candidate") is True,
+            warmup_context,
+            "warm-up is not a benchmark candidate",
+        )
+        _require(
+            warmup.get("benchmark_valid") is False,
+            warmup_context,
+            "warm-up must be excluded from benchmark statistics",
+        )
+        _require(
+            warmup.get("warmup_index") == warmup_index,
+            warmup_context,
+            "warmup_index is missing, duplicated, or out of order",
+        )
+        _require(
+            warmup.get("run_id") == environment.get("run_id"),
+            warmup_context,
+            "run_id differs from environment",
+        )
+        _require(
+            warmup.get("prompt") == ordered_prompts[0],
+            warmup_context,
+            "warm-up prompt differs from the first fixed prompt",
+        )
+        _require(
+            warmup.get("seed") == environment.get("seed"),
+            warmup_context,
+            "warm-up seed differs from the fixed base seed",
+        )
+        for field in (
+            "sample_steps",
+            "attention_method",
+            "use_cfg_cache",
+            "use_block_cache",
+        ):
+            _require(
+                _values_equal(warmup.get(field), environment.get(field)),
+                warmup_context,
+                f"{field} differs from environment",
+            )
+        warmup_total = _finite_number(
+            warmup,
+            "total_generation_seconds",
+            warmup_context,
+            positive=True,
+        )
+        _validate_gpu_monitor(
+            warmup.get("gpu_process_monitor"),
+            environment,
+            expected_nvidia_smi_binary,
+            pre_run_gpu.get("boot_id"),
+            environment.get("gpu_process_monitor_interval_seconds"),
+            warmup_total,
+            warmup_context,
+        )
+        if environment.get("attention_method") == "sparge":
+            dispatcher_errors = _sparge_dispatcher_errors(
+                warmup.get("video_self_attention_dispatcher"),
+                environment,
+                sparge_receipt,
+                pre_run_gpu.get("device_uuid"),
+                warmup_context,
+                block_cache_saved_calls=warmup.get(
+                    "block_cache_saved_video_self_attention_calls"
+                ),
+            )
+            _require(
+                not dispatcher_errors,
+                warmup_context,
+                "Sparge dispatcher evidence is invalid: "
+                + "; ".join(dispatcher_errors),
+            )
+        elif environment.get("attention_method") == "radial":
+            dispatcher_errors = _radial_dispatcher_errors(
+                warmup.get("video_self_attention_dispatcher"),
+                environment,
+                copied_receipt,
+                warmup_context,
+                block_cache_saved_calls=warmup.get(
+                    "block_cache_saved_video_self_attention_calls"
+                ),
+            )
+            _require(
+                not dispatcher_errors,
+                warmup_context,
+                "Radial dispatcher evidence is invalid: "
+                + "; ".join(dispatcher_errors),
+            )
+
     _require(len(actual_shapes) == 1, context, "measurements have inconsistent actual shapes")
     _require(len(generated_video_shapes) == 1, context, "measurements have inconsistent video tensor shapes")
     _require(len(generated_audio_shapes) == 1, context, "measurements have inconsistent audio tensor shapes")
 
-    prompt = next(iter(prompts))
-    seed = next(iter(seeds))
+    prompt = ordered_prompts[0] if prompt_count == 1 else ""
+    prompt_sha256 = (
+        hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if prompt_count == 1
+        else ""
+    )
+    seed = ordered_seeds[0] if len(ordered_seeds) == 1 else ""
     actual_shape = next(iter(actual_shapes))
     generated_video_shape = next(iter(generated_video_shapes))
     generated_audio_shape = next(iter(generated_audio_shapes))
-    prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     comparison_values = {
         "git_commit": git_commit,
         "checkpoint_fingerprint_sha256": checkpoint_fingerprint,
@@ -1797,8 +2775,12 @@ def validate_run(
             environment.get("gpu_uuid"),
             environment.get("gpu_name"),
         ),
-        "prompt": prompt,
-        "seed": seed,
+        "prompt_set_sha256": prompt_set_sha256,
+        "prompt_count": prompt_count,
+        "prompts": ordered_prompts,
+        "base_seed": environment.get("seed"),
+        "sample_count": sample_count,
+        "sample_seeds": ordered_seeds,
         "requested_shape": requested_shape,
         "actual_shape": actual_shape,
         "generated_video_shape": generated_video_shape,
@@ -1810,7 +2792,14 @@ def validate_run(
         "run_id": environment.get("run_id"),
         "verification_sha256": verification_snapshot.sha256,
         "preflight_sha256": preflight_sha256,
+        "timings_path": str(timings_path),
+        "timings_bytes": timings_snapshot.size,
         "timings_sha256": timings_snapshot.sha256,
+        "timings_record_count": len(timings),
+        "warmup_timings_path": str(warmup_timings_path),
+        "warmup_timings_bytes": warmup_timings_snapshot.size,
+        "warmup_timings_sha256": warmup_timings_snapshot.sha256,
+        "warmup_record_count": len(warmup_timings),
         "git_commit": git_commit,
         "checkpoint_manifest_sha256": checkpoint_manifest_sha256,
         "checkpoint_fingerprint_sha256": checkpoint_fingerprint,
@@ -1819,28 +2808,37 @@ def validate_run(
         **radial_summary,
         "prompt_sha256": prompt_sha256,
         "prompt": prompt,
+        "prompt_set_sha256": prompt_set_sha256,
+        "prompt_count": prompt_count,
+        "selected_sparse_profile": SPARSE_PROFILE_BY_RUN_KIND.get(
+            environment.get("run_kind"),
+            "",
+        ),
         "seed": seed,
+        "seed_count": len(ordered_seeds),
+        "seeds": ";".join(str(value) for value in ordered_seeds),
         "requested_height": requested_shape[0],
         "requested_width": requested_shape[1],
         "actual_height": actual_shape[0],
         "actual_width": actual_shape[1],
         "sample_steps": environment.get("sample_steps"),
-        "measurement_count": len(timings),
-        "measurement_indices": ";".join(str(index) for index in sorted(indices)),
+        "measurement_count": measurement_runs,
+        "measurement_indices": ";".join(
+            str(index) for index in range(measurement_runs)
+        ),
+        "artifact_count": len(timings),
         "denoise_seconds_median": statistics.median(denoise_values),
         "total_generation_seconds_median": statistics.median(total_values),
         "artifact_ready_seconds_median": statistics.median(artifact_ready_values),
         "peak_memory_allocated_gib_median": statistics.median(allocated_values) / GIB,
         "peak_memory_reserved_gib_median": statistics.median(reserved_values) / GIB,
         "artifact_sha256": ";".join(
-            f"{index}:{artifact_hash}"
-            for index, artifact_hash in sorted(zip(indices, artifact_hashes))
+            f"{identity[0]}:{identity[1]}:{identity[2]}:{artifact_hash}"
+            for identity, artifact_hash in sorted(artifact_hashes)
         ),
         "metrics_sidecar_sha256": ";".join(
-            f"{index}:{metrics_hash}"
-            for index, metrics_hash in sorted(
-                zip(indices, metrics_sidecar_hashes)
-            )
+            f"{identity[0]}:{identity[1]}:{identity[2]}:{metrics_hash}"
+            for identity, metrics_hash in sorted(metrics_sidecar_hashes)
         ),
         "engine_load_seconds": engine_load_seconds,
         "comparison_values": comparison_values,
@@ -1883,6 +2881,20 @@ def build_rows(
                 mappings[method_id],
                 manifest["fixed_protocol"],
             )
+
+    selected_cfg = summaries.get("best_sparse_cfg")
+    selected_block = summaries.get("block_cache")
+    if selected_cfg is not None and selected_block is not None:
+        cfg_profile = selected_cfg.get("selected_sparse_profile")
+        block_profile = selected_block.get("selected_sparse_profile")
+        _require(
+            isinstance(cfg_profile, str)
+            and cfg_profile
+            and block_profile == cfg_profile,
+            "run mappings",
+            "best_sparse_cfg and block_cache selected different sparse profiles: "
+            f"{cfg_profile!r} != {block_profile!r}",
+        )
 
     reference_id = "dense" if "dense" in summaries else next(iter(summaries), None)
     if reference_id is not None:

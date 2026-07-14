@@ -1,3 +1,4 @@
+import copy
 import csv
 import hashlib
 import importlib.util
@@ -220,7 +221,11 @@ class RunFactory:
             "cuda_visible_devices": "0",
             "gpu_process_monitor_interval_seconds": 5.0,
             "engine_load_seconds": 12.5,
-            "expected_measurement_records": 3,
+            "expected_measurement_records": (
+                self.manifest["fixed_protocol"]["measurement_runs"]
+                * self.manifest["fixed_protocol"]["prompt_count"]
+                * self.manifest["fixed_protocol"]["each_example_n_times"]
+            ),
             "expected_warmup_records": 1,
             "run_id": run_dir.name,
             "pre_run_gpu_sha256": sha256(pre_run_gpu_path),
@@ -233,8 +238,21 @@ class RunFactory:
 
         timings = []
         reports = []
-        for record_offset, measurement_index in enumerate(indices):
-            artifact = run_dir / f"measurement-{record_offset}.mp4"
+        with (REPO_ROOT / "prompts" / "ovi_dev6.csv").open(
+            "r", encoding="utf-8", newline=""
+        ) as handle:
+            prompt_values = [row["text_prompt"] for row in csv.DictReader(handle)]
+        assert len(prompt_values) == environment["prompt_count"]
+        for record_offset, (measurement_index, prompt_index, sample_index) in enumerate(
+            (measurement_index, prompt_index, sample_index)
+            for measurement_index in indices
+            for prompt_index in range(environment["prompt_count"])
+            for sample_index in range(environment["each_example_n_times"])
+        ):
+            artifact = run_dir / (
+                f"measurement-{measurement_index}-prompt-{prompt_index}-"
+                f"sample-{sample_index}.mp4"
+            )
             artifact.write_bytes(f"artifact-{method_id}-{record_offset}".encode())
             artifact_hash = sha256(artifact)
             record = {
@@ -244,10 +262,10 @@ class RunFactory:
                 "benchmark_valid": False,
                 "run_id": run_dir.name,
                 "measurement_index": measurement_index,
-                "prompt_index": 0,
-                "sample_index": 0,
-                "prompt": PROMPT,
-                "seed": 103,
+                "prompt_index": prompt_index,
+                "sample_index": sample_index,
+                "prompt": prompt_values[prompt_index],
+                "seed": 103 + sample_index,
                 "sample_steps": 50,
                 "attention_method": environment.get("attention_method"),
                 "use_cfg_cache": environment.get("use_cfg_cache"),
@@ -256,14 +274,14 @@ class RunFactory:
                 "actual_video_frame_height_width": [704, 704],
                 "generated_video_shape": [3, 121, 704, 704],
                 "generated_audio_shape": [80000],
-                "denoise_seconds": denoise[record_offset],
-                "total_generation_seconds": total[record_offset],
+                "denoise_seconds": denoise[measurement_index],
+                "total_generation_seconds": total[measurement_index],
                 "save_video_seconds": 2.0,
-                "artifact_ready_seconds": total[record_offset] + 2.0,
+                "artifact_ready_seconds": total[measurement_index] + 2.0,
                 "output_hash_seconds": 0.1,
-                "peak_memory_allocated_bytes": allocated_gib[record_offset]
+                "peak_memory_allocated_bytes": allocated_gib[measurement_index]
                 * EVAL.GIB,
-                "peak_memory_reserved_bytes": reserved_gib[record_offset]
+                "peak_memory_reserved_bytes": reserved_gib[measurement_index]
                 * EVAL.GIB,
                 "output_path": str(artifact.resolve()),
                 "output_sha256": artifact_hash,
@@ -272,15 +290,33 @@ class RunFactory:
             if nan_field is not None and record_offset == 1:
                 record[nan_field] = float("nan")
             timings.append(record)
-            write_json(artifact.with_suffix(".metrics.json"), record)
+            metrics_path = artifact.with_suffix(".metrics.json")
+            write_json(metrics_path, record)
+            report_hash = (
+                "f" * 64
+                if artifact_mismatch and record_offset == 1
+                else artifact_hash
+            )
             reports.append(
                 {
                     "path": str(artifact.resolve()),
-                    "sha256": (
-                        "f" * 64
-                        if artifact_mismatch and record_offset == 1
-                        else artifact_hash
-                    ),
+                    "sha256": report_hash,
+                    "measurement_index": measurement_index,
+                    "prompt_index": prompt_index,
+                    "sample_index": sample_index,
+                    "prompt": prompt_values[prompt_index],
+                    "seed": 103 + sample_index,
+                    "metrics_path": str(metrics_path.resolve()),
+                    "artifact_binding": {
+                        "path": str(artifact.resolve()),
+                        "bytes": artifact.stat().st_size,
+                        "sha256": report_hash,
+                    },
+                    "metrics_binding": {
+                        "path": str(metrics_path.resolve()),
+                        "bytes": metrics_path.stat().st_size,
+                        "sha256": sha256(metrics_path),
+                    },
                     "status": "ok",
                     "errors": [],
                 }
@@ -293,10 +329,32 @@ class RunFactory:
             ),
             encoding="utf-8",
         )
+        warmup = {
+            "status": "ok",
+            "record_type": "warmup",
+            "benchmark_candidate": True,
+            "benchmark_valid": False,
+            "run_id": run_dir.name,
+            "warmup_index": 0,
+            "prompt": prompt_values[0],
+            "seed": 103,
+            "sample_steps": 50,
+            "attention_method": environment.get("attention_method"),
+            "use_cfg_cache": environment.get("use_cfg_cache"),
+            "use_block_cache": environment.get("use_block_cache"),
+            "total_generation_seconds": 20.0,
+            "gpu_process_monitor": monitor(contention=contention),
+        }
+        warmup_path = run_dir / "warmup_timings.jsonl"
+        warmup_path.write_text(
+            json.dumps(warmup, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        expected_artifacts = len(timings)
         verification = {
             "status": "ok",
             "benchmark_valid": True,
-            "artifact_count": 3,
+            "artifact_count": expected_artifacts,
             "artifacts": reports,
             "protocol": {
                 "status": "ok",
@@ -305,8 +363,20 @@ class RunFactory:
                 "benchmark_valid": True,
                 "expected_warmup_records": 1,
                 "observed_warmup_records": 1,
-                "expected_measurement_records": 3,
-                "observed_measurement_records": 3,
+                "expected_measurement_records": expected_artifacts,
+                "observed_measurement_records": expected_artifacts,
+                "timings_binding": {
+                    "path": str((run_dir / "timings.jsonl").resolve()),
+                    "bytes": (run_dir / "timings.jsonl").stat().st_size,
+                    "sha256": sha256(run_dir / "timings.jsonl"),
+                    "record_count": expected_artifacts,
+                },
+                "warmup_timings_binding": {
+                    "path": str(warmup_path.resolve()),
+                    "bytes": warmup_path.stat().st_size,
+                    "sha256": sha256(warmup_path),
+                    "record_count": 1,
+                },
             },
         }
         write_json(run_dir / "verification.json", verification)
@@ -326,6 +396,194 @@ class EvalCsvTests(unittest.TestCase):
             item for item in self.manifest["methods"]
             if item["method_id"] == method_id
         )
+
+    def make_sparge_csv_fixture(self, method_id="sparge_topk50"):
+        run_dir = self.factory.make(method_id)
+        build_log_path = run_dir / "spargeattn-build.log"
+        build_log_path.write_bytes(b"audited SpargeAttn fixture build\n")
+        install_gpu_path = run_dir / "spargeattn-install-pre_run_gpu.json"
+        install_gpu_path.write_bytes((run_dir / "pre_run_gpu.json").read_bytes())
+        microtest = {
+            "status": "ok",
+            "device": GPU_NAME,
+            "device_uuid": GPU_UUID,
+            "compute_capability": [8, 0],
+            "torch": "2.6.0+cu124",
+            "torch_cuda": "12.4",
+            "torch_cxx11_abi": False,
+            "dtype": "torch.bfloat16",
+            "tensor_layout": "NHD",
+            "shape": [1, 132, 24, 128],
+            "tested_topk": [0.5, 1.0],
+            "cosine_vs_sdpa": 0.99,
+            "max_abs_difference_vs_sdpa": 0.01,
+        }
+        source_dir = (
+            "/cache/liluchen/FastA2V/sources/"
+            f"SpargeAttn-{EVAL.SPARGEATTN_COMMIT}"
+        )
+        core_fingerprint = {"bytes": 10, "sha256": "1" * 64}
+        receipt = {
+            "repository": EVAL.SPARGEATTN_REPOSITORY,
+            "clone_url": EVAL.SPARGEATTN_CLONE_URL,
+            "commit": EVAL.SPARGEATTN_COMMIT,
+            "api": EVAL.SPARGEATTN_API,
+            "package": "spas_sage_attn",
+            "package_version": "0.1.0",
+            "python": "3.11.15",
+            "torch": "2.6.0+cu124",
+            "torch_cuda": "12.4",
+            "torch_cxx11_abi": False,
+            "triton": "3.2.0",
+            "cuda_home": "/usr/local/cuda-12.1",
+            "torch_cuda_arch_list": "8.0",
+            "max_jobs": 2,
+            "source_dir": source_dir,
+            "source_core": {
+                "path": f"{source_dir}/spas_sage_attn/core.py",
+                **core_fingerprint,
+            },
+            "installed_package_root": (
+                "/cache/liluchen/FastA2V/envs/ovi/lib/python3.11/"
+                "site-packages/spas_sage_attn"
+            ),
+            "installed_files": {
+                "core.py": dict(core_fingerprint),
+                "_qattn_sm80.so": {
+                    "bytes": 20,
+                    "sha256": "2" * 64,
+                    "ldd_not_found": [],
+                },
+                "_fused_sm80.so": {
+                    "bytes": 30,
+                    "sha256": "3" * 64,
+                    "ldd_not_found": [],
+                },
+            },
+            "build_log": {
+                "path": "/cache/liluchen/FastA2V/spargeattn-build.log",
+                "bytes": build_log_path.stat().st_size,
+                "sha256": sha256(build_log_path),
+            },
+            "install_pre_run_gpu": {
+                "path": (
+                    "/cache/liluchen/FastA2V/"
+                    "spargeattn-pre_run_gpu.json"
+                ),
+                "bytes": install_gpu_path.stat().st_size,
+                "sha256": sha256(install_gpu_path),
+                "device_uuid": GPU_UUID,
+            },
+            "microtest": microtest,
+        }
+        receipt_path = run_dir / "spargeattn-install.json"
+        write_json(receipt_path, receipt)
+        preflight_path = run_dir / "preflight.json"
+        write_json(
+            preflight_path,
+            {
+                "errors": [],
+                "attention_method": "sparge",
+                "spargeattn": {
+                    "package_version": "0.1.0",
+                    "pinned_commit": EVAL.SPARGEATTN_COMMIT,
+                    "api": EVAL.SPARGEATTN_API,
+                    "install_receipt": (
+                        "/cache/liluchen/FastA2V/spargeattn-install.json"
+                    ),
+                    "install_receipt_contents": receipt,
+                    "installed_files_verified": True,
+                },
+                "spargeattn_microtest": microtest,
+            },
+        )
+
+        environment_path = run_dir / "environment.json"
+        environment = json.loads(environment_path.read_text())
+        environment["spas_sage_attn"] = "0.1.0"
+        environment["evidence_file_sha256"].update(
+            {
+                "preflight.json": sha256(preflight_path),
+                "spargeattn-install.json": sha256(receipt_path),
+                "spargeattn-build.log": sha256(build_log_path),
+                "spargeattn-install-pre_run_gpu.json": sha256(
+                    install_gpu_path
+                ),
+            }
+        )
+        write_json(environment_path, environment)
+
+        calls = 120
+        dispatcher = {
+            "configured_method": "sparge",
+            "active_method": "sparge",
+            "backend_ready": True,
+            "calls_total": calls,
+            "calls_by_method": {
+                "dense": 0,
+                "sparge": calls,
+                "radial": 0,
+                "svg": 0,
+            },
+            "errors_by_method": {
+                "dense": 0,
+                "sparge": 0,
+                "radial": 0,
+                "svg": 0,
+            },
+            "fallback_allowed": False,
+            "fallback_used": False,
+            "fallback_count": 0,
+            "fallback_reason": None,
+            "expected_calls_without_block_cache": calls,
+            "expected_calls": calls,
+            "calls_match_expected": True,
+            "backend_details": {
+                **EVAL.SPARGE_PROVENANCE,
+                "topk": environment["sparge_topk"],
+                "pvthreshd": environment["sparge_pvthreshd"],
+                "smooth_k": environment["sparge_smooth_k"],
+                "install_receipt": receipt,
+                "calls": calls,
+                "last_nhd_shape": [1, 15004, 24, 128],
+                "last_dtype": "torch.bfloat16",
+                "last_device": "cuda:0",
+            },
+        }
+        timings_path = run_dir / "timings.jsonl"
+        timings = [
+            json.loads(line) for line in timings_path.read_text().splitlines()
+        ]
+        for record in timings:
+            record["video_self_attention_dispatcher"] = dispatcher
+            record["block_cache_saved_video_self_attention_calls"] = 0
+            write_json(
+                Path(record["output_path"]).with_suffix(".metrics.json"),
+                record,
+            )
+        timings_path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in timings),
+            encoding="utf-8",
+        )
+        warmup_path = run_dir / "warmup_timings.jsonl"
+        warmup = json.loads(warmup_path.read_text().splitlines()[0])
+        warmup["video_self_attention_dispatcher"] = dispatcher
+        warmup["block_cache_saved_video_self_attention_calls"] = 0
+        warmup_path.write_text(
+            json.dumps(warmup, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.rebind_timings_verification(run_dir, rebind_artifacts=True)
+        verification_path = run_dir / "verification.json"
+        verification = json.loads(verification_path.read_text())
+        verification["protocol"]["warmup_timings_binding"] = {
+            "path": str(warmup_path.resolve()),
+            "bytes": warmup_path.stat().st_size,
+            "sha256": sha256(warmup_path),
+            "record_count": 1,
+        }
+        write_json(verification_path, verification)
+        return self.method(method_id), run_dir
 
     def make_radial_csv_fixture(self):
         run_dir = self.factory.make("radial_conservative")
@@ -584,6 +842,24 @@ class EvalCsvTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        warmup_path = run_dir / "warmup_timings.jsonl"
+        warmup = json.loads(warmup_path.read_text().splitlines()[0])
+        warmup["video_self_attention_dispatcher"] = dispatcher
+        warmup["block_cache_saved_video_self_attention_calls"] = 0
+        warmup_path.write_text(
+            json.dumps(warmup, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.rebind_timings_verification(run_dir, rebind_artifacts=True)
+        verification_path = run_dir / "verification.json"
+        verification = json.loads(verification_path.read_text())
+        verification["protocol"]["warmup_timings_binding"] = {
+            "path": str(warmup_path.resolve()),
+            "bytes": warmup_path.stat().st_size,
+            "sha256": sha256(warmup_path),
+            "record_count": 1,
+        }
+        write_json(verification_path, verification)
         method = dict(self.method("radial_conservative"))
         method["implementation_status"] = "ready"
         return method, run_dir, preflight_path
@@ -612,6 +888,77 @@ class EvalCsvTests(unittest.TestCase):
         environment["evidence_file_sha256"][path.name] = sha256(path)
         write_json(environment_path, environment)
 
+    def rebind_timings_verification(self, run_dir, *, rebind_artifacts=False):
+        timings_path = run_dir / "timings.jsonl"
+        lines = [
+            line for line in timings_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        records = [json.loads(line) for line in lines]
+        verification_path = run_dir / "verification.json"
+        verification = json.loads(verification_path.read_text(encoding="utf-8"))
+        verification["protocol"]["timings_binding"] = {
+            "path": str(timings_path.resolve()),
+            "bytes": timings_path.stat().st_size,
+            "sha256": sha256(timings_path),
+            "record_count": len(lines),
+        }
+        if rebind_artifacts:
+            reports_by_identity = {
+                (
+                    report["measurement_index"],
+                    report["prompt_index"],
+                    report["sample_index"],
+                ): report
+                for report in verification["artifacts"]
+            }
+            for record in records:
+                identity = (
+                    record["measurement_index"],
+                    record["prompt_index"],
+                    record["sample_index"],
+                )
+                report = reports_by_identity[identity]
+                artifact_path = Path(record["output_path"])
+                metrics_path = artifact_path.with_suffix(".metrics.json")
+                report.update(
+                    {
+                        "path": str(artifact_path),
+                        "sha256": record["output_sha256"],
+                        "prompt": record["prompt"],
+                        "seed": record["seed"],
+                        "metrics_path": str(metrics_path),
+                        "artifact_binding": {
+                            "path": str(artifact_path),
+                            "bytes": artifact_path.stat().st_size,
+                            "sha256": sha256(artifact_path),
+                        },
+                        "metrics_binding": {
+                            "path": str(metrics_path),
+                            "bytes": metrics_path.stat().st_size,
+                            "sha256": sha256(metrics_path),
+                        },
+                    }
+                )
+        write_json(verification_path, verification)
+
+    def rebind_warmup_verification(self, run_dir):
+        warmup_path = run_dir / "warmup_timings.jsonl"
+        lines = [
+            line
+            for line in warmup_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        verification_path = run_dir / "verification.json"
+        verification = json.loads(verification_path.read_text(encoding="utf-8"))
+        verification["protocol"]["warmup_timings_binding"] = {
+            "path": str(warmup_path.resolve()),
+            "bytes": warmup_path.stat().st_size,
+            "sha256": sha256(warmup_path),
+            "record_count": len(lines),
+        }
+        write_json(verification_path, verification)
+
     def rewrite_radial_timings(self, run_dir, mutate):
         timings_path = run_dir / "timings.jsonl"
         records = [
@@ -630,6 +977,27 @@ class EvalCsvTests(unittest.TestCase):
                 Path(record["output_path"]).with_suffix(".metrics.json"),
                 record,
             )
+        self.rebind_timings_verification(run_dir, rebind_artifacts=True)
+
+    def rewrite_sparge_timings(self, run_dir, mutate):
+        timings_path = run_dir / "timings.jsonl"
+        records = [
+            json.loads(line) for line in timings_path.read_text().splitlines()
+        ]
+        mutate(records)
+        timings_path.write_text(
+            "".join(
+                json.dumps(record, sort_keys=True) + "\n"
+                for record in records
+            ),
+            encoding="utf-8",
+        )
+        for record in records:
+            write_json(
+                Path(record["output_path"]).with_suffix(".metrics.json"),
+                record,
+            )
+        self.rebind_timings_verification(run_dir, rebind_artifacts=True)
 
     def test_manifest_has_seven_required_slots_and_optional_block(self):
         required = [
@@ -642,12 +1010,24 @@ class EvalCsvTests(unittest.TestCase):
         ]
         self.assertEqual(tuple(required), EVAL.REQUIRED_METHOD_IDS)
         self.assertEqual(tuple(optional), EVAL.OPTIONAL_METHOD_IDS)
-        for method_id in (
-            "radial_conservative",
-            "radial_aggressive",
-            "best_sparse_cfg",
-        ):
-            self.assertEqual(self.method(method_id)["implementation_status"], "pending")
+        self.assertEqual(
+            self.method("radial_conservative")["implementation_status"],
+            "ready",
+        )
+        self.assertEqual(
+            self.method("radial_aggressive")["implementation_status"],
+            "ready",
+        )
+        self.assertEqual(
+            self.method("best_sparse_cfg")["implementation_status"],
+            "ready",
+        )
+        self.assertIs(self.method("best_sparse_cfg")["selection_required"], True)
+        self.assertEqual(
+            self.method("block_cache")["implementation_status"],
+            "ready",
+        )
+        self.assertIs(self.method("block_cache")["selection_required"], True)
 
     def test_explicit_mapping_rejects_bare_path_unknown_and_duplicates(self):
         allowed = [item["method_id"] for item in self.manifest["methods"]]
@@ -659,6 +1039,482 @@ class EvalCsvTests(unittest.TestCase):
             EVAL.parse_run_mappings(["dense=/one", "dense=/two"], allowed)
         parsed = EVAL.parse_run_mappings(["dense=/chosen/exact/run"], allowed)
         self.assertEqual(parsed, {"dense": Path("/chosen/exact/run")})
+
+    def test_combo_manifest_contract_rejects_allowed_kind_or_selection_drift(self):
+        mutations = (
+            lambda method: method["allowed_run_kinds"].__setitem__(
+                0, "cfg_cache_benchmark"
+            ),
+            lambda method: method.__setitem__("selection_required", False),
+            lambda method: method.__setitem__("implementation_status", "pending"),
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                manifest = copy.deepcopy(self.manifest)
+                method = next(
+                    item
+                    for item in manifest["methods"]
+                    if item["method_id"] == "best_sparse_cfg"
+                )
+                mutation(method)
+                path = self.root / f"bad-combo-{len(list(self.root.iterdir()))}.json"
+                write_json(path, manifest)
+                with self.assertRaises(EVAL.EvaluationError):
+                    EVAL.load_manifest(path)
+
+    def test_dense_cache_runs_cannot_masquerade_as_sparse_selection_slots(self):
+        dense_cfg = self.factory.make("dense_cfg_cache")
+        with self.assertRaisesRegex(EVAL.EvaluationError, "run_kind"):
+            EVAL.validate_run(
+                self.method("best_sparse_cfg"),
+                dense_cfg,
+                self.manifest["fixed_protocol"],
+            )
+
+        dense_block = self.factory.make("block_cache")
+        environment_path = dense_block / "environment.json"
+        environment = json.loads(environment_path.read_text())
+        environment["run_kind"] = "block_cache_benchmark"
+        environment["attention_method"] = "dense"
+        write_json(environment_path, environment)
+        with self.assertRaisesRegex(EVAL.EvaluationError, "run_kind"):
+            EVAL.validate_run(
+                self.method("block_cache"),
+                dense_block,
+                self.manifest["fixed_protocol"],
+            )
+
+    def test_all_four_sparse_profiles_are_legal_for_each_selection_slot(self):
+        for method_id, run_kinds in EVAL.COMBO_METHOD_RUN_KINDS.items():
+            method = self.method(method_id)
+            for run_kind in run_kinds:
+                with self.subTest(method_id=method_id, run_kind=run_kind):
+                    environment = {
+                        "run_kind": run_kind,
+                        **EVAL.SPARSE_COMBO_RUN_KIND_CONTRACTS[run_kind],
+                    }
+                    EVAL._validate_combo_run_environment(
+                        method,
+                        environment,
+                        "fixture",
+                    )
+                    self.assertEqual(
+                        EVAL.SPARSE_PROFILE_BY_RUN_KIND[run_kind],
+                        run_kind.removesuffix("_cfg_benchmark").removesuffix(
+                            "_block_cache_benchmark"
+                        ),
+                    )
+
+    def test_combo_environment_profile_relabel_is_rejected(self):
+        cases = (
+            (
+                "best_sparse_cfg",
+                "sparge_topk50_cfg_benchmark",
+                "sparge_topk",
+                0.75,
+            ),
+            (
+                "block_cache",
+                "radial_conservative_block_cache_benchmark",
+                "radial_profile",
+                "aggressive",
+            ),
+        )
+        for method_id, run_kind, field, value in cases:
+            with self.subTest(run_kind=run_kind):
+                environment = {
+                    "run_kind": run_kind,
+                    **EVAL.SPARSE_COMBO_RUN_KIND_CONTRACTS[run_kind],
+                    field: value,
+                }
+                with self.assertRaisesRegex(EVAL.EvaluationError, field):
+                    EVAL._validate_combo_run_environment(
+                        self.method(method_id),
+                        environment,
+                        "fixture",
+                    )
+
+    def test_cfg_and_block_selection_must_use_the_same_sparse_profile(self):
+        def fake_validate(method, _run_dir, _fixed_protocol):
+            profile = (
+                "sparge_topk50"
+                if method["method_id"] == "best_sparse_cfg"
+                else "radial_conservative"
+            )
+            return {
+                "selected_sparse_profile": profile,
+                "comparison_values": {"fixture": "same"},
+            }
+
+        with (
+            mock.patch.object(EVAL, "validate_run", side_effect=fake_validate),
+            self.assertRaisesRegex(
+                EVAL.EvaluationError,
+                "selected different sparse profiles",
+            ),
+        ):
+            EVAL.build_rows(
+                self.manifest,
+                {
+                    "best_sparse_cfg": Path("/fixture/g"),
+                    "block_cache": Path("/fixture/h"),
+                },
+            )
+
+    def test_cfg_and_block_csv_rows_expose_the_selected_sparse_profile(self):
+        def fake_validate(_method, _run_dir, _fixed_protocol):
+            return {
+                "selected_sparse_profile": "sparge_topk75",
+                "comparison_values": {"fixture": "same"},
+            }
+
+        with mock.patch.object(EVAL, "validate_run", side_effect=fake_validate):
+            rows = EVAL.build_rows(
+                self.manifest,
+                {
+                    "best_sparse_cfg": Path("/fixture/g"),
+                    "block_cache": Path("/fixture/h"),
+                },
+            )
+        by_id = {row["method_id"]: row for row in rows}
+        self.assertEqual(
+            by_id["best_sparse_cfg"]["selected_sparse_profile"],
+            "sparge_topk75",
+        )
+        self.assertEqual(
+            by_id["block_cache"]["selected_sparse_profile"],
+            "sparge_topk75",
+        )
+
+    def test_radial_block_dispatcher_accounts_for_saved_calls_strictly(self):
+        _method, run_dir, _preflight = self.make_radial_csv_fixture()
+        environment = json.loads((run_dir / "environment.json").read_text())
+        environment["use_block_cache"] = True
+        receipt = json.loads((run_dir / "radialattn-install.json").read_text())
+        first_record = json.loads(
+            (run_dir / "timings.jsonl").read_text().splitlines()[0]
+        )
+        dispatcher = copy.deepcopy(
+            first_record["video_self_attention_dispatcher"]
+        )
+        saved_calls = 7
+        dispatcher["expected_calls_without_block_cache"] = (
+            dispatcher["expected_calls"] + saved_calls
+        )
+        self.assertEqual(
+            EVAL._radial_dispatcher_errors(
+                dispatcher,
+                environment,
+                receipt,
+                "fixture",
+                block_cache_saved_calls=saved_calls,
+            ),
+            [],
+        )
+
+        forged = copy.deepcopy(dispatcher)
+        forged["expected_calls_without_block_cache"] = forged["expected_calls"]
+        self.assertTrue(
+            EVAL._radial_dispatcher_errors(
+                forged,
+                environment,
+                receipt,
+                "fixture",
+                block_cache_saved_calls=saved_calls,
+            )
+        )
+        self.assertTrue(
+            EVAL._radial_dispatcher_errors(
+                dispatcher,
+                environment,
+                receipt,
+                "fixture",
+                block_cache_saved_calls=True,
+            )
+        )
+
+    def test_sparge_csv_revalidates_originals_and_all_dispatchers(self):
+        method, run_dir = self.make_sparge_csv_fixture()
+        summary = EVAL.validate_run(
+            method,
+            run_dir,
+            self.manifest["fixed_protocol"],
+        )
+        self.assertEqual(summary["artifact_count"], 18)
+        self.assertEqual(summary["preflight_sha256"], sha256(run_dir / "preflight.json"))
+
+    def test_sparge_csv_rejects_missing_originals(self):
+        for filename in (
+            "preflight.json",
+            "spargeattn-install.json",
+            "spargeattn-build.log",
+            "spargeattn-install-pre_run_gpu.json",
+        ):
+            with self.subTest(filename=filename):
+                method, run_dir = self.make_sparge_csv_fixture()
+                (run_dir / filename).unlink()
+                with self.assertRaises(EVAL.EvaluationError):
+                    EVAL.validate_run(
+                        method,
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+
+    def test_sparge_csv_rejects_symlinked_originals(self):
+        for filename in (
+            "preflight.json",
+            "spargeattn-install.json",
+            "spargeattn-build.log",
+            "spargeattn-install-pre_run_gpu.json",
+        ):
+            with self.subTest(filename=filename):
+                method, run_dir = self.make_sparge_csv_fixture()
+                path = run_dir / filename
+                target = run_dir / f"{filename}.target"
+                target.write_bytes(path.read_bytes())
+                path.unlink()
+                path.symlink_to(target)
+                with self.assertRaisesRegex(EVAL.EvaluationError, "symlink"):
+                    EVAL.validate_run(
+                        method,
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+
+    def test_sparge_csv_rejects_original_replacement_after_snapshot(self):
+        for filename in (
+            "preflight.json",
+            "spargeattn-install.json",
+            "spargeattn-build.log",
+            "spargeattn-install-pre_run_gpu.json",
+        ):
+            with self.subTest(filename=filename):
+                method, run_dir = self.make_sparge_csv_fixture()
+                target = (run_dir / filename).resolve()
+                original_snapshot = EVAL._stable_file_snapshot
+                replaced = False
+
+                def replace_after_snapshot(path, context):
+                    nonlocal replaced
+                    snapshot = original_snapshot(path, context)
+                    if Path(path).resolve(strict=False) == target and not replaced:
+                        replacement = target.with_suffix(target.suffix + ".replacement")
+                        replacement.write_bytes(snapshot.data)
+                        os.replace(replacement, target)
+                        replaced = True
+                    return snapshot
+
+                with (
+                    mock.patch.object(
+                        EVAL,
+                        "_stable_file_snapshot",
+                        side_effect=replace_after_snapshot,
+                    ),
+                    self.assertRaisesRegex(
+                        EVAL.EvaluationError,
+                        "changed after its stable byte snapshot",
+                    ),
+                ):
+                    EVAL.validate_run(
+                        method,
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+                self.assertTrue(replaced)
+
+    def test_sparge_csv_rejects_forged_original_chain_even_if_rehashed(self):
+        cases = {
+            "preflight.json": lambda payload: payload["spargeattn"].__setitem__(
+                "api", "forged_api"
+            ),
+            "spargeattn-install.json": lambda payload: payload.__setitem__(
+                "commit", "0" * 40
+            ),
+            "spargeattn-install-pre_run_gpu.json": lambda payload: payload.__setitem__(
+                "device_uuid", "GPU-00000000-0000-0000-0000-000000000000"
+            ),
+        }
+        for filename, mutate in cases.items():
+            with self.subTest(filename=filename):
+                method, run_dir = self.make_sparge_csv_fixture()
+                path = run_dir / filename
+                payload = json.loads(path.read_text())
+                mutate(payload)
+                write_json(path, payload)
+                self.rebind_environment_hash(run_dir, path)
+                with self.assertRaisesRegex(
+                    EVAL.EvaluationError,
+                    "Sparge original evidence",
+                ):
+                    EVAL.validate_run(
+                        method,
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+
+        method, run_dir = self.make_sparge_csv_fixture()
+        build_path = run_dir / "spargeattn-build.log"
+        build_path.write_bytes(b"forged build log\n")
+        self.rebind_environment_hash(run_dir, build_path)
+        with self.assertRaisesRegex(
+            EVAL.EvaluationError,
+            "Sparge original evidence",
+        ):
+            EVAL.validate_run(
+                method,
+                run_dir,
+                self.manifest["fixed_protocol"],
+            )
+
+    def test_sparge_csv_requires_every_measurement_dispatcher(self):
+        method, run_dir = self.make_sparge_csv_fixture()
+        self.rewrite_sparge_timings(
+            run_dir,
+            lambda records: records[7].pop("video_self_attention_dispatcher"),
+        )
+        with self.assertRaisesRegex(EVAL.EvaluationError, "Sparge dispatcher"):
+            EVAL.validate_run(
+                method,
+                run_dir,
+                self.manifest["fixed_protocol"],
+            )
+
+    def test_sparge_csv_rejects_dispatcher_fallback_calls_and_receipt_forgery(self):
+        mutations = {
+            "fallback": lambda records: records[0][
+                "video_self_attention_dispatcher"
+            ].__setitem__("fallback_used", True),
+            "calls": lambda records: records[0][
+                "video_self_attention_dispatcher"
+            ].__setitem__("calls_total", True),
+            "backend": lambda records: records[0][
+                "video_self_attention_dispatcher"
+            ]["backend_details"].__setitem__("backend", "forged"),
+            "receipt": lambda records: records[0][
+                "video_self_attention_dispatcher"
+            ]["backend_details"]["install_receipt"].__setitem__(
+                "commit", "0" * 40
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                method, run_dir = self.make_sparge_csv_fixture()
+                self.rewrite_sparge_timings(run_dir, mutate)
+                with self.assertRaisesRegex(
+                    EVAL.EvaluationError,
+                    "Sparge dispatcher",
+                ):
+                    EVAL.validate_run(
+                        method,
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+
+    def test_sparge_csv_requires_schema2_idle_install_gpu_in_rebound_chain(self):
+        method, run_dir = self.make_sparge_csv_fixture()
+        install_gpu_path = run_dir / "spargeattn-install-pre_run_gpu.json"
+        install_gpu = json.loads(install_gpu_path.read_text())
+        install_gpu["schema_version"] = 1
+        write_json(install_gpu_path, install_gpu)
+
+        receipt_path = run_dir / "spargeattn-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["install_pre_run_gpu"].update(
+            {
+                "bytes": install_gpu_path.stat().st_size,
+                "sha256": sha256(install_gpu_path),
+            }
+        )
+        write_json(receipt_path, receipt)
+
+        preflight_path = run_dir / "preflight.json"
+        preflight = json.loads(preflight_path.read_text())
+        preflight["spargeattn"]["install_receipt_contents"] = receipt
+        write_json(preflight_path, preflight)
+        for path in (install_gpu_path, receipt_path, preflight_path):
+            self.rebind_environment_hash(run_dir, path)
+
+        with self.assertRaisesRegex(EVAL.EvaluationError, "schema-2 idle"):
+            EVAL.validate_run(
+                method,
+                run_dir,
+                self.manifest["fixed_protocol"],
+            )
+
+    def test_sparge_csv_requires_warmup_dispatcher(self):
+        method, run_dir = self.make_sparge_csv_fixture()
+        warmup_path = run_dir / "warmup_timings.jsonl"
+        warmup = json.loads(warmup_path.read_text().splitlines()[0])
+        warmup.pop("video_self_attention_dispatcher")
+        warmup_path.write_text(
+            json.dumps(warmup, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.rebind_warmup_verification(run_dir)
+
+        with self.assertRaisesRegex(EVAL.EvaluationError, "Sparge dispatcher"):
+            EVAL.validate_run(
+                method,
+                run_dir,
+                self.manifest["fixed_protocol"],
+            )
+
+    def test_sparge_block_combo_shares_evidence_and_saved_call_contract(self):
+        _, run_dir = self.make_sparge_csv_fixture()
+        run_kind = "sparge_topk50_block_cache_benchmark"
+        contract = EVAL.SPARSE_COMBO_RUN_KIND_CONTRACTS[run_kind]
+        environment_path = run_dir / "environment.json"
+        environment = json.loads(environment_path.read_text())
+        environment.update(contract)
+        environment["run_kind"] = run_kind
+        write_json(environment_path, environment)
+
+        saved_calls = 5
+
+        def make_block_records(records):
+            for record in records:
+                record["attention_method"] = "sparge"
+                record["use_cfg_cache"] = False
+                record["use_block_cache"] = True
+                record["block_cache_saved_video_self_attention_calls"] = saved_calls
+                dispatcher = record["video_self_attention_dispatcher"]
+                dispatcher["expected_calls_without_block_cache"] = (
+                    dispatcher["expected_calls"] + saved_calls
+                )
+
+        self.rewrite_sparge_timings(run_dir, make_block_records)
+        warmup_path = run_dir / "warmup_timings.jsonl"
+        warmup = json.loads(warmup_path.read_text().splitlines()[0])
+        make_block_records([warmup])
+        warmup_path.write_text(
+            json.dumps(warmup, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.rebind_warmup_verification(run_dir)
+
+        summary = EVAL.validate_run(
+            self.method("block_cache"),
+            run_dir,
+            self.manifest["fixed_protocol"],
+        )
+        self.assertEqual(summary["selected_sparse_profile"], "sparge_topk50")
+
+        self.rewrite_sparge_timings(
+            run_dir,
+            lambda records: records[0]["video_self_attention_dispatcher"].__setitem__(
+                "expected_calls_without_block_cache",
+                records[0]["video_self_attention_dispatcher"]["expected_calls"],
+            ),
+        )
+        with self.assertRaisesRegex(
+            EVAL.EvaluationError,
+            "expected_calls_without_block_cache",
+        ):
+            EVAL.validate_run(
+                self.method("block_cache"),
+                run_dir,
+                self.manifest["fixed_protocol"],
+            )
 
     def test_radial_csv_revalidates_hashed_preflight_and_exposes_scope(self):
         method, run_dir, preflight_path = self.make_radial_csv_fixture()
@@ -839,6 +1695,27 @@ class EvalCsvTests(unittest.TestCase):
                 ):
                     self.validate_radial_fixture(method, run_dir)
 
+    def test_radial_csv_requires_warmup_dispatcher(self):
+        method, run_dir, _ = self.make_radial_csv_fixture()
+        warmup_path = run_dir / "warmup_timings.jsonl"
+        warmup = json.loads(warmup_path.read_text().splitlines()[0])
+        warmup.pop("video_self_attention_dispatcher")
+        warmup_path.write_text(
+            json.dumps(warmup, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        verification_path = run_dir / "verification.json"
+        verification = json.loads(verification_path.read_text())
+        verification["protocol"]["warmup_timings_binding"] = {
+            "path": str(warmup_path.resolve()),
+            "bytes": warmup_path.stat().st_size,
+            "sha256": sha256(warmup_path),
+            "record_count": 1,
+        }
+        write_json(verification_path, verification)
+        with self.assertRaisesRegex(EVAL.EvaluationError, "dispatcher"):
+            self.validate_radial_fixture(method, run_dir)
+
     def test_radial_csv_rejects_forged_originals_even_when_environment_rehashed(self):
         cases = (
             ("radial-attention-source.py", b"forged-source\n"),
@@ -956,6 +1833,407 @@ class EvalCsvTests(unittest.TestCase):
         with self.assertRaisesRegex(EVAL.EvaluationError, "must not be a symlink"):
             self.validate_radial_fixture(method, run_dir)
 
+    def test_run_jsonl_and_verification_replacement_after_snapshot_is_rejected(self):
+        for filename in (
+            "timings.jsonl",
+            "warmup_timings.jsonl",
+            "verification.json",
+        ):
+            with self.subTest(filename=filename):
+                run_dir = self.factory.make("dense")
+                target = run_dir / filename
+                original_snapshot = EVAL._stable_file_snapshot
+                replaced = False
+
+                def replace_after_snapshot(path, context):
+                    nonlocal replaced
+                    snapshot = original_snapshot(path, context)
+                    if Path(path).name == filename and not replaced:
+                        replacement = target.with_suffix(target.suffix + ".replacement")
+                        replacement.write_bytes(snapshot.data)
+                        os.replace(replacement, target)
+                        replaced = True
+                    return snapshot
+
+                with (
+                    mock.patch.object(
+                        EVAL,
+                        "_stable_file_snapshot",
+                        side_effect=replace_after_snapshot,
+                    ),
+                    self.assertRaisesRegex(
+                        EVAL.EvaluationError,
+                        "changed after its stable byte snapshot",
+                    ),
+                ):
+                    EVAL.validate_run(
+                        self.method("dense"),
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+                self.assertTrue(replaced)
+
+    def test_artifact_and_metrics_replacement_after_snapshot_is_rejected(self):
+        for suffix in (".mp4", ".metrics.json"):
+            with self.subTest(suffix=suffix):
+                run_dir = self.factory.make("dense")
+                target = sorted(run_dir.glob(f"*{suffix}"))[0]
+                target_canonical = target.resolve()
+                original_snapshot = EVAL._stable_file_snapshot
+                replaced = False
+
+                def replace_after_snapshot(path, context):
+                    nonlocal replaced
+                    snapshot = original_snapshot(path, context)
+                    if Path(path).resolve(strict=False) == target_canonical and not replaced:
+                        replacement = target.with_suffix(target.suffix + ".replacement")
+                        replacement.write_bytes(snapshot.data)
+                        os.replace(replacement, target)
+                        replaced = True
+                    return snapshot
+
+                with (
+                    mock.patch.object(
+                        EVAL,
+                        "_stable_file_snapshot",
+                        side_effect=replace_after_snapshot,
+                    ),
+                    self.assertRaisesRegex(
+                        EVAL.EvaluationError,
+                        "changed after its stable byte snapshot",
+                    ),
+                ):
+                    EVAL.validate_run(
+                        self.method("dense"),
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+                self.assertTrue(replaced)
+
+    def test_timings_and_verification_symlinks_are_rejected(self):
+        for filename in ("timings.jsonl", "verification.json"):
+            with self.subTest(filename=filename):
+                run_dir = self.factory.make("dense")
+                path = run_dir / filename
+                target = run_dir / f"{filename}.target"
+                target.write_bytes(path.read_bytes())
+                path.unlink()
+                path.symlink_to(target)
+                with self.assertRaisesRegex(EVAL.EvaluationError, "symlink"):
+                    EVAL.validate_run(
+                        self.method("dense"),
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+
+    def test_missing_timings_and_verification_are_rejected(self):
+        for filename in ("timings.jsonl", "verification.json"):
+            with self.subTest(filename=filename):
+                run_dir = self.factory.make("dense")
+                (run_dir / filename).unlink()
+                with self.assertRaises(EVAL.EvaluationError):
+                    EVAL.validate_run(
+                        self.method("dense"),
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+
+    def test_artifact_and_metrics_symlinks_are_rejected(self):
+        for suffix in (".mp4", ".metrics.json"):
+            with self.subTest(suffix=suffix):
+                run_dir = self.factory.make("dense")
+                path = sorted(run_dir.glob(f"*{suffix}"))[0]
+                target = path.with_suffix(path.suffix + ".target")
+                target.write_bytes(path.read_bytes())
+                path.unlink()
+                path.symlink_to(target)
+                with self.assertRaisesRegex(EVAL.EvaluationError, "symlink"):
+                    EVAL.validate_run(
+                        self.method("dense"),
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+
+    def test_warmup_binding_rejects_missing_stale_and_symlinked_files(self):
+        for mutation in ("missing", "stale", "symlink"):
+            with self.subTest(mutation=mutation):
+                run_dir = self.factory.make("dense")
+                warmup_path = run_dir / "warmup_timings.jsonl"
+                if mutation == "missing":
+                    warmup_path.unlink()
+                elif mutation == "stale":
+                    records = [
+                        json.loads(line)
+                        for line in warmup_path.read_text().splitlines()
+                    ]
+                    records[0]["total_generation_seconds"] += 1.0
+                    warmup_path.write_text(
+                        "".join(
+                            json.dumps(record, sort_keys=True) + "\n"
+                            for record in records
+                        ),
+                        encoding="utf-8",
+                    )
+                else:
+                    target = run_dir / "warmup-target.jsonl"
+                    target.write_bytes(warmup_path.read_bytes())
+                    warmup_path.unlink()
+                    warmup_path.symlink_to(target)
+                with self.assertRaises(EVAL.EvaluationError):
+                    EVAL.validate_run(
+                        self.method("dense"),
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+
+    def test_warmup_binding_requires_exact_typed_canonical_fields(self):
+        mutations = (
+            ("missing", lambda protocol: protocol.pop("warmup_timings_binding")),
+            (
+                "extra",
+                lambda protocol: protocol["warmup_timings_binding"].__setitem__(
+                    "extra", 1
+                ),
+            ),
+            (
+                "path",
+                lambda protocol: protocol["warmup_timings_binding"].__setitem__(
+                    "path", "/tmp/warmup.jsonl"
+                ),
+            ),
+            (
+                "bytes-bool",
+                lambda protocol: protocol["warmup_timings_binding"].__setitem__(
+                    "bytes", True
+                ),
+            ),
+            (
+                "sha",
+                lambda protocol: protocol["warmup_timings_binding"].__setitem__(
+                    "sha256", "0" * 64
+                ),
+            ),
+            (
+                "count-bool",
+                lambda protocol: protocol["warmup_timings_binding"].__setitem__(
+                    "record_count", True
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                run_dir = self.factory.make("dense")
+                verification_path = run_dir / "verification.json"
+                verification = json.loads(verification_path.read_text())
+                mutate(verification["protocol"])
+                write_json(verification_path, verification)
+                with self.assertRaises(EVAL.EvaluationError):
+                    EVAL.validate_run(
+                        self.method("dense"),
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+
+    def test_timings_binding_requires_exact_typed_canonical_fields(self):
+        mutations = (
+            ("missing", lambda protocol: protocol.pop("timings_binding")),
+            (
+                "extra",
+                lambda protocol: protocol["timings_binding"].__setitem__("extra", 1),
+            ),
+            (
+                "path",
+                lambda protocol: protocol["timings_binding"].__setitem__(
+                    "path", "/tmp/timings.jsonl"
+                ),
+            ),
+            (
+                "bytes-bool",
+                lambda protocol: protocol["timings_binding"].__setitem__(
+                    "bytes", True
+                ),
+            ),
+            (
+                "sha",
+                lambda protocol: protocol["timings_binding"].__setitem__(
+                    "sha256", "0" * 64
+                ),
+            ),
+            (
+                "count-bool",
+                lambda protocol: protocol["timings_binding"].__setitem__(
+                    "record_count", True
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                run_dir = self.factory.make("dense")
+                verification_path = run_dir / "verification.json"
+                verification = json.loads(verification_path.read_text())
+                mutate(verification["protocol"])
+                write_json(verification_path, verification)
+                with self.assertRaises(EVAL.EvaluationError):
+                    EVAL.validate_run(
+                        self.method("dense"),
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+
+    def test_artifact_bindings_require_exact_typed_canonical_fields(self):
+        mutations = (
+            (
+                "artifact-extra",
+                lambda report: report["artifact_binding"].__setitem__("extra", 1),
+            ),
+            (
+                "artifact-path",
+                lambda report: report["artifact_binding"].__setitem__(
+                    "path", "/tmp/artifact.mp4"
+                ),
+            ),
+            (
+                "artifact-bytes-bool",
+                lambda report: report["artifact_binding"].__setitem__(
+                    "bytes", True
+                ),
+            ),
+            (
+                "artifact-sha",
+                lambda report: report["artifact_binding"].__setitem__(
+                    "sha256", "0" * 64
+                ),
+            ),
+            (
+                "metrics-extra",
+                lambda report: report["metrics_binding"].__setitem__("extra", 1),
+            ),
+            (
+                "metrics-path",
+                lambda report: report["metrics_binding"].__setitem__(
+                    "path", "/tmp/artifact.metrics.json"
+                ),
+            ),
+            (
+                "metrics-bytes-bool",
+                lambda report: report["metrics_binding"].__setitem__(
+                    "bytes", False
+                ),
+            ),
+            (
+                "metrics-sha",
+                lambda report: report["metrics_binding"].__setitem__(
+                    "sha256", "0" * 64
+                ),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                run_dir = self.factory.make("dense")
+                verification_path = run_dir / "verification.json"
+                verification = json.loads(verification_path.read_text())
+                mutate(verification["artifacts"][0])
+                write_json(verification_path, verification)
+                with self.assertRaises(EVAL.EvaluationError):
+                    EVAL.validate_run(
+                        self.method("dense"),
+                        run_dir,
+                        self.manifest["fixed_protocol"],
+                    )
+
+    def test_legacy_artifact_report_schema_fails_closed(self):
+        run_dir = self.factory.make("dense")
+        verification_path = run_dir / "verification.json"
+        verification = json.loads(verification_path.read_text())
+        for report in verification["artifacts"]:
+            for field in (
+                "measurement_index",
+                "prompt_index",
+                "sample_index",
+                "prompt",
+                "seed",
+                "metrics_path",
+                "artifact_binding",
+                "metrics_binding",
+            ):
+                report.pop(field)
+        write_json(verification_path, verification)
+        with self.assertRaisesRegex(EVAL.EvaluationError, "artifact report identity"):
+            EVAL.validate_run(
+                self.method("dense"),
+                run_dir,
+                self.manifest["fixed_protocol"],
+            )
+
+    def test_one_prompt_smoke_run_fails_formal_csv_closed(self):
+        run_dir = self.factory.make("dense")
+        environment_path = run_dir / "environment.json"
+        environment = json.loads(environment_path.read_text())
+        environment["prompt_count"] = 1
+        environment["expected_measurement_records"] = 3
+        write_json(environment_path, environment)
+        with self.assertRaisesRegex(EVAL.EvaluationError, "prompt_count"):
+            EVAL.validate_run(
+                self.method("dense"),
+                run_dir,
+                self.manifest["fixed_protocol"],
+            )
+
+    def test_verification_artifact_identity_relabel_is_rejected(self):
+        run_dir = self.factory.make("dense")
+        verification_path = run_dir / "verification.json"
+        verification = json.loads(verification_path.read_text())
+        first = verification["artifacts"][0]
+        second = verification["artifacts"][1]
+        identity_fields = ("measurement_index", "prompt_index", "sample_index")
+        first_identity = tuple(first[field] for field in identity_fields)
+        second_identity = tuple(second[field] for field in identity_fields)
+        for field, value in zip(identity_fields, second_identity):
+            first[field] = value
+        for field, value in zip(identity_fields, first_identity):
+            second[field] = value
+        write_json(verification_path, verification)
+        with self.assertRaisesRegex(
+            EVAL.EvaluationError,
+            "different verification identity",
+        ):
+            EVAL.validate_run(
+                self.method("dense"),
+                run_dir,
+                self.manifest["fixed_protocol"],
+            )
+
+    def test_timing_and_sidecar_path_permutation_is_rejected(self):
+        run_dir = self.factory.make("dense")
+        timings_path = run_dir / "timings.jsonl"
+        records = [
+            json.loads(line) for line in timings_path.read_text().splitlines()
+        ]
+        first_path, first_hash = records[0]["output_path"], records[0]["output_sha256"]
+        records[0]["output_path"] = records[1]["output_path"]
+        records[0]["output_sha256"] = records[1]["output_sha256"]
+        records[1]["output_path"] = first_path
+        records[1]["output_sha256"] = first_hash
+        timings_path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        for record in records[:2]:
+            write_json(
+                Path(record["output_path"]).with_suffix(".metrics.json"),
+                record,
+            )
+        self.rebind_timings_verification(run_dir)
+        with self.assertRaisesRegex(
+            EVAL.EvaluationError,
+            "different verification identity",
+        ):
+            EVAL.validate_run(
+                self.method("dense"),
+                run_dir,
+                self.manifest["fixed_protocol"],
+            )
+
     def test_dirty_run_is_rejected_even_if_verification_claims_valid(self):
         run_dir = self.factory.make("dense", dirty=True)
         with self.assertRaisesRegex(EVAL.EvaluationError, "git_dirty"):
@@ -1001,6 +2279,7 @@ class EvalCsvTests(unittest.TestCase):
             "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
             encoding="utf-8",
         )
+        self.rebind_timings_verification(run_dir)
         with self.assertRaisesRegex(EVAL.EvaluationError, "nvidia-smi"):
             EVAL.validate_run(
                 self.method("dense"),
@@ -1021,6 +2300,7 @@ class EvalCsvTests(unittest.TestCase):
             "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
             encoding="utf-8",
         )
+        self.rebind_timings_verification(run_dir)
         with self.assertRaisesRegex(EVAL.EvaluationError, "raw GPU snapshot"):
             EVAL.validate_run(
                 self.method("dense"),
@@ -1113,6 +2393,7 @@ class EvalCsvTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
+                self.rebind_timings_verification(run_dir)
                 with self.assertRaises(EVAL.EvaluationError):
                     EVAL.validate_run(
                         self.method("dense"),
@@ -1134,6 +2415,7 @@ class EvalCsvTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.rebind_timings_verification(run_dir)
         with self.assertRaisesRegex(EVAL.EvaluationError, "schema"):
             EVAL.validate_run(
                 self.method("dense"),
@@ -1145,7 +2427,8 @@ class EvalCsvTests(unittest.TestCase):
         run_dir = self.factory.make("dense")
         lines = (run_dir / "timings.jsonl").read_text().splitlines()
         (run_dir / "timings.jsonl").write_text("\n".join(lines[:2]) + "\n")
-        with self.assertRaisesRegex(EVAL.EvaluationError, "exactly three"):
+        self.rebind_timings_verification(run_dir)
+        with self.assertRaisesRegex(EVAL.EvaluationError, "complete artifact matrix"):
             EVAL.validate_run(self.method("dense"), run_dir, self.manifest["fixed_protocol"])
 
     def test_duplicate_measurement_index_is_rejected(self):
@@ -1172,6 +2455,7 @@ class EvalCsvTests(unittest.TestCase):
         (run_dir / "timings.jsonl").write_text(
             "".join(json.dumps(record, sort_keys=True) + "\n" for record in records)
         )
+        self.rebind_timings_verification(run_dir)
         with self.assertRaisesRegex(EVAL.EvaluationError, "metrics sidecar"):
             EVAL.validate_run(self.method("dense"), run_dir, self.manifest["fixed_protocol"])
 
@@ -1212,6 +2496,14 @@ class EvalCsvTests(unittest.TestCase):
         self.assertEqual(by_id["dense_cfg_cache"]["total_generation_seconds_median"], 15.0)
         self.assertEqual(by_id["dense_cfg_cache"]["denoise_speedup_vs_dense"], 2.0)
         self.assertEqual(by_id["dense_cfg_cache"]["total_speedup_vs_dense"], 2.0)
+        self.assertEqual(by_id["dense"]["measurement_count"], 3)
+        self.assertEqual(by_id["dense"]["artifact_count"], 18)
+        self.assertEqual(by_id["dense"]["prompt_count"], 6)
+        self.assertEqual(
+            by_id["dense"]["prompt_set_sha256"],
+            self.manifest["fixed_protocol"]["prompts_sha256"],
+        )
+        self.assertEqual(by_id["dense"]["warmup_record_count"], 1)
 
     def test_missing_quality_and_manual_fields_stay_blank_and_pending(self):
         dense = self.factory.make("dense")

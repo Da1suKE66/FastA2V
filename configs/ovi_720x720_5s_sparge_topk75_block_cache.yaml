@@ -1,5 +1,5 @@
 ckpt_dir: /cache/liluchen/FastA2V/ckpts
-output_dir: ${oc.env:FASTA2V_RUN_DIR,/cache/liluchen/FastA2V/runs/ovi_720ckpt_block_cache_50step_manual}
+output_dir: ${oc.env:FASTA2V_RUN_DIR,/cache/liluchen/FastA2V/runs/ovi_720ckpt_sparge_topk75_block_cache_50step_manual}
 
 model_name: "720x720_5s"
 mode: "t2v"
@@ -23,11 +23,14 @@ text_prompt: prompts/ovi_dev6.csv
 each_example_n_times: 1
 warmup_runs: 1
 measurement_runs: 3
-run_kind: "block_cache_benchmark"
+run_kind: "sparge_topk75_block_cache_benchmark"
 benchmark_eligible: true
 gpu_process_monitor_interval_seconds: 5.0
 
-attention_method: "dense"
+attention_method: "sparge"
+sparge_topk: 0.75
+sparge_pvthreshd: 50
+sparge_smooth_k: true
 use_cfg_cache: false
 cfg_cache_start_step: 10
 cfg_cache_end_step: 39

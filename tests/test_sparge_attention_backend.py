@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -32,6 +32,47 @@ load_official_sparge_kernel = BACKEND_MODULE.load_official_sparge_kernel
 verify_sparge_install_receipt = BACKEND_MODULE.verify_sparge_install_receipt
 
 GPU_UUID = "GPU-11111111-2222-3333-4444-555555555555"
+
+
+def load_sparge_microtest_module():
+    torch_module = ModuleType("torch")
+    torch_nn_module = ModuleType("torch.nn")
+    torch_functional_module = ModuleType("torch.nn.functional")
+    torch_module.nn = torch_nn_module
+    torch_nn_module.functional = torch_functional_module
+
+    backend_module = ModuleType("ovi.modules.sparge_attention_backend")
+    backend_module.SPARGEATTN_MICROTEST_MIN_COSINE = (
+        BACKEND_MODULE.SPARGEATTN_MICROTEST_MIN_COSINE
+    )
+    backend_module.SPARGEATTN_MICROTEST_SHAPE = (
+        BACKEND_MODULE.SPARGEATTN_MICROTEST_SHAPE
+    )
+    backend_module.SpargeAttentionDependencyError = (
+        SpargeAttentionDependencyError
+    )
+    backend_module.load_official_sparge_kernel = lambda: None
+
+    gpu_module = ModuleType("ovi.gpu_process_monitor")
+    gpu_module.query_gpu_compute_processes = lambda _device_index: None
+
+    path = REPO_ROOT / "scripts" / "sparge_attn_microtest.py"
+    spec = importlib.util.spec_from_file_location(
+        "sparge_attn_microtest_under_test", path
+    )
+    module = importlib.util.module_from_spec(spec)
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "torch": torch_module,
+            "torch.nn": torch_nn_module,
+            "torch.nn.functional": torch_functional_module,
+            "ovi.modules.sparge_attention_backend": backend_module,
+            "ovi.gpu_process_monitor": gpu_module,
+        },
+    ):
+        spec.loader.exec_module(module)
+    return module
 
 
 def complete_microtest():
@@ -188,6 +229,72 @@ class RecordingKernel:
 
 
 class SpargeAttentionBackendTests(unittest.TestCase):
+    def test_microtest_normalizes_torch_26_uuid_without_gpu_prefix(self):
+        microtest = load_sparge_microtest_module()
+        properties = SimpleNamespace(
+            uuid="48F3AC25-1111-2222-3333-444444444444"
+        )
+        self.assertEqual(
+            microtest._normalize_runtime_gpu_uuid(properties),
+            "GPU-48f3ac25-1111-2222-3333-444444444444",
+        )
+        self.assertEqual(
+            microtest._validate_runtime_gpu_binding(
+                properties,
+                "NVIDIA A100-SXM4-80GB",
+                {
+                    "available": True,
+                    "device_index": 0,
+                    "device_name": "NVIDIA A100-SXM4-80GB",
+                    "device_uuid": (
+                        "GPU-48f3ac25-1111-2222-3333-444444444444"
+                    ),
+                    "process_count": 1,
+                },
+            ),
+            "GPU-48f3ac25-1111-2222-3333-444444444444",
+        )
+
+    def test_microtest_missing_or_malformed_runtime_uuid_fails_closed(self):
+        microtest = load_sparge_microtest_module()
+
+        class ExplodingUuid:
+            def __str__(self):
+                raise TypeError("uuid conversion failed")
+
+        for label, properties in (
+            ("missing", SimpleNamespace()),
+            ("wrong_type", SimpleNamespace(uuid=17)),
+            ("malformed", SimpleNamespace(uuid="GPU-not-a-uuid")),
+            ("conversion_error", SimpleNamespace(uuid=ExplodingUuid())),
+        ):
+            with self.subTest(label=label), self.assertRaises(
+                SpargeAttentionDependencyError
+            ):
+                microtest._normalize_runtime_gpu_uuid(properties)
+
+    def test_same_name_different_uuid_cannot_bind_logical_cuda_zero(self):
+        microtest = load_sparge_microtest_module()
+        runtime_properties = SimpleNamespace(
+            uuid="aaaaaaaa-1111-2222-3333-444444444444"
+        )
+        physical_zero = {
+            "available": True,
+            "device_index": 0,
+            "device_name": "NVIDIA A100-SXM4-80GB",
+            "device_uuid": "GPU-bbbbbbbb-1111-2222-3333-444444444444",
+            "process_count": 0,
+        }
+        with self.assertRaisesRegex(
+            SpargeAttentionDependencyError,
+            "UUID",
+        ):
+            microtest._validate_runtime_gpu_binding(
+                runtime_properties,
+                "NVIDIA A100-SXM4-80GB",
+                physical_zero,
+            )
+
     def make_backend(self, *, use_collectives=False):
         kernel = RecordingKernel()
         rope_calls = []

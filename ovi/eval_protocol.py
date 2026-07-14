@@ -24,7 +24,35 @@ def _freeze(value):
     return value
 
 
-def _base_protocol():
+_PROMPT_SET_CONTRACTS = MappingProxyType(
+    {
+        "smoke": MappingProxyType(
+            {
+                "prompts_sha256": (
+                    "1e7f242591c86e24334da252cb9ca5ee1e448cfc6e5990bbcd099b0767e1e42e"
+                ),
+                "prompt_count": 1,
+                "each_example_n_times": 1,
+            }
+        ),
+        "dev6": MappingProxyType(
+            {
+                "prompts_sha256": (
+                    "2b85656756511645007ec619ae692359ed0ca157f7188d73fd273bb000bba534"
+                ),
+                "prompt_count": 6,
+                "each_example_n_times": 1,
+            }
+        ),
+    }
+)
+
+
+def _base_protocol(prompt_set):
+    try:
+        prompt_contract = _PROMPT_SET_CONTRACTS[prompt_set]
+    except KeyError as exc:
+        raise ValueError(f"unknown audited prompt set {prompt_set!r}") from exc
     return {
         "model_name": "720x720_5s",
         "mode": "t2v",
@@ -35,11 +63,7 @@ def _base_protocol():
         "video_guidance_scale": 4.0,
         "audio_guidance_scale": 3.0,
         "slg_layer": 11,
-        "prompts_sha256": (
-            "1e7f242591c86e24334da252cb9ca5ee1e448cfc6e5990bbcd099b0767e1e42e"
-        ),
-        "prompt_count": 1,
-        "each_example_n_times": 1,
+        **prompt_contract,
         "video_negative_prompt": "jitter, bad hands, blur, distortion",
         "audio_negative_prompt": "robotic, muffled, echo, distorted",
         "fp8": False,
@@ -66,6 +90,7 @@ def _run_protocol(
     sample_steps,
     warmup_runs,
     measurement_runs,
+    prompt_set,
     attention_method="dense",
     use_cfg_cache=False,
     use_block_cache=False,
@@ -76,14 +101,19 @@ def _run_protocol(
     radial_profile=None,
     radial_decay_factor=None,
 ):
+    base_protocol = _base_protocol(prompt_set)
     protocol = {
-        **_base_protocol(),
+        **base_protocol,
         "run_kind": run_kind,
         "sample_steps": sample_steps,
         "warmup_runs": warmup_runs,
         "measurement_runs": measurement_runs,
         "expected_warmup_records": warmup_runs,
-        "expected_measurement_records": measurement_runs,
+        "expected_measurement_records": (
+            measurement_runs
+            * base_protocol["prompt_count"]
+            * base_protocol["each_example_n_times"]
+        ),
         "attention_method": attention_method,
         "use_cfg_cache": use_cfg_cache,
         "use_block_cache": use_block_cache,
@@ -118,6 +148,7 @@ def _build_protocols():
             sample_steps=50,
             warmup_runs=1,
             measurement_runs=3,
+            prompt_set="dev6",
             benchmark_eligible=True,
         ),
         _run_protocol(
@@ -125,6 +156,7 @@ def _build_protocols():
             sample_steps=20,
             warmup_runs=0,
             measurement_runs=1,
+            prompt_set="smoke",
             debug_forward=True,
         ),
         _run_protocol(
@@ -132,12 +164,14 @@ def _build_protocols():
             sample_steps=20,
             warmup_runs=0,
             measurement_runs=1,
+            prompt_set="smoke",
         ),
         _run_protocol(
             "cfg_cache_benchmark",
             sample_steps=50,
             warmup_runs=1,
             measurement_runs=3,
+            prompt_set="dev6",
             use_cfg_cache=True,
             benchmark_eligible=True,
         ),
@@ -146,6 +180,7 @@ def _build_protocols():
             sample_steps=20,
             warmup_runs=0,
             measurement_runs=1,
+            prompt_set="smoke",
             use_cfg_cache=True,
             debug_forward=True,
             debug_forward_step=11,
@@ -155,6 +190,7 @@ def _build_protocols():
             sample_steps=50,
             warmup_runs=1,
             measurement_runs=3,
+            prompt_set="dev6",
             use_block_cache=True,
             benchmark_eligible=True,
         ),
@@ -163,6 +199,7 @@ def _build_protocols():
             sample_steps=20,
             warmup_runs=0,
             measurement_runs=1,
+            prompt_set="smoke",
             use_block_cache=True,
             debug_forward=True,
             debug_forward_step=1,
@@ -172,6 +209,7 @@ def _build_protocols():
             sample_steps=50,
             warmup_runs=1,
             measurement_runs=3,
+            prompt_set="dev6",
             attention_method="sparge",
             sparge_topk=0.50,
             benchmark_eligible=True,
@@ -181,6 +219,7 @@ def _build_protocols():
             sample_steps=20,
             warmup_runs=0,
             measurement_runs=1,
+            prompt_set="smoke",
             attention_method="sparge",
             sparge_topk=0.50,
             debug_forward=True,
@@ -190,6 +229,7 @@ def _build_protocols():
             sample_steps=50,
             warmup_runs=1,
             measurement_runs=3,
+            prompt_set="dev6",
             attention_method="sparge",
             sparge_topk=0.75,
             benchmark_eligible=True,
@@ -199,6 +239,7 @@ def _build_protocols():
             sample_steps=20,
             warmup_runs=0,
             measurement_runs=1,
+            prompt_set="smoke",
             attention_method="sparge",
             sparge_topk=0.75,
             debug_forward=True,
@@ -208,6 +249,7 @@ def _build_protocols():
             sample_steps=50,
             warmup_runs=1,
             measurement_runs=3,
+            prompt_set="dev6",
             attention_method="radial",
             radial_profile="conservative",
             radial_decay_factor=4.0,
@@ -218,6 +260,7 @@ def _build_protocols():
             sample_steps=20,
             warmup_runs=0,
             measurement_runs=1,
+            prompt_set="smoke",
             attention_method="radial",
             radial_profile="conservative",
             radial_decay_factor=4.0,
@@ -228,6 +271,7 @@ def _build_protocols():
             sample_steps=50,
             warmup_runs=1,
             measurement_runs=3,
+            prompt_set="dev6",
             attention_method="radial",
             radial_profile="aggressive",
             radial_decay_factor=1.0,
@@ -238,10 +282,103 @@ def _build_protocols():
             sample_steps=20,
             warmup_runs=0,
             measurement_runs=1,
+            prompt_set="smoke",
             attention_method="radial",
             radial_profile="aggressive",
             radial_decay_factor=1.0,
             debug_forward=True,
+        ),
+        _run_protocol(
+            "sparge_topk50_cfg_benchmark",
+            sample_steps=50,
+            warmup_runs=1,
+            measurement_runs=3,
+            prompt_set="dev6",
+            attention_method="sparge",
+            sparge_topk=0.50,
+            use_cfg_cache=True,
+            benchmark_eligible=True,
+        ),
+        _run_protocol(
+            "sparge_topk75_cfg_benchmark",
+            sample_steps=50,
+            warmup_runs=1,
+            measurement_runs=3,
+            prompt_set="dev6",
+            attention_method="sparge",
+            sparge_topk=0.75,
+            use_cfg_cache=True,
+            benchmark_eligible=True,
+        ),
+        _run_protocol(
+            "radial_conservative_cfg_benchmark",
+            sample_steps=50,
+            warmup_runs=1,
+            measurement_runs=3,
+            prompt_set="dev6",
+            attention_method="radial",
+            radial_profile="conservative",
+            radial_decay_factor=4.0,
+            use_cfg_cache=True,
+            benchmark_eligible=True,
+        ),
+        _run_protocol(
+            "radial_aggressive_cfg_benchmark",
+            sample_steps=50,
+            warmup_runs=1,
+            measurement_runs=3,
+            prompt_set="dev6",
+            attention_method="radial",
+            radial_profile="aggressive",
+            radial_decay_factor=1.0,
+            use_cfg_cache=True,
+            benchmark_eligible=True,
+        ),
+        _run_protocol(
+            "sparge_topk50_block_cache_benchmark",
+            sample_steps=50,
+            warmup_runs=1,
+            measurement_runs=3,
+            prompt_set="dev6",
+            attention_method="sparge",
+            sparge_topk=0.50,
+            use_block_cache=True,
+            benchmark_eligible=True,
+        ),
+        _run_protocol(
+            "sparge_topk75_block_cache_benchmark",
+            sample_steps=50,
+            warmup_runs=1,
+            measurement_runs=3,
+            prompt_set="dev6",
+            attention_method="sparge",
+            sparge_topk=0.75,
+            use_block_cache=True,
+            benchmark_eligible=True,
+        ),
+        _run_protocol(
+            "radial_conservative_block_cache_benchmark",
+            sample_steps=50,
+            warmup_runs=1,
+            measurement_runs=3,
+            prompt_set="dev6",
+            attention_method="radial",
+            radial_profile="conservative",
+            radial_decay_factor=4.0,
+            use_block_cache=True,
+            benchmark_eligible=True,
+        ),
+        _run_protocol(
+            "radial_aggressive_block_cache_benchmark",
+            sample_steps=50,
+            warmup_runs=1,
+            measurement_runs=3,
+            prompt_set="dev6",
+            attention_method="radial",
+            radial_profile="aggressive",
+            radial_decay_factor=1.0,
+            use_block_cache=True,
+            benchmark_eligible=True,
         ),
     )
     return MappingProxyType(

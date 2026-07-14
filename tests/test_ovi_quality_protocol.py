@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 from types import SimpleNamespace
 import sys
@@ -40,13 +41,22 @@ class QualityProtocolTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.protocol, self.protocol_sha = QUALITY.load_quality_protocol()
 
-    def make_run(self, method_id, label, **overrides):
-        run_dir = self.root / f"run-{label}"
+    def make_run(
+        self,
+        method_id,
+        label,
+        *,
+        fixture_prompt_count=1,
+        fixture_sample_count=1,
+        **overrides,
+    ):
+        run_dir = (self.root / f"run-{label}").resolve()
         run_dir.mkdir()
         for name in (
             "environment.json",
             "verification.json",
             "timings.jsonl",
+            "warmup_timings.jsonl",
             "checkpoint_manifest.json",
         ):
             (run_dir / name).write_text(
@@ -54,36 +64,111 @@ class QualityProtocolTests(unittest.TestCase):
                 encoding="utf-8",
             )
         artifacts = {}
-        for index in QUALITY.EXPECTED_INDICES:
-            artifact_path = run_dir / f"measurement-{index}.mp4"
-            artifact_path.write_bytes(f"{label}-artifact-{index}".encode("utf-8"))
+        prompts = tuple(
+            f"A fixed audiovisual benchmark prompt {prompt_index}."
+            for prompt_index in range(fixture_prompt_count)
+        )
+        for index, prompt_index, sample_index in (
+            (index, prompt_index, sample_index)
+            for index in QUALITY.EXPECTED_INDICES
+            for prompt_index in range(fixture_prompt_count)
+            for sample_index in range(fixture_sample_count)
+        ):
+            identity = (index, prompt_index, sample_index)
+            artifact_path = run_dir / (
+                f"measurement-{index}-prompt-{prompt_index}-sample-{sample_index}.mp4"
+            )
+            artifact_path.write_bytes(f"{label}-artifact-{identity}".encode("utf-8"))
             metrics_path = artifact_path.with_suffix(".metrics.json")
             metrics_path.write_text(
-                f"{label}-metrics-{index}\n",
+                f"{label}-metrics-{identity}\n",
                 encoding="utf-8",
             )
-            artifacts[index] = QUALITY.MeasurementArtifact(
+            artifact_key = index if fixture_prompt_count == fixture_sample_count == 1 else identity
+            artifacts[artifact_key] = QUALITY.MeasurementArtifact(
                 measurement_index=index,
-                prompt_index=0,
-                sample_index=0,
+                prompt_index=prompt_index,
+                sample_index=sample_index,
                 path=artifact_path,
                 sha256=digest(artifact_path),
                 metrics_sidecar_path=metrics_path,
                 metrics_sidecar_sha256=digest(metrics_path),
-                prompt="A fixed audiovisual benchmark prompt.",
-                seed=103,
+                prompt=prompts[prompt_index],
+                seed=103 + sample_index,
                 requested_shape=(720, 720),
                 actual_shape=(704, 704),
                 generated_video_shape=(3, 121, 704, 704),
                 generated_audio_shape=(80000,),
                 sample_steps=50,
             )
+        (run_dir / "timings.jsonl").write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "measurement_index": artifact.measurement_index,
+                        "prompt_index": artifact.prompt_index,
+                        "sample_index": artifact.sample_index,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+                for artifact in artifacts.values()
+            ),
+            encoding="utf-8",
+        )
+        (run_dir / "warmup_timings.jsonl").write_text(
+            json.dumps({"record_type": "warmup", "warmup_index": 0}) + "\n",
+            encoding="utf-8",
+        )
+        preflight_path = run_dir / "preflight.json"
+        preflight_path.write_text('{"status":"ok"}\n', encoding="utf-8")
+        run_config_path = run_dir / "run_config.yaml"
+        run_config_path.write_text("model: ovi\n", encoding="utf-8")
+        write_json(
+            run_dir / "environment.json",
+            {
+                "evidence_file_sha256": {
+                    "checkpoint_manifest.json": digest(
+                        run_dir / "checkpoint_manifest.json"
+                    ),
+                    "preflight.json": digest(preflight_path),
+                },
+                "run_config_sha256": digest(run_config_path),
+            },
+        )
+        evidence_bindings = {
+            name: {
+                "path": str(run_dir / name),
+                "bytes": (run_dir / name).stat().st_size,
+                "sha256": digest(run_dir / name),
+            }
+            for name in (
+                "environment.json",
+                "verification.json",
+                "timings.jsonl",
+                "warmup_timings.jsonl",
+                "checkpoint_manifest.json",
+                "preflight.json",
+                "run_config.yaml",
+            )
+        }
         values = {
             "method_id": method_id,
             "run_dir": run_dir,
             "run_id": run_dir.name,
             "verification_sha256": digest(run_dir / "verification.json"),
+            "timings_path": run_dir / "timings.jsonl",
+            "timings_bytes": (run_dir / "timings.jsonl").stat().st_size,
             "timings_sha256": digest(run_dir / "timings.jsonl"),
+            "timings_record_count": len(artifacts),
+            "warmup_timings_path": run_dir / "warmup_timings.jsonl",
+            "warmup_timings_bytes": (
+                run_dir / "warmup_timings.jsonl"
+            ).stat().st_size,
+            "warmup_timings_sha256": digest(
+                run_dir / "warmup_timings.jsonl"
+            ),
+            "warmup_record_count": 1,
             "environment_sha256": digest(run_dir / "environment.json"),
             "git_commit": "a" * 40,
             "checkpoint_manifest_sha256": digest(
@@ -95,11 +180,22 @@ class QualityProtocolTests(unittest.TestCase):
                 "GPU-11111111-2222-3333-4444-555555555555",
                 "NVIDIA A100-SXM4-80GB",
             ),
-            "prompt_sha256": hashlib.sha256(
-                b"A fixed audiovisual benchmark prompt."
+            "prompt_set_sha256": hashlib.sha256(
+                json.dumps(
+                    list(prompts),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
             ).hexdigest(),
-            "prompt": "A fixed audiovisual benchmark prompt.",
-            "seed": 103,
+            "prompt_count": fixture_prompt_count,
+            "prompts": prompts,
+            "base_seed": 103,
+            "sample_count": fixture_sample_count,
+            "sample_seeds": tuple(
+                103 + sample_index
+                for sample_index in range(fixture_sample_count)
+            ),
+            "selected_sparse_profile": "",
             "requested_shape": (720, 720),
             "actual_shape": (704, 704),
             "generated_video_shape": (3, 121, 704, 704),
@@ -116,6 +212,7 @@ class QualityProtocolTests(unittest.TestCase):
                 "use_block_cache": False,
             },
             "artifacts": artifacts,
+            "evidence_bindings": evidence_bindings,
         }
         values.update(overrides)
         return QUALITY.AuditedRun(**values)
@@ -354,6 +451,7 @@ class QualityProtocolTests(unittest.TestCase):
             "methods": [
                 {
                     "method_id": "sparge_topk50",
+                    "implementation_status": "ready",
                     "expected_environment": {
                         "run_kind": "dense_baseline",
                         "attention_method": "dense",
@@ -365,6 +463,123 @@ class QualityProtocolTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(QUALITY.QualityError, "relabeled"):
             QUALITY._find_method(matrix, "sparge_topk50")
+
+    def test_quality_matrix_contracts_bind_all_eight_sparse_run_kinds(self):
+        matrix = json.loads(
+            (REPO_ROOT / "configs" / "ovi_eval_matrix.json").read_text()
+        )
+        validator = QUALITY._run_validator_module()
+        for method_id, run_kinds in validator.COMBO_METHOD_RUN_KINDS.items():
+            method = QUALITY._find_method(matrix, method_id)
+            self.assertEqual(tuple(method["allowed_run_kinds"]), run_kinds)
+            self.assertIs(method["selection_required"], True)
+            for run_kind in run_kinds:
+                with self.subTest(method_id=method_id, run_kind=run_kind):
+                    environment = {
+                        "run_kind": run_kind,
+                        **validator.SPARSE_COMBO_RUN_KIND_CONTRACTS[run_kind],
+                    }
+                    self.assertEqual(
+                        QUALITY._selected_sparse_profile_for_environment(
+                            method,
+                            environment,
+                            "fixture",
+                        ),
+                        validator.SPARSE_PROFILE_BY_RUN_KIND[run_kind],
+                    )
+
+    def test_quality_rejects_old_generic_dense_combo_contracts(self):
+        matrix = json.loads(
+            (REPO_ROOT / "configs" / "ovi_eval_matrix.json").read_text()
+        )
+        old_cfg = copy.deepcopy(matrix)
+        cfg = next(
+            method
+            for method in old_cfg["methods"]
+            if method["method_id"] == "best_sparse_cfg"
+        )
+        cfg["expected_environment"]["run_kind"] = "best_sparse_cfg_benchmark"
+        with self.assertRaisesRegex(QUALITY.QualityError, "generic cache contract"):
+            QUALITY._find_method(old_cfg, "best_sparse_cfg")
+
+        old_block = copy.deepcopy(matrix)
+        block = next(
+            method
+            for method in old_block["methods"]
+            if method["method_id"] == "block_cache"
+        )
+        block["expected_environment"].update(
+            {
+                "run_kind": "block_cache_benchmark",
+                "attention_method": "dense",
+            }
+        )
+        with self.assertRaisesRegex(QUALITY.QualityError, "generic cache contract"):
+            QUALITY._find_method(old_block, "block_cache")
+
+    def test_quality_dense_cache_runs_cannot_masquerade_as_g_or_h(self):
+        matrix = json.loads(
+            (REPO_ROOT / "configs" / "ovi_eval_matrix.json").read_text()
+        )
+        cases = (
+            (
+                "best_sparse_cfg",
+                {
+                    "run_kind": "cfg_cache_benchmark",
+                    "attention_method": "dense",
+                    "use_cfg_cache": True,
+                    "use_block_cache": False,
+                },
+            ),
+            (
+                "block_cache",
+                {
+                    "run_kind": "block_cache_benchmark",
+                    "attention_method": "dense",
+                    "block_cache_policy": "fixed",
+                    "use_cfg_cache": False,
+                    "use_block_cache": True,
+                },
+            ),
+        )
+        for method_id, environment in cases:
+            with self.subTest(method_id=method_id):
+                method = QUALITY._find_method(matrix, method_id)
+                with self.assertRaisesRegex(QUALITY.QualityError, "run_kind"):
+                    QUALITY._selected_sparse_profile_for_environment(
+                        method,
+                        environment,
+                        "fixture",
+                    )
+
+    def test_quality_requires_g_and_h_to_bind_the_same_selected_profile(self):
+        cfg = self.make_run(
+            "best_sparse_cfg",
+            "quality-selection-g",
+            selected_sparse_profile="sparge_topk50",
+        )
+        block = self.make_run(
+            "block_cache",
+            "quality-selection-h",
+            selected_sparse_profile="sparge_topk50",
+        )
+        self.assertEqual(
+            QUALITY.validate_selected_sparse_profile_consistency((cfg, block)),
+            "sparge_topk50",
+        )
+        mismatched = QUALITY.AuditedRun(
+            **{
+                **block.__dict__,
+                "selected_sparse_profile": "radial_conservative",
+            }
+        )
+        with self.assertRaisesRegex(
+            QUALITY.QualityError,
+            "selected different sparse profiles",
+        ):
+            QUALITY.validate_selected_sparse_profile_consistency(
+                (cfg, mismatched)
+            )
 
     def test_builds_three_index_pairs_and_numeric_medians_without_acceptance_claim(self):
         values = iter((0.2, 0.1, 0.3))
@@ -389,6 +604,77 @@ class QualityProtocolTests(unittest.TestCase):
                 pair["candidate"]["checkpoint_fingerprint_sha256"],
             )
             self.assertIsNone(pair["automatic_acceptance"])
+
+    def test_builds_eighteen_identity_pairs_for_six_prompt_matrix(self):
+        dense = self.make_run(
+            "dense",
+            "dense-six",
+            fixture_prompt_count=6,
+        )
+        candidate = self.make_run(
+            "dense_cfg_cache",
+            "candidate-six",
+            fixture_prompt_count=6,
+        )
+        lpips_values = iter(float(value) for value in range(18))
+
+        report = self.build(
+            dense=dense,
+            candidate=candidate,
+            runner=lambda _dense, _candidate: self.metrics(
+                lpips_alex=next(lpips_values)
+            ),
+        )
+
+        expected_identities = [
+            (measurement_index, prompt_index, 0)
+            for measurement_index in QUALITY.EXPECTED_MEASUREMENT_INDICES
+            for prompt_index in range(6)
+        ]
+        self.assertEqual(report["pair_count"], 18)
+        self.assertEqual(
+            [
+                (
+                    pair["measurement_index"],
+                    pair["prompt_index"],
+                    pair["sample_index"],
+                )
+                for pair in report["pairs"]
+            ],
+            expected_identities,
+        )
+        self.assertEqual(report["metric_medians"]["lpips_alex"], 8.5)
+
+    def test_quality_pairing_rejects_prompt_identity_relabel(self):
+        dense = self.make_run(
+            "dense",
+            "dense-six-relabel",
+            fixture_prompt_count=6,
+        )
+        candidate = self.make_run(
+            "dense_cfg_cache",
+            "candidate-six-relabel",
+            fixture_prompt_count=6,
+        )
+        artifacts = dict(candidate.artifacts)
+        identity = (0, 1, 0)
+        artifacts[identity] = QUALITY.MeasurementArtifact(
+            **{**artifacts[identity].__dict__, "prompt": "relabelled prompt"}
+        )
+        candidate = QUALITY.AuditedRun(
+            **{**candidate.__dict__, "artifacts": artifacts}
+        )
+        with self.assertRaisesRegex(QUALITY.QualityError, "prompt differs"):
+            self.build(dense=dense, candidate=candidate)
+
+    def test_legacy_quality_protocol_schema_is_rejected(self):
+        legacy = copy.deepcopy(self.protocol)
+        legacy["schema_version"] = 1
+        legacy["protocol_id"] = "ovi_720x720_5s_dense_pair_quality_v1"
+        path = self.root / "legacy-quality-protocol.json"
+        write_json(path, legacy)
+        with self.assertRaisesRegex(QUALITY.QualityError, "schema_version"):
+            QUALITY.load_quality_protocol(path)
 
     def test_artifact_hash_drift_during_metric_execution_is_rejected(self):
         dense = self.make_run("dense", "dense")
@@ -422,6 +708,110 @@ class QualityProtocolTests(unittest.TestCase):
                 runner=mutating_late_runner,
             )
 
+    def test_preflight_drift_after_run_load_is_rejected(self):
+        run = self.make_run("dense_cfg_cache", "preflight-drift")
+        preflight = run.run_dir / "preflight.json"
+        preflight.write_text('{"status":"ok"}\n', encoding="utf-8")
+        bindings = dict(run.evidence_bindings)
+        bindings["preflight.json"] = {
+            "path": str(preflight),
+            "bytes": preflight.stat().st_size,
+            "sha256": digest(preflight),
+        }
+        guarded = QUALITY.AuditedRun(
+            **{**run.__dict__, "evidence_bindings": bindings}
+        )
+        preflight.write_text('{"status":"forged"}\n', encoding="utf-8")
+        with self.assertRaisesRegex(
+            QUALITY.QualityError,
+            "preflight.json evidence bytes or SHA256 drifted",
+        ):
+            QUALITY._assert_run_evidence(guarded, "after metrics")
+
+    def test_persisted_binding_covers_environment_originals_and_run_config(self):
+        for filename, expected_message in (
+            (
+                "preflight.json",
+                "evidence_bindings omits environment evidence preflight.json",
+            ),
+            ("run_config.yaml", "evidence_bindings omits run_config.yaml"),
+        ):
+            with self.subTest(filename=filename):
+                run = self.make_run(
+                    "dense_cfg_cache", f"persisted-omits-{filename}"
+                )
+                binding = run.sidecar_binding()
+                del binding["evidence_bindings"][filename]
+                with self.assertRaisesRegex(
+                    QUALITY.QualityError, expected_message
+                ):
+                    QUALITY._validate_persisted_run_binding(
+                        binding, "candidate"
+                    )
+
+    def test_persisted_binding_rejects_bound_original_drift(self):
+        for filename in ("preflight.json", "run_config.yaml"):
+            with self.subTest(filename=filename):
+                run = self.make_run(
+                    "dense_cfg_cache", f"persisted-drift-{filename}"
+                )
+                binding = run.sidecar_binding()
+                (run.run_dir / filename).write_text(
+                    "forged persisted original\n", encoding="utf-8"
+                )
+                with self.assertRaisesRegex(
+                    QUALITY.QualityError,
+                    rf"{re.escape(filename)} evidence bytes or SHA256 drifted",
+                ):
+                    QUALITY._validate_persisted_run_binding(
+                        binding, "candidate"
+                    )
+
+    def test_persisted_binding_cross_checks_environment_hashes(self):
+        for filename, expected_message in (
+            (
+                "preflight.json",
+                "preflight.json differs from bound environment evidence hash",
+            ),
+            (
+                "run_config.yaml",
+                "run_config.yaml differs from bound environment hash",
+            ),
+        ):
+            with self.subTest(filename=filename):
+                run = self.make_run(
+                    "dense_cfg_cache", f"persisted-rehash-{filename}"
+                )
+                binding = run.sidecar_binding()
+                path = run.run_dir / filename
+                path.write_text(
+                    "forged and locally rebound original\n", encoding="utf-8"
+                )
+                binding["evidence_bindings"][filename] = {
+                    "path": str(path),
+                    "bytes": path.stat().st_size,
+                    "sha256": digest(path),
+                }
+                with self.assertRaisesRegex(
+                    QUALITY.QualityError, expected_message
+                ):
+                    QUALITY._validate_persisted_run_binding(
+                        binding, "candidate"
+                    )
+
+    def test_non_string_evidence_binding_name_is_rejected_cleanly(self):
+        run = self.make_run("dense_cfg_cache", "bad-evidence-name")
+        bindings = dict(run.evidence_bindings)
+        bindings[1] = bindings["environment.json"]
+        guarded = QUALITY.AuditedRun(
+            **{**run.__dict__, "evidence_bindings": bindings}
+        )
+        with self.assertRaisesRegex(
+            QUALITY.QualityError,
+            "invalid evidence binding filename",
+        ):
+            QUALITY._assert_run_evidence(guarded, "after metrics")
+
     def test_nan_metric_is_rejected_instead_of_becoming_zero(self):
         with self.assertRaisesRegex(QUALITY.QualityError, "lpips_alex must be finite"):
             self.build(
@@ -446,7 +836,7 @@ class QualityProtocolTests(unittest.TestCase):
         candidate = QUALITY.AuditedRun(
             **{**candidate.__dict__, "artifacts": wrong}
         )
-        with self.assertRaisesRegex(QUALITY.QualityError, "measurement_index"):
+        with self.assertRaisesRegex(QUALITY.QualityError, "identity"):
             self.build(dense=dense, candidate=candidate)
 
     def test_cross_protocol_commit_is_rejected(self):
@@ -489,6 +879,64 @@ class QualityProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(QUALITY.QualityError, "refusing to overwrite"):
             QUALITY.write_quality_sidecars(report, output_dir)
 
+    def test_six_prompt_sidecars_and_manual_rows_bind_all_eighteen_identities(self):
+        dense = self.make_run(
+            "dense",
+            "dense-six-loop",
+            fixture_prompt_count=6,
+        )
+        candidate = self.make_run(
+            "dense_cfg_cache",
+            "candidate-six-loop",
+            fixture_prompt_count=6,
+        )
+        report = self.build(dense=dense, candidate=candidate)
+        median_path = QUALITY.write_quality_sidecars(
+            report,
+            self.root / "quality-six-loop",
+        )
+        median = json.loads(median_path.read_text(encoding="utf-8"))
+        self.assertEqual(median["pair_count"], 18)
+        self.assertEqual(len(median["pairs"]), 18)
+        bindings = QUALITY._expected_manual_bindings_from_report(median)
+        self.assertEqual(len(bindings), 18)
+
+        manual = self.root / "manual-six-loop.csv"
+        with manual.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=QUALITY.MANUAL_FIELDS)
+            writer.writeheader()
+            for identity in sorted(bindings):
+                writer.writerow(
+                    {
+                        "measurement_index": identity[0],
+                        "prompt_index": identity[1],
+                        "sample_index": identity[2],
+                        "dense_artifact_sha256": bindings[identity][0],
+                        "candidate_artifact_sha256": bindings[identity][1],
+                        "reviewer": "human-reviewer",
+                        "reviewed_at_utc": "2026-07-14T12:00:00Z",
+                        "sync_rating": "pass",
+                        "notes": "Reviewed exact identity pair.",
+                    }
+                )
+        status = QUALITY.validate_manual_reviews(
+            manual,
+            bindings,
+            self.protocol["manual_reviews"],
+        )
+        self.assertEqual(status["status"], "complete")
+        self.assertEqual(status["row_count"], 18)
+
+    def test_quality_evidence_rejects_symlinked_warmup_snapshot(self):
+        dense = self.make_run("dense", "dense-warmup-symlink")
+        candidate = self.make_run("dense_cfg_cache", "candidate-warmup-symlink")
+        target = dense.run_dir / "warmup-target.jsonl"
+        target.write_bytes(dense.warmup_timings_path.read_bytes())
+        dense.warmup_timings_path.unlink()
+        dense.warmup_timings_path.symlink_to(target)
+        with self.assertRaisesRegex(QUALITY.QualityError, "symlink"):
+            self.build(dense=dense, candidate=candidate)
+
     def test_manual_template_is_valid_but_pending_and_never_autofilled(self):
         dense = self.make_run("dense", "dense")
         candidate = self.make_run("dense_cfg_cache", "candidate")
@@ -519,6 +967,8 @@ class QualityProtocolTests(unittest.TestCase):
                 writer.writerow(
                     {
                         "measurement_index": index,
+                        "prompt_index": 0,
+                        "sample_index": 0,
                         "dense_artifact_sha256": bindings[index][0],
                         "candidate_artifact_sha256": (
                             "f" * 64 if index == 1 else bindings[index][1]
@@ -545,15 +995,17 @@ class QualityProtocolTests(unittest.TestCase):
         with manual.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=QUALITY.MANUAL_FIELDS)
             writer.writeheader()
-            for index in QUALITY.EXPECTED_INDICES:
+            for identity in sorted(bindings):
                 writer.writerow(
                     {
-                        "measurement_index": index,
-                        "dense_artifact_sha256": bindings[index][0],
-                        "candidate_artifact_sha256": bindings[index][1],
+                        "measurement_index": identity[0],
+                        "prompt_index": identity[1],
+                        "sample_index": identity[2],
+                        "dense_artifact_sha256": bindings[identity][0],
+                        "candidate_artifact_sha256": bindings[identity][1],
                         "reviewer": "human-reviewer",
                         "reviewed_at_utc": "2026-07-14T12:00:00Z",
-                        "sync_rating": "uncertain" if index == 2 else "pass",
+                        "sync_rating": "uncertain" if identity[0] == 2 else "pass",
                         "notes": "Human-authored synchronization review.",
                     }
                 )
@@ -578,7 +1030,7 @@ class QualityProtocolTests(unittest.TestCase):
 
     def test_forged_inline_three_pair_report_is_not_a_manual_trust_root(self):
         forged = {
-            "schema_version": 1,
+            "schema_version": QUALITY.QUALITY_SCHEMA_VERSION,
             "record_type": "ovi_quality_report",
             "pairs": [
                 {

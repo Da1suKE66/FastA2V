@@ -1028,12 +1028,6 @@ class RadialVideoSelfAttentionBackend:
 def build_radial_video_backend(config):
     """Build the strict backend before Ovi checkpoint allocation."""
 
-    if bool(config.get("use_cfg_cache", False)) or bool(
-        config.get("use_block_cache", False)
-    ):
-        raise RadialAttentionInputError(
-            "audited Radial baselines require CFG cache and block cache disabled"
-        )
     if int(config.get("sp_size", 1)) != 1:
         raise RadialAttentionInputError("audited Radial baselines require sp_size=1")
     profile_name = str(config.get("radial_profile", "conservative")).lower()

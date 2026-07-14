@@ -59,6 +59,7 @@ RadialAttentionInputError = BACKEND_MODULE.RadialAttentionInputError
 RadialAttentionDependencyError = BACKEND_MODULE.RadialAttentionDependencyError
 RadialVideoSelfAttentionBackend = BACKEND_MODULE.RadialVideoSelfAttentionBackend
 audit_and_repair_radial_mask = BACKEND_MODULE.audit_and_repair_radial_mask
+build_radial_video_backend = BACKEND_MODULE.build_radial_video_backend
 summarize_bool_rows = BACKEND_MODULE.summarize_bool_rows
 
 _COMPRESSED_RAW_MASKS = {
@@ -1650,6 +1651,47 @@ class RadialBackendExecutionTests(unittest.TestCase):
             runtime_dependency_verifier=runtime_dependency_verifier,
         )
         return backend, torch_module, flashinfer, mask_calls, rope_calls
+
+    def test_builder_allows_registered_cache_combinations_to_reach_audit(self):
+        class DependencyAuditReached(RuntimeError):
+            pass
+
+        for cache_fields in (
+            {"use_cfg_cache": True, "use_block_cache": False},
+            {"use_cfg_cache": False, "use_block_cache": True},
+        ):
+            config = {
+                "sp_size": 1,
+                "radial_profile": "conservative",
+                "radial_decay_factor": 4.0,
+                "radial_block_size": 128,
+                "radial_model_type": "wan",
+                **cache_fields,
+            }
+            with self.subTest(cache_fields=cache_fields), mock.patch.object(
+                BACKEND_MODULE,
+                "verify_radial_install_receipt",
+                side_effect=DependencyAuditReached,
+            ):
+                with self.assertRaises(DependencyAuditReached):
+                    build_radial_video_backend(config)
+
+    def test_cache_permission_does_not_relax_dtype_or_fallback_contract(self):
+        backend, _torch, _flashinfer, _mask_calls, _rope_calls = self.make_backend()
+        wrong_dtype = FakeTensor(
+            "q",
+            (1, 15004, 24, 128),
+            dtype="torch.float16",
+        )
+        with self.assertRaisesRegex(RadialAttentionInputError, "BF16"):
+            backend._validate_inputs(
+                wrong_dtype,
+                wrong_dtype,
+                wrong_dtype,
+                FakeHostTensor([15004]),
+                FakeHostTensor([[31, 22, 22]]),
+            )
+        self.assertIs(backend.metrics()["fallback_allowed"], False)
 
     def test_first_cuda_dependency_audit_persists_across_metric_resets(self):
         evidence = {

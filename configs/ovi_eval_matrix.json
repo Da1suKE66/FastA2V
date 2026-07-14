@@ -43,7 +43,8 @@
     "warmup_runs": 1,
     "measurement_runs": 3,
     "each_example_n_times": 1,
-    "prompt_count": 1,
+    "prompt_count": 6,
+    "prompts_sha256": "2b85656756511645007ec619ae692359ed0ca157f7188d73fd273bb000bba534",
     "benchmark_eligible": true,
     "debug_forward": false
   },
@@ -106,8 +107,7 @@
       "method_id": "radial_conservative",
       "label": "Radial conservative",
       "required": true,
-      "implementation_status": "pending",
-      "pending_reason": "Official Radial compatibility and its formal benchmark are not implemented or verified yet.",
+      "implementation_status": "ready",
       "expected_environment": {
         "run_kind": "radial_conservative_baseline",
         "attention_method": "radial",
@@ -120,8 +120,7 @@
       "method_id": "radial_aggressive",
       "label": "Radial aggressive",
       "required": true,
-      "implementation_status": "pending",
-      "pending_reason": "Official Radial compatibility and its formal benchmark are not implemented or verified yet.",
+      "implementation_status": "ready",
       "expected_environment": {
         "run_kind": "radial_aggressive_baseline",
         "attention_method": "radial",
@@ -134,23 +133,36 @@
       "method_id": "best_sparse_cfg",
       "label": "Best sparse + CFG cache",
       "required": true,
-      "implementation_status": "pending",
-      "pending_reason": "The best sparse method cannot be selected until valid sparse performance and quality results exist.",
+      "implementation_status": "ready",
+      "selection_required": true,
+      "pending_reason": "No explicit selected sparse-profile run mapping was provided for this ready slot.",
       "selection_policy": "After sparse quality review, select the fastest accepted sparse profile and rerun it with only CFG cache additionally enabled.",
+      "allowed_run_kinds": [
+        "sparge_topk50_cfg_benchmark",
+        "sparge_topk75_cfg_benchmark",
+        "radial_conservative_cfg_benchmark",
+        "radial_aggressive_cfg_benchmark"
+      ],
       "expected_environment": {
-        "run_kind": "best_sparse_cfg_benchmark",
         "use_cfg_cache": true,
         "use_block_cache": false
       }
     },
     {
       "method_id": "block_cache",
-      "label": "Dense + block cache",
+      "label": "Best sparse + simple block cache",
       "required": false,
       "implementation_status": "ready",
+      "selection_required": true,
+      "pending_reason": "No explicit selected sparse-profile run mapping was provided for this ready slot.",
+      "selection_policy": "Select the accepted best sparse profile, then rerun it with only the simple block cache additionally enabled.",
+      "allowed_run_kinds": [
+        "sparge_topk50_block_cache_benchmark",
+        "sparge_topk75_block_cache_benchmark",
+        "radial_conservative_block_cache_benchmark",
+        "radial_aggressive_block_cache_benchmark"
+      ],
       "expected_environment": {
-        "run_kind": "block_cache_benchmark",
-        "attention_method": "dense",
         "use_cfg_cache": false,
         "use_block_cache": true,
         "block_cache_policy": "fixed"
