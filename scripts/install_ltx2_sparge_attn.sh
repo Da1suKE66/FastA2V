@@ -120,7 +120,7 @@ missing = required - set(inspect.signature(spas_sage2_attn_meansim_topk_cuda).pa
 if missing:
     raise RuntimeError(f"official SpargeAttn API is missing parameters: {sorted(missing)}")
 
-device = torch.device("cuda")
+device = torch.device("cuda", torch.cuda.current_device())
 if torch.cuda.get_device_capability(device) != (8, 0):
     raise RuntimeError(f"LTX SpargeAttn build targets sm80; got {torch.cuda.get_device_capability(device)}")
 generator = torch.Generator(device=device).manual_seed(0)
