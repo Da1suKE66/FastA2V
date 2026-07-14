@@ -144,6 +144,109 @@ def media_mocks():
     )
 
 
+class MediaDecodeCommandTests(unittest.TestCase):
+    @staticmethod
+    def completed(*, stdout=b"", stderr=b"", returncode=0):
+        return VERIFIER.subprocess.CompletedProcess(
+            args=["ffmpeg"],
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    def test_full_video_decode_has_exact_length_and_isolates_stdin(self):
+        raw = bytes(range(256)) * 32
+        with mock.patch.object(
+            VERIFIER.subprocess,
+            "run",
+            return_value=self.completed(stdout=raw),
+        ) as run_mock:
+            decoded = VERIFIER.decode_video_gray(Path("fixture.mp4"), 2)
+
+        self.assertEqual(decoded.nbytes, 2 * 64 * 64)
+        self.assertEqual(decoded.tobytes(), raw)
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[:2], ["ffmpeg", "-nostdin"])
+        self.assertIs(run_mock.call_args.kwargs["stdin"], VERIFIER.subprocess.DEVNULL)
+        self.assertIs(run_mock.call_args.kwargs["stdout"], VERIFIER.subprocess.PIPE)
+        self.assertIs(run_mock.call_args.kwargs["stderr"], VERIFIER.subprocess.PIPE)
+        self.assertIs(run_mock.call_args.kwargs["check"], False)
+
+    def test_returncode_zero_partial_video_decode_is_rejected(self):
+        with mock.patch.object(
+            VERIFIER.subprocess,
+            "run",
+            return_value=self.completed(stdout=b"\x01" * (64 * 64)),
+        ), self.assertRaisesRegex(
+            ValueError,
+            r"expected 8192 bytes for 2 frames, found 4096 bytes",
+        ):
+            VERIFIER.decode_video_gray(Path("fixture.mp4"), 2)
+
+    def test_returncode_zero_zero_frame_decode_is_rejected(self):
+        with mock.patch.object(
+            VERIFIER.subprocess,
+            "run",
+            return_value=self.completed(stdout=b""),
+        ), self.assertRaisesRegex(
+            ValueError,
+            r"expected 4096 bytes for 1 frames, found 0 bytes",
+        ):
+            VERIFIER.decode_video_gray(Path("fixture.mp4"), 1)
+
+    def test_returncode_zero_error_stderr_fails_without_mixing_stdout(self):
+        with mock.patch.object(
+            VERIFIER.subprocess,
+            "run",
+            return_value=self.completed(
+                stdout=b"secret-binary-stdout",
+                stderr=b"decoder reported corruption\n",
+            ),
+        ), self.assertRaises(VERIFIER.MediaCommandError) as raised:
+            VERIFIER.decode_audio(Path("fixture.mp4"))
+
+        rendered = str(raised.exception)
+        self.assertIn("error-level stderr despite exit status 0", rendered)
+        self.assertIn("decoder reported corruption", rendered)
+        self.assertNotIn("secret-binary-stdout", rendered)
+
+    def test_nonzero_exit_without_stderr_is_readable_and_fail_closed(self):
+        with mock.patch.object(
+            VERIFIER.subprocess,
+            "run",
+            return_value=self.completed(returncode=7),
+        ), self.assertRaisesRegex(
+            VERIFIER.MediaCommandError,
+            r"ffprobe exited with status 7 without stderr diagnostics",
+        ):
+            VERIFIER.probe(Path("fixture.mp4"))
+
+    def test_audio_uses_nostdin_and_probe_uses_devnull_without_nostdin(self):
+        audio_result = self.completed(stdout=b"\x00\x00\x00\x00")
+        probe_result = self.completed(stdout=b'{"streams": []}')
+        with mock.patch.object(
+            VERIFIER.subprocess,
+            "run",
+            side_effect=[audio_result, probe_result],
+        ) as subprocess_run, mock.patch.object(
+            VERIFIER,
+            "run",
+            wraps=VERIFIER.run,
+        ) as run_mock:
+            audio = VERIFIER.decode_audio(Path("fixture.mp4"))
+            payload = VERIFIER.probe(Path("fixture.mp4"))
+
+        self.assertEqual(audio.size, 1)
+        self.assertEqual(payload, {"streams": []})
+        audio_command = run_mock.call_args_list[0].args[0]
+        probe_command = run_mock.call_args_list[1].args[0]
+        self.assertEqual(audio_command[:2], ["ffmpeg", "-nostdin"])
+        self.assertEqual(probe_command[0], "ffprobe")
+        self.assertNotIn("-nostdin", probe_command)
+        for call in subprocess_run.call_args_list:
+            self.assertIs(call.kwargs["stdin"], VERIFIER.subprocess.DEVNULL)
+
+
 def make_protocol_fixture(run_dir):
     run_dir = Path(run_dir).resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -517,6 +620,27 @@ class StableArtifactCounterexampleTests(unittest.TestCase):
             VERIFIER.verify(
                 artifact, expected_video_frames=1, run_dir=self.run_dir
             )
+
+    def test_verify_binds_expected_decode_count_and_records_raw_digest(self):
+        artifact = self.run_dir / "artifact.mp4"
+        artifact.write_bytes(b"snapshot media")
+        expected_gray = VERIFIER.np.arange(64 * 64, dtype=VERIFIER.np.uint8)
+        probe_patch, audio_patch, video_patch = media_mocks()
+        with probe_patch, audio_patch, video_patch as video_mock:
+            report = VERIFIER.verify(
+                artifact,
+                require_metrics=False,
+                expected_video_frames=1,
+                run_dir=self.run_dir,
+            )
+
+        self.assertEqual(video_mock.call_args.args[1], 1)
+        self.assertEqual(report["video"]["decoded_frames"], 1)
+        self.assertEqual(report["video"]["decoded_raw_bytes"], 64 * 64)
+        self.assertEqual(
+            report["video"]["decoded_raw_sha256"],
+            hashlib.sha256(expected_gray).hexdigest(),
+        )
 
     def test_final_revalidation_publishes_failed_after_replacement(self):
         evidence_path = self.run_dir / "timings.jsonl"

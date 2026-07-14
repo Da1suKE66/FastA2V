@@ -68,6 +68,31 @@ SPARGE_PROVENANCE = {
 }
 
 
+class MediaCommandError(subprocess.SubprocessError):
+    """Fail-closed ffmpeg/ffprobe failure with stderr-only diagnostics."""
+
+    def __init__(self, command, returncode, stderr):
+        executable = Path(str(command[0])).name if command else "media command"
+        stderr = bytes(stderr or b"")
+        rendered_stderr = stderr.decode("utf-8", errors="replace").strip()
+        if not rendered_stderr and stderr:
+            rendered_stderr = repr(stderr)
+        if returncode:
+            message = f"{executable} exited with status {returncode}"
+        else:
+            message = (
+                f"{executable} emitted error-level stderr despite exit status 0"
+            )
+        if rendered_stderr:
+            message += f": {rendered_stderr}"
+        else:
+            message += " without stderr diagnostics"
+        super().__init__(message)
+        self.command = tuple(command)
+        self.returncode = returncode
+        self.stderr = stderr
+
+
 class EvidenceSnapshotError(ValueError):
     """Raised when a persisted evidence file cannot be read immutably."""
 
@@ -329,7 +354,20 @@ def _binding_shape_errors(binding, expected_keys, context):
 
 
 def run(command):
-    return subprocess.check_output(command, stderr=subprocess.STDOUT)
+    """Run a media command without a controlling stdin or mixed output pipes."""
+
+    completed = subprocess.run(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    stdout = bytes(completed.stdout or b"")
+    stderr = bytes(completed.stderr or b"")
+    if completed.returncode != 0 or stderr:
+        raise MediaCommandError(command, completed.returncode, stderr)
+    return stdout
 
 
 def probe(path):
@@ -350,6 +388,7 @@ def probe(path):
 def decode_audio(path):
     raw = run([
         "ffmpeg",
+        "-nostdin",
         "-v",
         "error",
         "-i",
@@ -367,9 +406,12 @@ def decode_audio(path):
     return np.frombuffer(raw, dtype="<f4")
 
 
-def decode_video_gray(path):
+def decode_video_gray(path, expected_frames):
+    if type(expected_frames) is not int or expected_frames < 1:
+        raise ValueError("expected decoded video frame count must be a positive integer")
     raw = run([
         "ffmpeg",
+        "-nostdin",
         "-v",
         "error",
         "-i",
@@ -384,6 +426,17 @@ def decode_video_gray(path):
         "gray",
         "pipe:1",
     ])
+    bytes_per_frame = 64 * 64
+    expected_bytes = expected_frames * bytes_per_frame
+    actual_bytes = len(raw)
+    if actual_bytes != expected_bytes:
+        complete_frames, trailing_bytes = divmod(actual_bytes, bytes_per_frame)
+        raise ValueError(
+            "decoded 64x64 gray video byte length mismatch: "
+            f"expected {expected_bytes} bytes for {expected_frames} frames, "
+            f"found {actual_bytes} bytes ({complete_frames} complete frames, "
+            f"{trailing_bytes} trailing bytes)"
+        )
     return np.frombuffer(raw, dtype=np.uint8)
 
 
@@ -1614,7 +1667,7 @@ def verify(
             else np.empty(0, dtype=np.float32)
         )
         gray = (
-            decode_video_gray(materialized_path)
+            decode_video_gray(materialized_path, expected_video_frames)
             if media_videos
             else np.empty(0, dtype=np.uint8)
         )
@@ -1965,6 +2018,9 @@ def verify(
             "height": height,
             "frames": frames,
             "duration_seconds": duration,
+            "decoded_frames": int(gray.size // (64 * 64)),
+            "decoded_raw_bytes": int(gray.nbytes),
+            "decoded_raw_sha256": hashlib.sha256(gray).hexdigest(),
             "decoded_pixel_std": video_std,
         },
         "audio": {
