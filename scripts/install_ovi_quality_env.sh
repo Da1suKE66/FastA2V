@@ -284,6 +284,9 @@ EVAL_ALEXNET_PATH="${ALEXNET_PATH}" \
 EVAL_INSTALL_MODE="${QUALITY_INSTALL_MODE}" \
 EVAL_PROTOCOL_CONFIG="${PROTOCOL_CONFIG}" \
 EVAL_QUALITY_URL_POLICY="${QUALITY_URL_POLICY}" \
+EVAL_PIP_CACHE_DIR="${PIP_CACHE_DIR}" \
+EVAL_PIP_NETWORK_TIMEOUT_SECONDS="${PIP_NETWORK_TIMEOUT_SECONDS}" \
+EVAL_PIP_NETWORK_RETRIES="${PIP_NETWORK_RETRIES}" \
 "${EVAL_ENV}/bin/python" -I -B - <<'PY'
 import hashlib
 import importlib
@@ -293,9 +296,9 @@ import os
 from pathlib import Path
 import platform
 import re
+import subprocess
 import sys
 from urllib.parse import unquote, urlparse
-import urllib.request
 
 from pip._vendor.packaging.utils import canonicalize_name, parse_wheel_filename
 
@@ -427,11 +430,6 @@ else:
             if str(wheel_version) != version:
                 raise SystemExit(f"wheel filename version differs for {distribution}: {filename}")
             wheel_path = wheelhouse / filename
-            temporary = wheel_path.with_suffix(wheel_path.suffix + ".part")
-            urllib.request.urlretrieve(archive_url, temporary)
-            if sha256(temporary) != archive_hash:
-                raise SystemExit(f"downloaded wheel hash differs from pip report: {distribution}")
-            temporary.replace(wheel_path)
             archive_receipts[distribution] = {
                 "distribution": distribution,
                 "version": version,
@@ -440,6 +438,65 @@ else:
                 "archive_sha256": archive_hash,
                 "archive_path": str(wheel_path.resolve()),
             }
+
+    expected_wheel_paths = {
+        Path(record["archive_path"])
+        for record in archive_receipts.values()
+    }
+    if len(expected_wheel_paths) != len(archive_receipts):
+        raise SystemExit("two bootstrap dependencies map to the same wheel filename")
+    download_command = [
+        sys.executable,
+        "-I",
+        "-B",
+        "-m",
+        "pip",
+        "--isolated",
+        "download",
+        "--disable-pip-version-check",
+        "--no-input",
+        "--cache-dir",
+        os.environ["EVAL_PIP_CACHE_DIR"],
+        "--timeout",
+        os.environ["EVAL_PIP_NETWORK_TIMEOUT_SECONDS"],
+        "--retries",
+        os.environ["EVAL_PIP_NETWORK_RETRIES"],
+        "--resume-retries",
+        os.environ["EVAL_PIP_NETWORK_RETRIES"],
+        "--no-deps",
+        "--only-binary=:all:",
+        "--no-index",
+        "--dest",
+        str(wheelhouse),
+        *[
+            archive_receipts[distribution]["archive_url"]
+            for distribution in sorted(archive_receipts)
+        ],
+    ]
+    download_environment = os.environ.copy()
+    download_environment["PIP_CONFIG_FILE"] = os.devnull
+    subprocess.run(
+        download_command,
+        check=True,
+        env=download_environment,
+        stdin=subprocess.DEVNULL,
+    )
+    try:
+        url_policy["validate_exact_wheelhouse"](
+            wheelhouse,
+            expected_wheel_paths,
+        )
+    except ValueError as exc:
+        raise SystemExit(
+            "materialized wheelhouse differs from the exact pip reports: "
+            f"{exc}"
+        ) from exc
+    for distribution, record in archive_receipts.items():
+        wheel_path = Path(record["archive_path"])
+        if sha256(wheel_path) != record["archive_sha256"]:
+            raise SystemExit(
+                f"materialized wheel hash differs from pip report: {distribution}"
+            )
 
 installed = {}
 for distribution_metadata in importlib.metadata.distributions(path=[str(site_packages)]):

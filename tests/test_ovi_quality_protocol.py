@@ -22,6 +22,15 @@ QUALITY = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = QUALITY
 SPEC.loader.exec_module(QUALITY)
 
+URL_POLICY_PATH = REPO_ROOT / "scripts" / "quality_archive_urls.py"
+URL_POLICY_SPEC = importlib.util.spec_from_file_location(
+    "quality_archive_urls_test",
+    URL_POLICY_PATH,
+)
+URL_POLICY = importlib.util.module_from_spec(URL_POLICY_SPEC)
+sys.modules[URL_POLICY_SPEC.name] = URL_POLICY
+URL_POLICY_SPEC.loader.exec_module(URL_POLICY)
+
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -1349,14 +1358,46 @@ class QualityProtocolTests(unittest.TestCase):
             source.count('--retries "${PIP_NETWORK_RETRIES}"'),
             4,
         )
-        self.assertEqual(source.count("--disable-pip-version-check"), 4)
-        self.assertEqual(source.count("--no-input"), 4)
+        self.assertEqual(source.count("--disable-pip-version-check"), 5)
+        self.assertEqual(source.count("--no-input"), 5)
         self.assertNotIn("-m pip install", source)
         self.assertNotIn("export PIP_CACHE_DIR", source)
+        self.assertIn('download_environment["PIP_CONFIG_FILE"] = os.devnull', source)
+        self.assertIn('"--isolated",\n        "download",', source)
+        self.assertIn('"--resume-retries",', source)
+        self.assertIn('"--no-deps",\n        "--only-binary=:all:",\n        "--no-index",', source)
+        self.assertIn("materialized wheelhouse differs from the exact pip reports", source)
+        self.assertIn("materialized wheel hash differs from pip report", source)
         self.assertNotIn(
             'archive_url.startswith("https://download.pytorch.org/")',
             source,
         )
+
+    def test_exact_wheelhouse_rejects_symlink_entry(self):
+        wheelhouse = self.root / "exact-wheelhouse-symlink"
+        wheelhouse.mkdir()
+        expected = wheelhouse / "expected-1.0-py3-none-any.whl"
+        expected.write_bytes(b"expected-wheel")
+        (wheelhouse / "extra-link.whl").symlink_to(expected.name)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "non-regular or symlink top-level entries",
+        ):
+            URL_POLICY.validate_exact_wheelhouse(wheelhouse, {expected})
+
+    def test_exact_wheelhouse_rejects_directory_entry(self):
+        wheelhouse = self.root / "exact-wheelhouse-directory"
+        wheelhouse.mkdir()
+        expected = wheelhouse / "expected-1.0-py3-none-any.whl"
+        expected.write_bytes(b"expected-wheel")
+        (wheelhouse / "extra-directory").mkdir()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "non-regular or symlink top-level entries",
+        ):
+            URL_POLICY.validate_exact_wheelhouse(wheelhouse, {expected})
 
     def test_pip_dual_isolation_ignores_synthetic_ambient_configuration(self):
         pip_config = self.root / "synthetic-pip.conf"

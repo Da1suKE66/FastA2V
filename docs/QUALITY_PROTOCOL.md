@@ -74,6 +74,14 @@ isolation above remains the source boundary. Bootstrap uses only its explicitly
 written indexes; pinned mode remains `--no-index` and can read only its retained
 wheelhouse.
 
+After bootstrap installation, the exact archive URLs already recorded in the
+three pip reports are materialized into the retained wheelhouse by isolated pip
+with `--no-index --no-deps`. This second pass reuses the fixed pip cache, allows
+bounded HTTP range resumption, requires the wheelhouse filename set to match the
+reports exactly, rejects every non-regular or symlink top-level entry, and
+verifies every full archive SHA256 again. It does not run a second dependency
+resolution and cannot add an index or an unreported wheel.
+
 The canonical CPU resolver entry remains
 `https://download.pytorch.org/whl/cpu`, while PyTorch currently serves wheel
 bytes from either `download.pytorch.org` or its official

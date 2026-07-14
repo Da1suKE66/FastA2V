@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 
@@ -106,3 +107,47 @@ def validate_dependency_archive_url(
             f"{observed_source_index!r} != {expected_source_index!r}"
         )
     return observed_source_index
+
+
+def validate_exact_wheelhouse(
+    wheelhouse: object,
+    expected_paths: object,
+) -> frozenset[Path]:
+    """Require an exact flat set of regular, non-symlink wheel files."""
+
+    wheelhouse_path = Path(wheelhouse)
+    if wheelhouse_path.is_symlink() or not wheelhouse_path.is_dir():
+        raise ValueError("wheelhouse must be a non-symlink directory")
+    wheelhouse_path = wheelhouse_path.resolve()
+    try:
+        expected_sequence = tuple(expected_paths)
+    except TypeError as exc:
+        raise ValueError("expected wheel paths must be iterable") from exc
+    expected = set()
+    for raw_path in expected_sequence:
+        path = Path(raw_path).resolve()
+        if path.parent != wheelhouse_path:
+            raise ValueError(f"expected wheel escaped the flat wheelhouse: {path}")
+        expected.add(path)
+    if len(expected) != len(expected_sequence):
+        raise ValueError("expected wheel paths contain a duplicate filename")
+
+    observed = set()
+    rejected = []
+    for path in wheelhouse_path.iterdir():
+        if path.is_symlink() or not path.is_file():
+            rejected.append(path.name)
+            continue
+        observed.add(path.resolve())
+    if rejected:
+        raise ValueError(
+            "wheelhouse contains non-regular or symlink top-level entries: "
+            f"{sorted(rejected)}"
+        )
+    if observed != expected:
+        raise ValueError(
+            "wheelhouse file set differs; "
+            f"missing={sorted(str(path) for path in expected - observed)}, "
+            f"extra={sorted(str(path) for path in observed - expected)}"
+        )
+    return frozenset(observed)
