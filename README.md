@@ -25,6 +25,24 @@
 > The optional official SpargeAttn adapter has a separate pinned build step and
 > fail-fast receipt check. See [`docs/SPARGEATTN.md`](docs/SPARGEATTN.md).
 >
+> The LTX line starts independently from official LTX-2.3 commit
+> `9377758131b1ffde4b7f766804590a6617bf2ab9`. Its environment, models and runs
+> stay under `/cache/liluchen/FastA2V`; only video `attn1` is eligible for the
+> sparse adapter. Bootstrap it and run one dense 5-second smoke with:
+>
+> ```bash
+> bash scripts/setup_ltx2_env.sh
+> bash scripts/download_ltx2_weights.sh
+> # Accept the Gemma terms and run the pinned login/download command printed above.
+> bash scripts/run_ltx2_quick.sh
+> ```
+>
+> Run all four quick prompts by setting
+> `FASTA2V_LTX2_PROMPTS_CSV=prompts/ltx2_quick4.csv`. For Sparge, first run
+> `bash scripts/install_ltx2_sparge_attn.sh`, then set
+> `FASTA2V_LTX2_METHOD=sparge`. Set `FASTA2V_LTX2_PIPELINE=one-stage` for the
+> 20/30-step dev-checkpoint baseline.
+>
 > The Radial Attention scaffold pins the official MIT Han Lab source, keeps its
 > checkout pristine, handles Ovi's 28-token non-block tail without padding, and
 > fails closed until its fixed FlashInfer candidate passes a guarded smoke run.
