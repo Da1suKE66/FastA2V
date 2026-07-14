@@ -94,7 +94,6 @@ if [[ "${EVAL_PYTHON_MINOR}" != "3.11" ]]; then
 fi
 
 export CUDA_VISIBLE_DEVICES=""
-export PIP_CACHE_DIR
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1
 export TORCH_HOME
@@ -102,7 +101,11 @@ unset PYTHONHOME
 unset PYTHONPATH
 
 if [[ "${QUALITY_INSTALL_MODE}" == "bootstrap" ]]; then
-  "${EVAL_ENV}/bin/python" -I -B -m pip install \
+  PIP_CONFIG_FILE=/dev/null \
+  "${EVAL_ENV}/bin/python" -I -B -m pip --isolated install \
+    --disable-pip-version-check \
+    --no-input \
+    --cache-dir "${PIP_CACHE_DIR}" \
     --force-reinstall \
     --no-compile \
     --only-binary=:all: \
@@ -110,7 +113,11 @@ if [[ "${QUALITY_INSTALL_MODE}" == "bootstrap" ]]; then
     --index-url "https://pypi.org/simple" \
     "pip==25.1.1" \
     "setuptools==75.8.0"
-  "${EVAL_ENV}/bin/python" -I -B -m pip install \
+  PIP_CONFIG_FILE=/dev/null \
+  "${EVAL_ENV}/bin/python" -I -B -m pip --isolated install \
+    --disable-pip-version-check \
+    --no-input \
+    --cache-dir "${PIP_CACHE_DIR}" \
     --force-reinstall \
     --no-compile \
     --only-binary=:all: \
@@ -123,7 +130,11 @@ if [[ "${QUALITY_INSTALL_MODE}" == "bootstrap" ]]; then
     "scipy==1.13.1" \
     "tqdm==4.67.1" \
     "pillow==11.1.0"
-  "${EVAL_ENV}/bin/python" -I -B -m pip install \
+  PIP_CONFIG_FILE=/dev/null \
+  "${EVAL_ENV}/bin/python" -I -B -m pip --isolated install \
+    --disable-pip-version-check \
+    --no-input \
+    --cache-dir "${PIP_CACHE_DIR}" \
     --force-reinstall \
     --no-compile \
     --only-binary=:all: \
@@ -201,7 +212,11 @@ Path(os.environ["EVAL_PINNED_REQUIREMENTS"]).write_text(
     encoding="utf-8",
 )
 PY
-  "${EVAL_ENV}/bin/python" -I -B -m pip install \
+  PIP_CONFIG_FILE=/dev/null \
+  "${EVAL_ENV}/bin/python" -I -B -m pip --isolated install \
+    --disable-pip-version-check \
+    --no-input \
+    --cache-dir "${PIP_CACHE_DIR}" \
     --force-reinstall \
     --no-compile \
     --no-index \

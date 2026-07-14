@@ -1333,10 +1333,172 @@ class QualityProtocolTests(unittest.TestCase):
         self.assertIn('EVAL_QUALITY_URL_POLICY="${QUALITY_URL_POLICY}"', source)
         self.assertIn('"classify_dependency_archive_url"', source)
         self.assertIn('url_policy["validate_dependency_archive_url"]', source)
+        isolated_pip = (
+            'PIP_CONFIG_FILE=/dev/null \\\n'
+            '  "${EVAL_ENV}/bin/python" -I -B -m pip --isolated install \\\n'
+        )
+        self.assertEqual(source.count(isolated_pip), 4)
+        self.assertEqual(source.count('--cache-dir "${PIP_CACHE_DIR}"'), 4)
+        self.assertEqual(source.count("--disable-pip-version-check"), 4)
+        self.assertEqual(source.count("--no-input"), 4)
+        self.assertNotIn("-m pip install", source)
+        self.assertNotIn("export PIP_CACHE_DIR", source)
         self.assertNotIn(
             'archive_url.startswith("https://download.pytorch.org/")',
             source,
         )
+
+    def test_pip_dual_isolation_ignores_synthetic_ambient_configuration(self):
+        pip_config = self.root / "synthetic-pip.conf"
+        config_index = "https://config-index.invalid/simple"
+        environment_index = "https://environment-index.invalid/simple"
+        pip_config.write_text(
+            "[global]\n"
+            f"extra-index-url = {config_index}\n"
+            f"find-links = {self.root / 'config-wheels'}\n",
+            encoding="utf-8",
+        )
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("PIP_")
+        }
+        environment.update(
+            {
+                "PIP_CONFIG_FILE": str(pip_config),
+                "PIP_EXTRA_INDEX_URL": environment_index,
+            }
+        )
+
+        isolated_only = subprocess.run(
+            [sys.executable, "-m", "pip", "--isolated", "config", "list"],
+            check=True,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertTrue(config_index in isolated_only.stdout)
+        self.assertFalse(environment_index in isolated_only.stdout)
+
+        environment["PIP_CONFIG_FILE"] = os.devnull
+        config_file_only = subprocess.run(
+            [sys.executable, "-m", "pip", "config", "list"],
+            check=True,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertTrue(environment_index in config_file_only.stdout)
+
+        dual_isolation = subprocess.run(
+            [sys.executable, "-m", "pip", "--isolated", "config", "list"],
+            check=True,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(dual_isolation.stdout.strip(), "")
+        self.assertFalse(config_index in dual_isolation.stderr)
+        self.assertFalse(environment_index in dual_isolation.stderr)
+
+    def test_pip_dual_isolation_confines_pinned_find_links(self):
+        ambient_wheelhouse = self.root / "ambient-wheels"
+        intended_wheelhouse = self.root / "intended-wheels"
+        cache_dir = self.root / "pip-cache"
+        ambient_wheelhouse.mkdir()
+        intended_wheelhouse.mkdir()
+        wheel = (
+            ambient_wheelhouse
+            / "fasta2v_pip_isolation_probe-1.0-py3-none-any.whl"
+        )
+        files = {
+            "fasta2v_pip_isolation_probe/__init__.py": b"VALUE = 1\n",
+            "fasta2v_pip_isolation_probe-1.0.dist-info/METADATA": (
+                b"Metadata-Version: 2.1\n"
+                b"Name: fasta2v-pip-isolation-probe\n"
+                b"Version: 1.0\n"
+            ),
+            "fasta2v_pip_isolation_probe-1.0.dist-info/WHEEL": (
+                b"Wheel-Version: 1.0\n"
+                b"Generator: FastA2V-test\n"
+                b"Root-Is-Purelib: true\n"
+                b"Tag: py3-none-any\n"
+            ),
+            "fasta2v_pip_isolation_probe-1.0.dist-info/RECORD": b"",
+        }
+        with zipfile.ZipFile(
+            wheel,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            for name, content in files.items():
+                archive.writestr(name, content)
+
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("PIP_")
+        }
+        environment.update(
+            {
+                "PIP_CONFIG_FILE": os.devnull,
+                "PIP_FIND_LINKS": str(ambient_wheelhouse),
+            }
+        )
+        common = [
+            "install",
+            "--dry-run",
+            "--disable-pip-version-check",
+            "--no-input",
+            "--cache-dir",
+            str(cache_dir),
+            "--target",
+            str(self.root / "pip-target"),
+            "--no-index",
+            "--no-deps",
+            "--find-links",
+            str(intended_wheelhouse),
+            "fasta2v-pip-isolation-probe==1.0",
+        ]
+
+        config_file_only = subprocess.run(
+            [sys.executable, "-I", "-B", "-m", "pip", *common],
+            check=False,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(
+            config_file_only.returncode,
+            0,
+            config_file_only.stdout + config_file_only.stderr,
+        )
+        self.assertIn(str(wheel), config_file_only.stdout)
+
+        dual_isolation = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-m",
+                "pip",
+                "--isolated",
+                *common,
+            ],
+            check=False,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        combined_output = dual_isolation.stdout + dual_isolation.stderr
+        self.assertNotEqual(dual_isolation.returncode, 0)
+        self.assertNotIn(str(ambient_wheelhouse), combined_output)
+        self.assertIn("No matching distribution found", combined_output)
 
     def test_missing_weight_fails_before_any_lpips_score_exists(self):
         protocol, _receipt_path, _weight, kwargs = self.make_dependency_fixture(

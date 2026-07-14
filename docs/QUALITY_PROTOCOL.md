@@ -59,6 +59,17 @@ torchvision AlexNet backbone with absolute path, byte count, full SHA256, and
 source. Installation uses wheels only, disables bytecode compilation, and
 rejects symlinks and any distribution not present in the resolver reports.
 
+Every pip resolver invocation combines `--isolated` with
+`PIP_CONFIG_FILE=/dev/null`: the first disables ambient `PIP_*` options and
+user configuration, while the second disables global, virtual-environment,
+and explicit configuration files. This prevents an inherited extra index,
+find-links directory, constraint, or credential-bearing index URL from joining
+the fixed resolver inputs. Because isolated pip ignores `PIP_CACHE_DIR`, the
+installer passes the fixed `/cache/liluchen/FastA2V/cache/pip-eval` directory
+with `--cache-dir` on every invocation. It also disables interactive input and
+pip's version check. Bootstrap uses only its explicitly written indexes; pinned
+mode remains `--no-index` and can read only its retained wheelhouse.
+
 The canonical CPU resolver entry remains
 `https://download.pytorch.org/whl/cpu`, while PyTorch currently serves wheel
 bytes from either `download.pytorch.org` or its official
