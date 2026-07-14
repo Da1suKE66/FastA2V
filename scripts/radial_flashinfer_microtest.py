@@ -37,7 +37,7 @@ from ovi.radial_evidence import (
     RADIAL_HEADS,
     RADIAL_MASK_API,
     RADIAL_PMON_MAX_RECEIPT_GAP_SECONDS,
-    RADIAL_PMON_SAMPLE_INTERVAL_SECONDS,
+    RADIAL_PMON_MAX_SOURCE_GAP_SECONDS,
     RADIAL_SEQUENCE,
     parse_nvidia_smi_pmon_output,
 )
@@ -337,13 +337,13 @@ class _ContinuousPmon:
                 )
                 if not (
                     0.0 < source_gap
-                    <= RADIAL_PMON_SAMPLE_INTERVAL_SECONDS
+                    <= RADIAL_PMON_MAX_SOURCE_GAP_SECONDS
                     and 0.0 < receipt_gap
                     <= RADIAL_PMON_MAX_RECEIPT_GAP_SECONDS
                 ):
                     self._append_lifecycle_error(
-                        "pmon output violated the fixed 1-second source "
-                        "cadence or continuous receipt coverage: "
+                        "pmon output violated bounded source cadence or "
+                        "continuous receipt coverage: "
                         f"source_gap={source_gap!r}, receipt_gap={receipt_gap!r}"
                     )
             self._last_source_timestamp = float(source_timestamp)

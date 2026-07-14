@@ -180,9 +180,26 @@ class ContinuousPmonBehaviorTests(unittest.TestCase):
         evidence = monitor.evidence()
         self.assertEqual(evidence["status"], "failed")
         self.assertTrue(
-            any("fixed 1-second" in error for error in evidence["errors"]),
+            any("bounded source cadence" in error for error in evidence["errors"]),
             evidence["errors"],
         )
+
+    def test_coarse_source_clock_may_skip_one_label_when_receipts_are_continuous(self):
+        monitor = self.make_monitor()
+        self.prepare_window(monitor)
+        self.record(
+            monitor,
+            pmon_line(104.0, host_pid=self.host_pid, process_type="C"),
+            103.1,
+        )
+        self.assertTrue(monitor.window_compute_seen())
+        self.record(monitor, pmon_line(105.0), 104.1)
+        monitor.wait_for_final_sync_coverage(103.5, 103.5)
+        self.stop(monitor, 104.2)
+
+        evidence = monitor.evidence()
+        self.assertEqual(evidence["status"], "ok", evidence["errors"])
+        self.assertEqual(evidence["observation_mode"], "direct_c_observed")
 
     def test_stdout_eof_while_process_runs_is_an_interruption(self):
         monitor = self.make_monitor()

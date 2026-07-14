@@ -102,7 +102,12 @@ RADIAL_GPU_QUERY_MAX_GAP_SECONDS = 1.0
 RADIAL_GPU_QUERY_MAX_DURATION_SECONDS = 1.0
 RADIAL_GPU_QUERY_MIN_BACKEND_SAMPLES = 2
 RADIAL_PMON_SAMPLE_INTERVAL_SECONDS = 1.0
-RADIAL_PMON_MAX_RECEIPT_GAP_SECONDS = 2.0
+# ``nvidia-smi pmon -d 1 -o DT`` has been observed to emit rows roughly one
+# second apart while its coarse source clock skips one label (for example
+# 05:29:45 -> 05:29:47).  Treat delivery time as the continuity clock and keep
+# the source clock as a bounded, monotonic cross-check.
+RADIAL_PMON_MAX_SOURCE_GAP_SECONDS = 2.0 * RADIAL_PMON_SAMPLE_INTERVAL_SECONDS
+RADIAL_PMON_MAX_RECEIPT_GAP_SECONDS = 1.5 * RADIAL_PMON_SAMPLE_INTERVAL_SECONDS
 RADIAL_QKV_STORAGE_BYTES = (
     3 * RADIAL_SEQUENCE * RADIAL_HEADS * RADIAL_HEAD_DIM * 2
 )
@@ -1509,7 +1514,7 @@ def _pmon_evidence_errors(
                 source_gap = float(source) - float(previous_source)
                 receipt_gap = float(received) - float(previous_received)
                 if not (
-                    0.0 < source_gap <= RADIAL_PMON_SAMPLE_INTERVAL_SECONDS
+                    0.0 < source_gap <= RADIAL_PMON_MAX_SOURCE_GAP_SECONDS
                     and 0.0
                     < receipt_gap
                     <= RADIAL_PMON_MAX_RECEIPT_GAP_SECONDS
