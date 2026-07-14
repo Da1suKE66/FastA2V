@@ -16,6 +16,8 @@ CORE_PIP_REPORT="${EVAL_CHECKPOINT_ROOT}/quality-core-pip-report.json"
 LPIPS_PIP_REPORT="${EVAL_CHECKPOINT_ROOT}/quality-lpips-pip-report.json"
 WHEELHOUSE="${EVAL_CHECKPOINT_ROOT}/wheels"
 PIP_CACHE_DIR="${FASTA2V_CACHE_ROOT}/cache/pip-eval"
+PIP_NETWORK_TIMEOUT_SECONDS="300"
+PIP_NETWORK_RETRIES="10"
 PYTHON_BOOTSTRAP="${PYTHON_BOOTSTRAP:-python3.11}"
 ALEXNET_URL="https://download.pytorch.org/models/alexnet-owt-7be5be79.pth"
 ALEXNET_PATH="${TORCH_HOME}/hub/checkpoints/alexnet-owt-7be5be79.pth"
@@ -106,6 +108,8 @@ if [[ "${QUALITY_INSTALL_MODE}" == "bootstrap" ]]; then
     --disable-pip-version-check \
     --no-input \
     --cache-dir "${PIP_CACHE_DIR}" \
+    --timeout "${PIP_NETWORK_TIMEOUT_SECONDS}" \
+    --retries "${PIP_NETWORK_RETRIES}" \
     --force-reinstall \
     --no-compile \
     --only-binary=:all: \
@@ -118,6 +122,8 @@ if [[ "${QUALITY_INSTALL_MODE}" == "bootstrap" ]]; then
     --disable-pip-version-check \
     --no-input \
     --cache-dir "${PIP_CACHE_DIR}" \
+    --timeout "${PIP_NETWORK_TIMEOUT_SECONDS}" \
+    --retries "${PIP_NETWORK_RETRIES}" \
     --force-reinstall \
     --no-compile \
     --only-binary=:all: \
@@ -135,6 +141,8 @@ if [[ "${QUALITY_INSTALL_MODE}" == "bootstrap" ]]; then
     --disable-pip-version-check \
     --no-input \
     --cache-dir "${PIP_CACHE_DIR}" \
+    --timeout "${PIP_NETWORK_TIMEOUT_SECONDS}" \
+    --retries "${PIP_NETWORK_RETRIES}" \
     --force-reinstall \
     --no-compile \
     --only-binary=:all: \
@@ -217,6 +225,8 @@ PY
     --disable-pip-version-check \
     --no-input \
     --cache-dir "${PIP_CACHE_DIR}" \
+    --timeout "${PIP_NETWORK_TIMEOUT_SECONDS}" \
+    --retries "${PIP_NETWORK_RETRIES}" \
     --force-reinstall \
     --no-compile \
     --no-index \

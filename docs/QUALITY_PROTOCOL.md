@@ -67,8 +67,12 @@ find-links directory, constraint, or credential-bearing index URL from joining
 the fixed resolver inputs. Because isolated pip ignores `PIP_CACHE_DIR`, the
 installer passes the fixed `/cache/liluchen/FastA2V/cache/pip-eval` directory
 with `--cache-dir` on every invocation. It also disables interactive input and
-pip's version check. Bootstrap uses only its explicitly written indexes; pinned
-mode remains `--no-index` and can read only its retained wheelhouse.
+pip's version check. Every pip invocation fixes the HTTPS read timeout at 300
+seconds and the connection retry budget at 10 so a slow official archive host
+can be tolerated without changing the fixed resolver inputs. The dual
+isolation above remains the source boundary. Bootstrap uses only its explicitly
+written indexes; pinned mode remains `--no-index` and can read only its retained
+wheelhouse.
 
 The canonical CPU resolver entry remains
 `https://download.pytorch.org/whl/cpu`, while PyTorch currently serves wheel

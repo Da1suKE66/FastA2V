@@ -1339,6 +1339,16 @@ class QualityProtocolTests(unittest.TestCase):
         )
         self.assertEqual(source.count(isolated_pip), 4)
         self.assertEqual(source.count('--cache-dir "${PIP_CACHE_DIR}"'), 4)
+        self.assertIn('PIP_NETWORK_TIMEOUT_SECONDS="300"', source)
+        self.assertIn('PIP_NETWORK_RETRIES="10"', source)
+        self.assertEqual(
+            source.count('--timeout "${PIP_NETWORK_TIMEOUT_SECONDS}"'),
+            4,
+        )
+        self.assertEqual(
+            source.count('--retries "${PIP_NETWORK_RETRIES}"'),
+            4,
+        )
         self.assertEqual(source.count("--disable-pip-version-check"), 4)
         self.assertEqual(source.count("--no-input"), 4)
         self.assertNotIn("-m pip install", source)
