@@ -1243,6 +1243,9 @@ class QualityProtocolTests(unittest.TestCase):
             "record_probe/__pycache__/trusted.cpython-311.pyc": (
                 b"hash-bound-wheel-bytecode"
             ),
+            "record_probe/_vendor/vendored-9.9.dist-info/RECORD": (
+                b"vendored-package-record\n"
+            ),
             "record_probe-1.0.dist-info/METADATA": (
                 b"Metadata-Version: 2.1\nName: record-probe\nVersion: 1.0\n"
             ),

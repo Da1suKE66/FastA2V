@@ -579,16 +579,18 @@ def _wheel_archive_errors(
     """Verify installed files against the RECORD inside a trusted wheel."""
 
     errors: list[str] = []
+    wheel_parts = archive_path.name.removesuffix(".whl").split("-")
+    if not archive_path.name.endswith(".whl") or len(wheel_parts) < 5:
+        return [f"trusted wheel filename is malformed: {archive_path.name}"]
+    primary_record = f"{wheel_parts[0]}-{wheel_parts[1]}.dist-info/RECORD"
     try:
         with zipfile.ZipFile(archive_path) as wheel:
-            record_names = [
-                name
-                for name in wheel.namelist()
-                if name.endswith(".dist-info/RECORD")
-            ]
-            if len(record_names) != 1:
-                return [f"trusted wheel contains {len(record_names)} RECORD files"]
-            record_text = wheel.read(record_names[0]).decode("utf-8")
+            if wheel.namelist().count(primary_record) != 1:
+                return [
+                    "trusted wheel does not contain exactly one primary RECORD "
+                    f"at {primary_record}"
+                ]
+            record_text = wheel.read(primary_record).decode("utf-8")
     except (OSError, zipfile.BadZipFile, KeyError, UnicodeDecodeError) as exc:
         return [f"cannot read trusted wheel {archive_path}: {exc}"]
     try:
@@ -677,14 +679,20 @@ def _wheel_site_package_paths(
 
     allowed: set[Path] = set()
     errors: list[str] = []
+    wheel_parts = archive_path.name.removesuffix(".whl").split("-")
+    if not archive_path.name.endswith(".whl") or len(wheel_parts) < 5:
+        return set(), [f"trusted wheel filename is malformed: {archive_path.name}"]
+    primary_record = f"{wheel_parts[0]}-{wheel_parts[1]}.dist-info/RECORD"
     try:
         with zipfile.ZipFile(archive_path) as wheel:
-            record_names = [
-                name for name in wheel.namelist() if name.endswith(".dist-info/RECORD")
-            ]
-            if len(record_names) != 1:
-                return set(), [f"trusted wheel contains {len(record_names)} RECORD files"]
-            rows = list(csv.reader(wheel.read(record_names[0]).decode("utf-8").splitlines()))
+            if wheel.namelist().count(primary_record) != 1:
+                return set(), [
+                    "trusted wheel does not contain exactly one primary RECORD "
+                    f"at {primary_record}"
+                ]
+            rows = list(
+                csv.reader(wheel.read(primary_record).decode("utf-8").splitlines())
+            )
     except (OSError, zipfile.BadZipFile, KeyError, UnicodeDecodeError, csv.Error) as exc:
         return set(), [f"cannot derive trusted wheel file set from {archive_path}: {exc}"]
     for row_number, row in enumerate(rows, start=1):

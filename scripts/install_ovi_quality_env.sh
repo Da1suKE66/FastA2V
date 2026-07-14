@@ -611,18 +611,15 @@ def authenticated_wheel_bytecode(package):
     context = f"retained wheel for {package['distribution']}"
     try:
         with zipfile.ZipFile(archive_path) as wheel:
-            record_names = [
-                name
-                for name in wheel.namelist()
-                if name.endswith(".dist-info/RECORD")
-            ]
-            if len(record_names) != 1:
+            primary_record = f"{Path(package['record_path']).parent.name}/RECORD"
+            if wheel.namelist().count(primary_record) != 1:
                 raise SystemExit(
-                    f"{context} contains {len(record_names)} RECORD files"
+                    f"{context} does not contain exactly one primary RECORD "
+                    f"at {primary_record}"
                 )
             rows = list(
                 csv.reader(
-                    wheel.read(record_names[0]).decode("utf-8").splitlines()
+                    wheel.read(primary_record).decode("utf-8").splitlines()
                 )
             )
     except (OSError, zipfile.BadZipFile, KeyError, UnicodeDecodeError, csv.Error) as exc:
