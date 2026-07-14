@@ -153,7 +153,7 @@ class WinnerFixture:
 
 class SelectSparseWinnerTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
         self.protocol_path = self.root / "quality_protocol.json"
         make_pinned_protocol(self.protocol_path)

@@ -703,7 +703,7 @@ class FinalCsvFixture:
 
 class OviFinalCsvTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
         self.protocol_path, self.lpips_inline = make_pinned_protocol_fixture(
             self.root
