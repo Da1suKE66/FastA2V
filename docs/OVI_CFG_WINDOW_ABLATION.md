@@ -32,6 +32,14 @@ The two cached runs have essentially identical latency but substantially
 different reconstruction metrics. This already points to timestep sensitivity,
 not cache misses or a failed implementation.
 
+The execution counts also show that the implementation is realizing the
+available compute saving. Dense executes 1,770 video self-attention calls;
+either r5 window executes 1,364. The call ratio is `1364/1770 = 0.7706`, while
+the measured denoise ratio is `75.8509/98.4911 = 0.7701`. The difference is
+under 0.1 percentage point. Non-denoise time remains about 13.8 seconds in both
+runs. The speed ceiling is therefore dominated by coverage and fixed work, not
+cache misses or dispatch fallback.
+
 ## Run policy
 
 Run only on an idle physical GPU 0:
