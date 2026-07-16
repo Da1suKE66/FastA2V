@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "status": "completed",
+  "scope": "single-prompt engineering ablation, not a formal benchmark",
+  "run": {
+    "run_id": "20260717-late-window-r5-spare",
+    "git_commit": "4c77d1e8a954c805e26ce35a8f97befbec447960",
+    "git_dirty": false,
+    "gpu": "NVIDIA A100-SXM4-80GB",
+    "gpu_contention_detected": false,
+    "torch": "2.6.0+cu124",
+    "torch_cuda": "12.4",
+    "flash_attn": "2.7.4.post1",
+    "solver": "euler",
+    "sample_steps": 30,
+    "seed": 103,
+    "cfg_cache_window_inclusive": [
+      12,
+      29
+    ],
+    "cfg_cache_refresh_interval": 5,
+    "cfg_cache_hits": 14,
+    "cfg_cache_refreshes": 4,
+    "cfg_negative_forwards": 16,
+    "attention_calls_total": 1364,
+    "attention_calls_expected": 1364,
+    "attention_fallback_used": false,
+    "timing_seconds": {
+      "pre_denoise": 0.14067452028393745,
+      "denoise": 76.49464341253042,
+      "audio_decode": 0.05967888981103897,
+      "video_decode": 13.782977234572172,
+      "total_generation": 90.47797405719757,
+      "save_video": 2.5329428389668465,
+      "artifact_ready": 93.08718313649297
+    },
+    "media_verification": {
+      "status": "ok",
+      "benchmark_valid": false,
+      "frames": 121,
+      "width": 704,
+      "height": 704,
+      "video_codec": "h264",
+      "audio_codec": "aac",
+      "audio_is_non_silent": true
+    },
+    "output_sha256": "a655f1c14863569d77c2af7fa41290155e5b9e4280422c1dee5fb4bc24a0e6d3",
+    "quality_vs_dense": {
+      "video_psnr_db": 31.074362,
+      "video_ssim": 0.936218,
+      "audio_correlation": 0.433301636034785,
+      "frame_topology_equivalent": true,
+      "audio_length_equivalent": true
+    }
+  },
+  "same_compute_comparators": [
+    {
+      "window_inclusive": [
+        6,
+        23
+      ],
+      "cfg_cache_hits": 14,
+      "cfg_cache_refreshes": 4,
+      "cfg_negative_forwards": 16,
+      "attention_calls_total": 1364,
+      "total_generation_seconds": 89.70437571406364,
+      "denoise_seconds": 75.87743742763996,
+      "video_psnr_db": 25.436539,
+      "video_ssim": 0.880535,
+      "audio_correlation": 0.10406368254068235
+    },
+    {
+      "window_inclusive": [
+        9,
+        26
+      ],
+      "cfg_cache_hits": 14,
+      "cfg_cache_refreshes": 4,
+      "cfg_negative_forwards": 16,
+      "attention_calls_total": 1364,
+      "total_generation_seconds": 89.68515915051103,
+      "denoise_seconds": 75.85093213617802,
+      "video_psnr_db": 28.459344,
+      "video_ssim": 0.918419,
+      "audio_correlation": 0.2314609371179993
+    }
+  ],
+  "conclusion": {
+    "implementation_failed": false,
+    "early_steps_are_more_cache_sensitive_for_this_sample": true,
+    "video_decode_share_of_non_denoise_generation": 0.9856719822203885,
+    "next_action": "Stop the tuning sweep and evaluate 12-29/r5 on held-out prompts and seeds before adoption."
+  }
+}
