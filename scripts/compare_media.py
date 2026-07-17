@@ -157,7 +157,12 @@ def ffmpeg_metric(
     )
     matches = re.findall(pattern, process.stderr)
     if not matches:
-        raise RuntimeError(f"could not parse {filter_name} from ffmpeg output")
+        stderr_tail = process.stderr[-4000:]
+        raise RuntimeError(
+            f"could not parse {filter_name} from ffmpeg output "
+            f"for reference={reference} candidate={candidate}; "
+            f"pattern={pattern!r}; stderr_tail={stderr_tail!r}"
+        )
     value = matches[-1]
     return math.inf if value.lower() == "inf" else float(value)
 
