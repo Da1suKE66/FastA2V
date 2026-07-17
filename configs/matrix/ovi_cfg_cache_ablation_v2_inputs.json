@@ -1,0 +1,59 @@
+{
+  "schema_version": 2,
+  "protocol_id": "ovi_cfg_cache_ablation_v2",
+  "authoritative_bundle_files": {
+    "generate_ovi_cfg_ablation_v2_configs.py": {
+      "sha256": "9af786a2bfeb41d855fa45f426d73597c7b91944b4d078f01aa25f5697d28e52",
+      "integration": "scripts/generate_ovi_cfg_ablation_v2_configs.py is a fail-closed extension of this source"
+    },
+    "ovi_cfg_cache_ablation_v2.md": {
+      "sha256": "5f989734cfea3b20a43e2944b9b15118207b609f980e7a20f5d6691194db9364"
+    },
+    "ovi_cfg_cache_ablation_v2_matrix.csv": {
+      "sha256": "b317f02e66e8e356bd80218b24182607a8e1a686878cdb0a32cfa55595843524"
+    },
+    "ovi_cfg_cache_heldout_prompt_manifest.csv": {
+      "sha256": "a360c2d00109d242deb9ef5f290591a113d178ebc0a4e1b279f8b7269b289018"
+    },
+    "ovi_cfg_cache_heldout_prompts.csv": {
+      "sha256": "be05f7c411dbe9c1e1a1a2ef8aa6b8f7f6b9a0247f0550198ea66dfb19675631"
+    }
+  },
+  "repo_files": {
+    "docs/protocol/ovi_cfg_cache_ablation_v2.md": {
+      "sha256": "5f989734cfea3b20a43e2944b9b15118207b609f980e7a20f5d6691194db9364",
+      "source": "authoritative_bundle:ovi_cfg_cache_ablation_v2.md"
+    },
+    "configs/matrix/ovi_cfg_cache_ablation_v2_matrix.csv": {
+      "sha256": "b317f02e66e8e356bd80218b24182607a8e1a686878cdb0a32cfa55595843524",
+      "source": "authoritative_bundle:ovi_cfg_cache_ablation_v2_matrix.csv"
+    },
+    "prompts/ovi_cfg_cache_heldout_prompt_manifest.csv": {
+      "sha256": "a360c2d00109d242deb9ef5f290591a113d178ebc0a4e1b279f8b7269b289018",
+      "source": "authoritative_bundle:ovi_cfg_cache_heldout_prompt_manifest.csv"
+    },
+    "prompts/ovi_cfg_cache_heldout_prompts.csv": {
+      "sha256": "be05f7c411dbe9c1e1a1a2ef8aa6b8f7f6b9a0247f0550198ea66dfb19675631",
+      "source": "authoritative_bundle:ovi_cfg_cache_heldout_prompts.csv"
+    },
+    "prompts/ovi_cfg_ablation_v2_dev5.csv": {
+      "sha256": "0e301ab5fa3bfd0d69ccdbbdd5869bf3956a2a4d3578ce3c4aafd10f326b48fe",
+      "source": "workspace:runtime/ovi_user5.csv"
+    },
+    "prompts/ovi_cfg_ablation_v2_dev3.csv": {
+      "sha256": "535025400e1ad0140f43885ee64cf2a0ec7f8dd5e37467e135dc5e95e0ede05c",
+      "source": "derived verbatim from dev5 rows 1,4,5"
+    },
+    "prompts/ovi_cfg_ablation_v2_stage0.csv": {
+      "sha256": "e6a2ca8265d071176c9223b9dd9e79e12e829b9a8165e6488f37d6f8f63ea66f",
+      "source": "derived verbatim from dev5 row 1"
+    }
+  },
+  "heldout_policy": {
+    "source": "authoritative_bundle",
+    "prompt_count": 8,
+    "immutable_after_first_heldout_run": true,
+    "forbidden_substitute": "prompts/ovi_formal8.csv",
+    "reason": "the existing formal8 prompt set overlaps development prompts"
+  }
+}
