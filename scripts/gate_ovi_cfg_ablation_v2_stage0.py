@@ -111,6 +111,14 @@ def load_run(path: Path, label: str, expected_calls: int) -> dict:
 
 
 def exact_stream_match(left: dict, right: dict) -> tuple[bool, dict]:
+    # Exact container identity is the strongest available equality proof and
+    # avoids false failures when two ffmpeg builds convert the same H.264/AAC
+    # bytes to RGB/f32 with different rounding.  Only when containers differ
+    # do we fall back to the protocol's decoded-stream hashes.
+    container_match = (
+        isinstance(left.get("container_sha256"), str)
+        and left.get("container_sha256") == right.get("container_sha256")
+    )
     fields = (
         "decoded_rgb24_sha256",
         "decoded_rgb24_bytes",
@@ -118,7 +126,16 @@ def exact_stream_match(left: dict, right: dict) -> tuple[bool, dict]:
         "decoded_pcm_bytes",
     )
     comparison = {field: left.get(field) == right.get(field) for field in fields}
-    return all(comparison.values()), comparison
+    decoded_match = all(comparison.values())
+    return container_match or decoded_match, {
+        "criterion": (
+            "exact_container_sha256"
+            if container_match
+            else "decoded_rgb24_and_pcm"
+        ),
+        "container_sha256": container_match,
+        "decoded_streams": comparison,
+    }
 
 
 def main() -> int:
