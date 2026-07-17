@@ -319,7 +319,19 @@ def validate_inputs(args: argparse.Namespace) -> dict[str, Any]:
     cells = filter_cells(all_cells, stages, config_ids)
     execution_stage = args.execution_stage
     if execution_stage in {"0", "1", "2"}:
-        mismatched = [cell.config_id for cell in cells if cell.stage != execution_stage]
+        # Stages 1 and 2 both require newly generated Dense references for
+        # their own prompt/seed sets.  Dense has one canonical matrix row in
+        # Stage 0, so it is the only cross-source cell allowed here.
+        mismatched = [
+            cell.config_id
+            for cell in cells
+            if cell.stage != execution_stage
+            and not (
+                execution_stage in {"1", "2"}
+                and cell.config_id == "dense"
+                and cell.stage == "0"
+            )
+        ]
         if mismatched:
             raise ProtocolError(
                 f"execution stage {execution_stage} cannot use source-matrix cells "

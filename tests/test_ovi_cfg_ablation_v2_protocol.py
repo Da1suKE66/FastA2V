@@ -311,6 +311,38 @@ class OviCfgAblationV2ProtocolTests(unittest.TestCase):
                 sha256(REPO_ROOT / "prompts/ovi_cfg_cache_heldout_prompt_manifest.csv"),
             )
 
+    def test_stage1_materializes_canonical_dense_for_both_stage1_seeds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "stage1-dense"
+            args = [
+                "materialize-config",
+                "--base-config",
+                str(BASE),
+                "--prompt-csv",
+                str(REPO_ROOT / "prompts/ovi_cfg_ablation_v2_dev3.csv"),
+                "--output-dir",
+                str(output),
+                "--stages",
+                "0",
+                "--config-ids",
+                "dense",
+                "--execution-stage",
+                "1",
+                "--seeds",
+                "103,211",
+            ]
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(GENERATOR.main(args), 0)
+            manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(manifest["materializations"]), 2)
+            self.assertEqual(
+                {entry["seed"] for entry in manifest["materializations"]},
+                {103, 211},
+            )
+            for entry in manifest["materializations"]:
+                self.assertEqual(entry["source_matrix_stage"], 0)
+                self.assertEqual(entry["execution_stage"], 1)
+
     def test_benchmark_materialization_enforces_three_warmups_and_five_measurements(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "benchmark"

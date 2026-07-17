@@ -291,6 +291,12 @@ def validate_launch_inputs(
         )
     elif execution_stage == "4":
         allowed_seeds = {seed}
+    elif (
+        execution_stage in {"1", "2"}
+        and cell.config_id == "dense"
+        and cell.stage == "0"
+    ):
+        allowed_seeds = set(STAGE_SEEDS[execution_stage])
     else:
         _require(
             execution_stage == cell.stage,
