@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -66,6 +67,50 @@ SPARGE_PROVENANCE = {
     "tensor_layout": "NHD",
     "return_sparsity": False,
 }
+
+
+STRICT_AUDIO_THRESHOLDS = {
+    "minimum_rms_exclusive": 1e-3,
+    "minimum_peak_exclusive": 1e-2,
+    "active_sample_absolute_threshold": 1e-3,
+    "minimum_active_sample_ratio_exclusive": 0.01,
+}
+EXPLICIT_NON_SPEECH_AUDIO_THRESHOLDS = {
+    "minimum_rms_exclusive": 1e-6,
+    "minimum_peak_exclusive": None,
+    "active_sample_absolute_threshold": 1e-3,
+    "minimum_active_sample_ratio_exclusive": None,
+}
+_SPEECH_TAG_RE = re.compile(r"<\s*s\s*>", re.IGNORECASE)
+_NO_SPEECH_RE = re.compile(r"\bno\s+speech\b", re.IGNORECASE)
+_AUDCAP_RE = re.compile(r"<AUDCAP>(.*?)<ENDAUDCAP>", re.IGNORECASE | re.DOTALL)
+
+
+def audio_validation_profile(prompt):
+    """Choose the relaxed profile only for an explicit frozen no-speech prompt.
+
+    Missing, malformed, or ambiguous prompt evidence remains on the historical
+    strict profile.  In particular, ``No speech`` must occur inside exactly one
+    AUDCAP block and the complete prompt must contain no speech tag.
+    """
+
+    strict = {
+        "name": "speech_or_unspecified",
+        "thresholds": dict(STRICT_AUDIO_THRESHOLDS),
+    }
+    if not isinstance(prompt, str) or not prompt.strip():
+        return strict
+    if _SPEECH_TAG_RE.search(prompt) is not None:
+        return strict
+    audcaps = _AUDCAP_RE.findall(prompt)
+    if len(audcaps) != 1:
+        return strict
+    if _NO_SPEECH_RE.search(audcaps[0]) is None:
+        return strict
+    return {
+        "name": "explicit_non_speech",
+        "thresholds": dict(EXPLICIT_NON_SPEECH_AUDIO_THRESHOLDS),
+    }
 
 
 class MediaCommandError(subprocess.SubprocessError):
@@ -1708,13 +1753,6 @@ def verify(
         errors.append(f"decoded audio is too short: {samples.size} samples")
     if not np.isfinite(samples).all():
         errors.append("decoded audio contains NaN or Inf")
-    if not math.isfinite(rms) or rms <= 1e-3:
-        errors.append(f"audio RMS is silent/invalid: {rms}")
-    if not math.isfinite(peak) or peak <= 1e-2:
-        errors.append(f"audio peak is silent/invalid: {peak}")
-    if active_ratio <= 0.01:
-        errors.append(f"audio active-sample ratio is too low: {active_ratio}")
-
     video_std = float(gray.std()) if gray.size else 0.0
     if gray.size == 0 or video_std <= 2.0:
         errors.append(f"decoded video is blank or nearly constant: std={video_std}")
@@ -1730,6 +1768,34 @@ def verify(
         metrics_snapshot, metrics = _snapshot_json(metrics_path)
         if metrics_payloads is not None:
             metrics_payloads[str(path)] = metrics
+
+    prompt = metrics.get("prompt") if isinstance(metrics, dict) else None
+    audio_profile = audio_validation_profile(prompt)
+    audio_thresholds = audio_profile["thresholds"]
+    minimum_rms = audio_thresholds["minimum_rms_exclusive"]
+    minimum_peak = audio_thresholds["minimum_peak_exclusive"]
+    minimum_active_ratio = audio_thresholds[
+        "minimum_active_sample_ratio_exclusive"
+    ]
+    if not math.isfinite(rms) or rms <= minimum_rms:
+        errors.append(
+            "audio RMS is silent/invalid under "
+            f"{audio_profile['name']} profile: {rms} <= {minimum_rms}"
+        )
+    if minimum_peak is not None and (
+        not math.isfinite(peak) or peak <= minimum_peak
+    ):
+        errors.append(
+            "audio peak is silent/invalid under "
+            f"{audio_profile['name']} profile: {peak} <= {minimum_peak}"
+        )
+    if minimum_active_ratio is not None and active_ratio <= minimum_active_ratio:
+        errors.append(
+            "audio active-sample ratio is too low under "
+            f"{audio_profile['name']} profile: "
+            f"{active_ratio} <= {minimum_active_ratio}"
+        )
+
     if metrics is None and require_metrics:
         errors.append(f"missing metrics sidecar: {metrics_path}")
     elif metrics is not None:
@@ -2030,6 +2096,8 @@ def verify(
             "peak": peak,
             "dbfs": dbfs,
             "active_sample_ratio_abs_gt_1e-3": active_ratio,
+            "validation_profile": audio_profile["name"],
+            "thresholds": audio_thresholds,
         },
     }
 

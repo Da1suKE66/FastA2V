@@ -1,4 +1,5 @@
 import copy
+import csv
 import hashlib
 import importlib.util
 import json
@@ -640,6 +641,114 @@ class StableArtifactCounterexampleTests(unittest.TestCase):
         self.assertEqual(
             report["video"]["decoded_raw_sha256"],
             hashlib.sha256(expected_gray).hexdigest(),
+        )
+
+    def verify_quiet_prompt(self, filename, prompt):
+        artifact = self.run_dir / filename
+        artifact.write_bytes(b"snapshot media")
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        metrics = artifact_metrics(artifact, digest)
+        metrics["prompt"] = prompt
+        artifact.with_suffix(".metrics.json").write_text(
+            json.dumps(metrics) + "\n", encoding="utf-8"
+        )
+        quiet_audio = VERIFIER.np.full(
+            80000, 5e-4, dtype=VERIFIER.np.float32
+        )
+        probe_patch, _audio_patch, video_patch = media_mocks()
+        with (
+            probe_patch,
+            mock.patch.object(VERIFIER, "decode_audio", return_value=quiet_audio),
+            video_patch,
+        ):
+            return VERIFIER.verify(
+                artifact, expected_video_frames=1, run_dir=self.run_dir
+            )
+
+    def test_explicit_non_speech_prompt_uses_frozen_rms_contract(self):
+        prompt = (
+            "A quiet fountain with no people. "
+            "<AUDCAP>Gentle water and wind. No speech, no music.<ENDAUDCAP>"
+        )
+        report = self.verify_quiet_prompt("non-speech.mp4", prompt)
+
+        self.assertEqual(report["status"], "ok", report["errors"])
+        self.assertEqual(
+            report["audio"]["validation_profile"], "explicit_non_speech"
+        )
+        self.assertEqual(
+            report["audio"]["thresholds"],
+            {
+                "minimum_rms_exclusive": 1e-6,
+                "minimum_peak_exclusive": None,
+                "active_sample_absolute_threshold": 1e-3,
+                "minimum_active_sample_ratio_exclusive": None,
+            },
+        )
+        self.assertGreater(report["audio"]["rms"], 1e-6)
+        self.assertLess(report["audio"]["rms"], 1e-3)
+
+    def test_speech_prompt_retains_all_historical_audio_thresholds(self):
+        prompt = (
+            "A speaker says <S>Hello there.<E> "
+            "<AUDCAP>Clear speech and quiet room tone.<ENDAUDCAP>"
+        )
+        report = self.verify_quiet_prompt("speech.mp4", prompt)
+
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(
+            report["audio"]["validation_profile"], "speech_or_unspecified"
+        )
+        self.assertEqual(
+            report["audio"]["thresholds"],
+            {
+                "minimum_rms_exclusive": 1e-3,
+                "minimum_peak_exclusive": 1e-2,
+                "active_sample_absolute_threshold": 1e-3,
+                "minimum_active_sample_ratio_exclusive": 0.01,
+            },
+        )
+        rendered = "; ".join(report["errors"])
+        self.assertIn("audio RMS is silent/invalid", rendered)
+        self.assertIn("audio peak is silent/invalid", rendered)
+        self.assertIn("audio active-sample ratio is too low", rendered)
+
+    def test_non_speech_profile_requires_both_unambiguous_prompt_signals(self):
+        strict_prompts = (
+            "No speech. <AUDCAP>Gentle water and wind.<ENDAUDCAP>",
+            "<S>Hello.<E> <AUDCAP>No speech, only wind.<ENDAUDCAP>",
+            "<AUDCAP>No other speech is present.<ENDAUDCAP>",
+            "<AUDCAP>No speech.<ENDAUDCAP><AUDCAP>No speech.<ENDAUDCAP>",
+            "<AUDCAP>No speech without a closing tag.",
+        )
+        for prompt in strict_prompts:
+            with self.subTest(prompt=prompt):
+                profile = VERIFIER.audio_validation_profile(prompt)
+                self.assertEqual(profile["name"], "speech_or_unspecified")
+
+        relaxed = VERIFIER.audio_validation_profile(
+            "A fountain. <AUDCAP>Water only. No speech.<ENDAUDCAP>"
+        )
+        self.assertEqual(relaxed["name"], "explicit_non_speech")
+
+    def test_frozen_heldout_profiles_relax_only_h07_and_h08(self):
+        prompt_path = REPO_ROOT / "prompts/ovi_cfg_cache_heldout_prompts.csv"
+        with prompt_path.open(newline="", encoding="utf-8") as handle:
+            prompts = [row["text_prompt"] for row in csv.DictReader(handle)]
+
+        self.assertEqual(len(prompts), 8)
+        self.assertEqual(
+            [VERIFIER.audio_validation_profile(prompt)["name"] for prompt in prompts],
+            [
+                "speech_or_unspecified",
+                "speech_or_unspecified",
+                "speech_or_unspecified",
+                "speech_or_unspecified",
+                "speech_or_unspecified",
+                "speech_or_unspecified",
+                "explicit_non_speech",
+                "explicit_non_speech",
+            ],
         )
 
     def test_final_revalidation_publishes_failed_after_replacement(self):
