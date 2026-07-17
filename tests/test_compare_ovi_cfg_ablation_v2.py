@@ -60,6 +60,23 @@ class AudioMetricTests(unittest.TestCase):
 
 
 class VideoAndLatentMetricTests(unittest.TestCase):
+    def test_ffmpeg_metric_disables_interactive_stdin(self):
+        media = TOOL._load_sibling_module("compare_media")
+        completed = mock.Mock(
+            stderr="[Parsed_ssim_0] SSIM Y:0.9 U:0.9 V:0.9 All:0.9 (10.0)\n"
+        )
+        with mock.patch.object(media.subprocess, "run", return_value=completed) as run:
+            value = media.ffmpeg_metric(
+                Path("dense.mp4"),
+                Path("candidate.mp4"),
+                121,
+                "ssim",
+                r"All:([0-9.+-]+|inf)",
+            )
+
+        self.assertEqual(value, 0.9)
+        self.assertIn("-nostdin", run.call_args.args[0])
+
     def test_temporal_frame_difference_error(self):
         reference = np.asarray([[[0]], [[10]], [[20]]], dtype=np.uint8)
         identical = reference.copy()

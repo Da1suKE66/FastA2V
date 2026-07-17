@@ -24,6 +24,7 @@ def decode_audio(path, *, ffmpeg="ffmpeg"):
     process = subprocess.run(
         [
             str(ffmpeg),
+            "-nostdin",
             "-v",
             "error",
             "-i",
@@ -86,6 +87,7 @@ def decode_tail_gray(path, frame_count, *, ffmpeg="ffmpeg"):
     process = subprocess.run(
         [
             str(ffmpeg),
+            "-nostdin",
             "-v",
             "error",
             "-i",
@@ -138,6 +140,7 @@ def ffmpeg_metric(
     process = subprocess.run(
         [
             str(ffmpeg),
+            "-nostdin",
             "-v",
             "info",
             "-i",

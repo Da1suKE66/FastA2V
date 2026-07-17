@@ -148,6 +148,7 @@ def decode_video_gray(
     process = subprocess.run(
         [
             str(ffmpeg),
+            "-nostdin",
             "-v",
             "error",
             "-i",
