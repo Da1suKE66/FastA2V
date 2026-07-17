@@ -1,0 +1,44 @@
+{
+  "artifact_count": 1,
+  "artifacts": [
+    {
+      "audio": {
+        "codec_name": "aac",
+        "decode": {
+          "bytes": 322480,
+          "channels": 1,
+          "sample_count": 80620,
+          "sample_format": "f32le",
+          "sample_rate": 16000,
+          "sha256": "c38aee3ea2809ff2f9f0ed193942469bb2e0ea2dfe5954ed6bcd08f0e882c60a"
+        }
+      },
+      "container": {
+        "bytes": 583551,
+        "sha256": "6c8362f95469f97ee37d87d00d705c14fead8ec3564d2e4dcb470c1f1f73b78d"
+      },
+      "video": {
+        "codec_name": "h264",
+        "decode": {
+          "bytes": 179908608,
+          "frames": 121,
+          "height": 704,
+          "pixel_format": "rgb24",
+          "sha256": "eb9c0112612de0ea7e2c2a51689f9909bc83d386d468e588799dbc8f763e84f9",
+          "width": 704
+        }
+      }
+    }
+  ],
+  "provenance": {
+    "decoder": "ffmpeg 8.1.1",
+    "original_git_commit": "24bfbaac798f0e85617210f239c3d725b12fea95",
+    "original_run_id": "20260716-user1-30_90-r5-euler30-24bfbaa",
+    "original_run_kind": "cfg_cache_screen_user1",
+    "source_gpu_uuid": "GPU-48f35320-ea87-6378-1d50-f22cb9376023",
+    "source_prompt_seed": 103,
+    "source_window": "steps09-26_inclusive_r5"
+  },
+  "schema_version": 1,
+  "status": "ok"
+}

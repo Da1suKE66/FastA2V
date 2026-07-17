@@ -16,7 +16,7 @@ BASE_CONFIG="${REPO_ROOT}/configs/ovi_720x720_5s_cfg_cache_late_window_ablation.
 PROMPTS="${REPO_ROOT}/prompts/ovi_cfg_ablation_v2_stage0.csv"
 INPUT_ROOT="${FASTA2V_CACHE_ROOT}/protocol_inputs/ovi_cfg_ablation_v2/${STAGE_TAG}"
 RUN_ROOT="${FASTA2V_CACHE_ROOT}/runs/ovi_cfg_ablation_v2"
-OLD_ANCHOR_HASHES="${FASTA2V_OLD_ANCHOR_HASHES:-${FASTA2V_CACHE_ROOT}/reference/ovi_cfg_v2_old_9_26_r5/decoded_stream_hashes.json}"
+OLD_ANCHOR_HASHES="${FASTA2V_OLD_ANCHOR_HASHES:-${REPO_ROOT}/docs/results/ovi_cfg_cache_v2_old_anchor_decoded_stream_hashes.json}"
 
 if [[ -e "${INPUT_ROOT}" ]]; then
   echo "Refusing to reuse Stage 0 input directory: ${INPUT_ROOT}" >&2

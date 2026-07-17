@@ -143,6 +143,10 @@ def main() -> int:
         old_anchor = one_artifact_hashes(
             load_json(args.old_anchor_hashes), "old 9-26/r5 anchor"
         )
+        old_anchor_receipt = {
+            "path": str(args.old_anchor_hashes.resolve(strict=True)),
+            "sha256": sha256_file(args.old_anchor_hashes),
+        }
 
         identities = {
             (
@@ -213,6 +217,7 @@ def main() -> int:
                 for name, run in runs.items()
             },
             "old_anchor_hashes": old_anchor,
+            "old_anchor_receipt": old_anchor_receipt,
             "comparisons": comparisons,
             "equal_compute_denoise": equal_compute_denoise,
         }
