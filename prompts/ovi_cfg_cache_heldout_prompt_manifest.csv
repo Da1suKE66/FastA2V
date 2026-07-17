@@ -1,0 +1,9 @@
+prompt_id,category,primary_stress
+H01,stable_single_speaker,baseline speech and lip motion
+H02,speaker_object_interaction,hand-object motion with speech
+H03,full_body_camera_motion,walking plus smooth camera motion
+H04,pan_object_interaction,small pan plus manipulation
+H05,two_speaker_turn_taking,multi-speaker identity and audio turn
+H06,occlusion_fine_object,face accessories and fine hand motion
+H07,non_speech_environment,continuous environmental audio and motion
+H08,music_only,transient timing and audio decay

@@ -5,7 +5,6 @@ import cv2
 import glob
 import torch
 import logging
-import time
 from textwrap import indent
 import torch.nn as nn
 from diffusers import FluxPipeline
@@ -31,6 +30,7 @@ from ovi.modules.video_attention_dispatcher import (
     VideoSelfAttentionDispatcher,
     expected_video_self_attention_calls,
 )
+from ovi.phase_timing import GenerationPhaseTimer
 
 DEFAULT_CONFIG = OmegaConf.load('ovi/configs/inference/inference_fusion.yaml')
 
@@ -282,7 +282,7 @@ class OviFusionEngine:
         )
         torch.cuda.reset_peak_memory_stats(self.device)
         torch.cuda.synchronize(self.device)
-        generation_started = time.perf_counter()
+        phase_timer = GenerationPhaseTimer()
         # The mutable cache is scoped to this generation.  It is never stored on
         # the engine/model and is cleared in ``finally`` on success or failure.
         cfg_cache_state = (
@@ -333,6 +333,7 @@ class OviFusionEngine:
             # Only the post-run verifier can certify benchmark validity after
             # checking warm-up/measurement cardinality and every artifact.
             "benchmark_valid": False,
+            "phase_timing_schema_version": 1,
             "sample_steps": int(sample_steps),
             "slg_layer": int(slg_layer),
             "seed": int(seed),
@@ -484,7 +485,7 @@ class OviFusionEngine:
                 self.model = self.model.to(self.device)
             with torch.amp.autocast('cuda', enabled=self.target_dtype != torch.float32, dtype=self.target_dtype):
                 torch.cuda.synchronize(self.device)
-                denoise_started = time.perf_counter()
+                phase_timer.transition("denoise")
                 for i, (t_v, t_a) in tqdm(enumerate(zip(timesteps_video, timesteps_audio))):
                     timestep_input = torch.full((1,), t_v, device=self.device)
                     debug_this_step = self.debug_forward and i == self.debug_forward_step
@@ -652,8 +653,11 @@ class OviFusionEngine:
                         )
 
                 torch.cuda.synchronize(self.device)
-                denoise_seconds = time.perf_counter() - denoise_started
+                phase_timer.transition("audio_decode")
 
+                # Keep the phases contiguous so they add back to the generation
+                # total. CPU-offload setup is attributed to audio decode and
+                # decoder cleanup to video decode.
                 if self.cpu_offload:
                     self.offload_to_cpu(self.model)
                     self.vae_model_video.model = self.vae_model_video.model.to(
@@ -670,7 +674,9 @@ class OviFusionEngine:
                 if not torch.isfinite(generated_audio).all():
                     raise FloatingPointError("audio decoder returned NaN or Inf")
                 generated_audio = generated_audio.squeeze().cpu().float().numpy()
-                
+
+                phase_timer.transition("video_decode")
+
                 # Decode video  
                 video_latents_for_vae = video_noise.unsqueeze(0)  # 1, c, f, h, w
                 generated_video = self.vae_model_video.wrapped_decode(video_latents_for_vae)
@@ -682,11 +688,11 @@ class OviFusionEngine:
                     self.offload_to_cpu(self.vae_model_audio)
 
             torch.cuda.synchronize(self.device)
-            total_generation_seconds = time.perf_counter() - generation_started
+            phase_timer.finish()
+            phase_metrics = phase_timer.metrics()
             self.last_run_metrics.update({
                 "status": "ok",
-                "denoise_seconds": denoise_seconds,
-                "total_generation_seconds": total_generation_seconds,
+                **phase_metrics,
                 "peak_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(self.device)),
                 "peak_memory_reserved_bytes": int(torch.cuda.max_memory_reserved(self.device)),
                 "generated_video_shape": list(generated_video.shape),
@@ -697,9 +703,14 @@ class OviFusionEngine:
                 },
             })
             logging.info(
-                "Generation metrics: total=%.3fs denoise=%.3fs peak_allocated=%.3fGiB",
-                total_generation_seconds,
-                denoise_seconds,
+                "Generation metrics: total=%.3fs pre_denoise=%.3fs "
+                "denoise=%.3fs audio_decode=%.3fs video_decode=%.3fs "
+                "peak_allocated=%.3fGiB",
+                phase_metrics["total_generation_seconds"],
+                phase_metrics["pre_denoise_seconds"],
+                phase_metrics["denoise_seconds"],
+                phase_metrics["audio_decode_seconds"],
+                phase_metrics["video_decode_seconds"],
                 self.last_run_metrics["peak_memory_allocated_bytes"] / (1024 ** 3),
             )
             return generated_video, generated_audio, image
@@ -708,10 +719,11 @@ class OviFusionEngine:
         except Exception as e:
             if torch.cuda.is_available():
                 torch.cuda.synchronize(self.device)
+            phase_timer.finish()
             self.last_run_metrics.update({
                 "status": "failed",
                 "error": repr(e),
-                "total_generation_seconds": time.perf_counter() - generation_started,
+                **phase_timer.metrics(),
                 "peak_memory_allocated_bytes": int(torch.cuda.max_memory_allocated(self.device)) if torch.cuda.is_available() else 0,
                 "peak_memory_reserved_bytes": int(torch.cuda.max_memory_reserved(self.device)) if torch.cuda.is_available() else 0,
                 "video_self_attention_dispatcher": {

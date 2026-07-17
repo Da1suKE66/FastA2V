@@ -1,0 +1,37 @@
+ckpt_dir: /cache/liluchen/FastA2V/ckpts
+output_dir: ${oc.env:FASTA2V_RUN_DIR,/cache/liluchen/FastA2V/runs/ovi_cfg_window_ablation_manual}
+
+model_name: "720x720_5s"
+mode: "t2v"
+video_frame_height_width: [720, 720]
+sample_steps: 30
+solver_name: "euler"
+shift: 5.0
+sp_size: 1
+
+audio_guidance_scale: 3.0
+video_guidance_scale: 4.0
+slg_layer: 11
+video_negative_prompt: "jitter, bad hands, blur, distortion"
+audio_negative_prompt: "robotic, muffled, echo, distorted"
+
+fp8: false
+qint8: false
+cpu_offload: false
+seed: 103
+text_prompt: prompts/ovi_cfg_window_ablation.csv
+each_example_n_times: 1
+warmup_runs: 1
+measurement_runs: 1
+run_kind: "cfg_cache_window_ablation_user1"
+benchmark_eligible: false
+gpu_process_monitor_interval_seconds: 5.0
+
+attention_method: "dense"
+use_cfg_cache: true
+cfg_cache_start_step: 12
+cfg_cache_end_step: 29
+cfg_cache_refresh_interval: 5
+use_block_cache: false
+debug_forward: false
+debug_forward_step: 0
